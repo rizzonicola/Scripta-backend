@@ -1,0 +1,88 @@
+{{define "users.html"}}
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <title>Admin · Note Markdown</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }
+    h1 { font-size: 22px; }
+    h2 { font-size: 16px; margin-top: 40px; color: #444; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #fff; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 14px; }
+    th { background: #f0f0f0; font-weight: 600; }
+    form.inline { display: inline; }
+    .card { background: #fff; border: 1px solid #eee; border-radius: 8px; padding: 20px; margin-top: 12px; }
+    input { padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; margin-right: 8px; }
+    button { padding: 8px 14px; border: none; border-radius: 6px; background: #2563eb; color: #fff; font-size: 14px; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button.secondary { background: #6b7280; }
+    button.secondary:hover { background: #4b5563; }
+    .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
+    .flash.ok { background: #dcfce7; color: #166534; }
+    .flash.error { background: #fee2e2; color: #991b1b; }
+    .mono { font-family: monospace; font-size: 12px; color: #666; }
+    details summary { cursor: pointer; color: #2563eb; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>📝 Amministrazione — Note Markdown</h1>
+
+  {{if .Flash}}
+    <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}">{{.Flash}}</div>
+  {{end}}
+
+  <h2>Utenti registrati</h2>
+  <table>
+    <thead>
+      <tr><th>Username</th><th>ID</th><th>Creato il</th><th>Azioni</th></tr>
+    </thead>
+    <tbody>
+      {{range .Users}}
+      <tr>
+        <td>{{.Username}}</td>
+        <td class="mono">{{.ID}}</td>
+        <td>{{.CreatedAt}}</td>
+        <td>
+          <details>
+            <summary>Reset password</summary>
+            <form class="inline" method="POST" action="/admin/users/reset-password" style="margin-top:8px;">
+              <input type="hidden" name="user_id" value="{{.ID}}" />
+              <input type="password" name="new_password" placeholder="Nuova password" minlength="8" required />
+              <button type="submit" class="secondary">Reset</button>
+            </form>
+          </details>
+        </td>
+      </tr>
+      {{else}}
+      <tr><td colspan="4">Nessun utente registrato.</td></tr>
+      {{end}}
+    </tbody>
+  </table>
+
+  <h2>Crea nuovo utente</h2>
+  <div class="card">
+    <form method="POST" action="/admin/users/create">
+      <input type="text" name="username" placeholder="Username" required autocomplete="off" />
+      <input type="password" name="password" placeholder="Password (min 8 caratteri)" minlength="8" required autocomplete="new-password" />
+      <button type="submit">Crea utente</button>
+    </form>
+  </div>
+
+  <p class="mono" style="margin-top:30px;">La password viene cifrata con bcrypt prima di essere salvata; non è mai visibile in chiaro né qui né nel database.</p>
+
+  <h2>ℹ️ Crediti & Info Sistema</h2>
+  <div class="card" style="font-size: 13px; line-height: 1.6;">
+    <p><strong>Scripta Notes Server</strong> — v1.2.0 (Go 1.22+)</p>
+    <p>Licenza: <strong>GNU General Public License v3.0 (GPL-3.0)</strong></p>
+    <p style="margin-top:8px;"><strong>Librerie e dipendenze Open Source:</strong></p>
+    <ul style="margin: 4px 0 0 16px; padding: 0;">
+      <li><code>github.com/tursodatabase/go-libsql</code>: Driver SQLite/libSQL puro Go con supporto WAL e embedded replicas.</li>
+      <li><code>github.com/golang-jwt/jwt/v5</code>: Creazione e verifica token JWT con firma HMAC-SHA256.</li>
+      <li><code>golang.org/x/crypto/bcrypt</code>: Funzione crittografica adattiva per hashing password.</li>
+      <li><code>github.com/google/uuid</code>: Generazione crittograficamente sicura di identificatori UUIDv4.</li>
+    </ul>
+  </div>
+</body>
+</html>
+{{end}}

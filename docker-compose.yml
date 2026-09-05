@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  notes-server:
+    build: .
+    image: notes-server:latest
+    container_name: notes-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DB_PATH: /data/app.db
+      USERS_DATA_DIR: /data/users
+      PORT: "8080"
+      # SOSTITUIRE questi valori in produzione (non lasciare i default):
+      JWT_SECRET: "CAMBIAMI-con-una-stringa-random-lunga-e-segreta"
+      ADMIN_USER: "admin"
+      ADMIN_PASS: "CAMBIAMI-password-admin"
+      # --- Opzionali: modalità "embedded replica" verso Turso/libSQL server ---
+      # Se TURSO_SYNC_URL è vuoto (default), il server usa solo il file
+      # locale /data/app.db, esattamente come prima della migrazione.
+      TURSO_SYNC_URL: ""
+      TURSO_AUTH_TOKEN: ""
+      # Intervallo di sync automatico in background (formato time.Duration
+      # di Go, es. "30s", "1m"). Vuoto = nessun auto-sync periodico.
+      TURSO_SYNC_INTERVAL: ""
+    volumes:
+      - notes-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  notes-data:
+    driver: local
