@@ -9,8 +9,8 @@ import (
 	"time"
 
 	// Import anonimi per registrare i driver del database (SQLite / LibSQL)
-	_ "github.com/mattn/go-sqlite3"
-	_ "github.com/tursodatabase/go-libsql"
+	//_ "github.com/mattn/go-sqlite3"
+	//_ "github.com/tursodatabase/go-libsql"
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
