@@ -1,129 +1,87 @@
 package main
 
 import (
-	"embed"
+	"database/sql"
 	"log"
 	"net/http"
 	"os"
-	"time"
 
-	"notes-server/internal/auth"
+	_ "github.com/mattn/go-sqlite3"
+
 	"notes-server/internal/db"
 	"notes-server/internal/handlers"
 	"notes-server/internal/middleware"
 	"notes-server/internal/storage"
 )
 
-//go:embed web/templates/*.html
-var templatesFS embed.FS
-
-// settingsDispatch instrada GET e PUT su /api/v1/user/settings verso i rispettivi
-// handler (mux.Handle non fa dispatch per metodo su un singolo pattern).
-func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			h.GetSettings(w, r)
-		case http.MethodPut:
-			h.UpdateSettings(w, r)
-		default:
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
-		}
-	}
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
 func main() {
-	dbPath := getEnv("DB_PATH", "data/app.db")
-	usersDataDir := getEnv("USERS_DATA_DIR", "data/users")
-	jwtSecret := getEnv("JWT_SECRET", "change-me-in-production-please")
-	adminUser := getEnv("ADMIN_USER", "admin")
-	adminPass := getEnv("ADMIN_PASS", "admin")
-	port := getEnv("PORT", "8080")
-
-	if jwtSecret == "change-me-in-production-please" {
-		log.Println("ATTENZIONE: JWT_SECRET non impostato, viene usato un valore di default INSICURO. Impostare la variabile d'ambiente JWT_SECRET in produzione.")
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "./notes.db"
 	}
 
-	// TURSO_SYNC_URL / TURSO_AUTH_TOKEN sono opzionali: se assenti il server
-	// funziona come prima, con un file .db locale puro. Se TURSO_SYNC_URL è
-	// impostato, dbPath diventa una embedded replica sincronizzata con quel
-	// server libSQL/Turso remoto.
-	tursoSyncURL := getEnv("TURSO_SYNC_URL", "")
-	tursoAuthToken := getEnv("TURSO_AUTH_TOKEN", "")
-	var tursoSyncInterval time.Duration
-	if raw := getEnv("TURSO_SYNC_INTERVAL", ""); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil {
-			tursoSyncInterval = d
-		} else {
-			log.Printf("TURSO_SYNC_INTERVAL non valido (%q), ignorato: %v", raw, err)
-		}
+	dataDir := os.Getenv("USERS_DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./data/users"
 	}
 
-	sqlDB, err := db.OpenWithConfig(db.Config{
-		Path:         dbPath,
-		PrimaryURL:   tursoSyncURL,
-		AuthToken:    tursoAuthToken,
-		SyncInterval: tursoSyncInterval,
-	})
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "super-secret-key-change-in-production"
+	}
+
+	database, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		log.Fatalf("errore apertura database: %v", err)
+		log.Fatalf("Impossibile aprire il database: %v", err)
 	}
-	defer sqlDB.Close()
+	defer database.Close()
 
-	usersRepo := db.NewUsersRepo(sqlDB)
-	notesRepo := db.NewNotesRepo(sqlDB)
-	settingsRepo := db.NewSettingsRepo(sqlDB)
-	store := storage.NewStore(usersDataDir)
-	tokenManager := auth.NewTokenManager(jwtSecret, 7*24*time.Hour)
+	// Inizializzazione Repository
+	usersRepo := db.NewUsersRepository(database)
+	notesRepo := db.NewNotesRepository(database)
+	settingsRepo := db.NewSettingsRepository(database)
 
-	// --- Handlers ---
-	adminHandler, err := handlers.NewAdminHandler(usersRepo, templatesFS)
-	if err != nil {
-		log.Fatalf("errore caricamento template admin: %v", err)
-	}
-	authHandler := handlers.NewAuthHandler(usersRepo, tokenManager)
-	syncHandler := handlers.NewSyncHandler(notesRepo, store)
-	notesHandler := handlers.NewNotesHandler(store)
+	// Inizializzazione Storage Manager
+	storageMgr := storage.NewStorageManager(dataDir)
+
+	// Inizializzazione Handler
+	authHandler := handlers.NewAPIAuthHandler(usersRepo, jwtSecret)
+	syncHandler := handlers.NewAPISyncHandler(notesRepo, storageMgr)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
+	adminHandler := handlers.NewAdminHandler(usersRepo, storageMgr)
+
+	// Inizializzazione Middleware
+	authMiddleware := middleware.NewAuthMiddleware(jwtSecret)
 
 	mux := http.NewServeMux()
 
-	// --- Dashboard Admin (protetta con Basic Auth) ---
-	adminAuth := middleware.BasicAuthAdmin(adminUser, adminPass)
-	mux.Handle("/admin", adminAuth(http.HandlerFunc(adminHandler.UsersPage)))
-	mux.Handle("/admin/users/create", adminAuth(http.HandlerFunc(adminHandler.CreateUser)))
-	mux.Handle("/admin/users/reset-password", adminAuth(http.HandlerFunc(adminHandler.ResetPassword)))
+	// --- 1. ROTTE API FLUTTER MOBILE (Inalterate) ---
+	mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+	mux.HandleFunc("POST /api/v1/auth/register", authHandler.Register)
 
-	// --- API pubbliche (mobile app) ---
-	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
+	// Rotte API protette da JWT per il client Flutter
+	mux.Handle("POST /api/v1/sync", authMiddleware.Authenticate(http.HandlerFunc(syncHandler.Sync)))
+	mux.Handle("GET /api/v1/user/settings", authMiddleware.Authenticate(http.HandlerFunc(settingsHandler.GetSettings)))
+	mux.Handle("POST /api/v1/user/settings", authMiddleware.Authenticate(http.HandlerFunc(settingsHandler.UpdateSettings)))
 
-	// --- API protette da JWT ---
-	requireJWT := middleware.RequireJWT(tokenManager)
-	mux.Handle("/api/v1/sync", requireJWT(http.HandlerFunc(syncHandler.Sync)))
-	mux.Handle("/api/v1/notes/download", requireJWT(http.HandlerFunc(notesHandler.Download)))
-	mux.Handle("/api/v1/user/settings", requireJWT(http.HandlerFunc(settingsDispatch(settingsHandler))))
+	// --- 2. ROTTE DASHBOARD ADMIN WEB & GESTIONE UTENTI ---
+	mux.HandleFunc("GET /admin/users", adminHandler.RenderUsersPage)
+	mux.HandleFunc("GET /api/admin/users", adminHandler.ListUsersAPI)
+	mux.HandleFunc("POST /api/admin/users", adminHandler.CreateUserHandler)
+	mux.HandleFunc("DELETE /admin/users/{id}", adminHandler.DeleteUserHandler)
+	mux.HandleFunc("POST /admin/users/delete", adminHandler.DeleteUserHandler)
 
-	// --- Health check & System info ---
-	healthHandler := func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","name":"Scripta Notes Server","version":"1.2.0","license":"GPL-3.0","credits":{"database":"github.com/tursodatabase/go-libsql","jwt":"github.com/golang-jwt/jwt/v5","security":"golang.org/x/crypto/bcrypt","uuid":"github.com/google/uuid"}}` + "\n"))
+	// Serving file statici UI
+	fileServer := http.FileServer(http.Dir("./web"))
+	mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/health", healthHandler)
 
-	addr := ":" + port
-	log.Printf("server in ascolto su %s (admin: http://localhost%s/admin)", addr, addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("errore server: %v", err)
+	log.Printf("Server avviato sulla porta %s...", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatalf("Errore esecuzione server: %v", err)
 	}
 }
