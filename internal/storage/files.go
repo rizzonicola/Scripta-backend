@@ -1,168 +1,116 @@
 package storage
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"sync"
 )
 
-// Store gestisce la persistenza dei file .md su filesystem per ogni utente.
-type Store struct {
-	baseDir string // es. /data/users
-	locks   keyedMutex
+type StorageManager struct {
+	BaseDir string
 }
 
-func NewStore(baseDir string) *Store {
-	return &Store{baseDir: baseDir}
+func NewStorageManager(baseDir string) *StorageManager {
+	return &StorageManager{BaseDir: baseDir}
 }
 
-// UserNotesDir restituisce la directory delle note di un utente.
-func (s *Store) UserNotesDir(userID string) string {
-	return filepath.Join(s.baseDir, userID, "notes")
+// GetUserDir restituisce il percorso della cartella dedicata all'utente.
+func (s *StorageManager) GetUserDir(userID int64) string {
+	return filepath.Join(s.BaseDir, strconv.FormatInt(userID, 10))
 }
 
-// ResolvePath valida e risolve un relativePath fornito dal client,
-// impedendo path traversal (es. "../../etc/passwd").
-func (s *Store) ResolvePath(userID, relativePath string) (string, error) {
-	clean := filepath.Clean("/" + relativePath) // forza percorso "assoluto" relativo alla root utente
-	clean = strings.TrimPrefix(clean, "/")
-	if clean == "" || clean == "." {
-		return "", fmt.Errorf("percorso relativo non valido")
+// EnsureUserDir assicura che la directory fisica dell'utente esista.
+func (s *StorageManager) EnsureUserDir(userID int64) error {
+	dir := s.GetUserDir(userID)
+	return os.MkdirAll(dir, 0755)
+}
+
+// isSafePath previene attacchi di Path Traversal (es. ../../etc/passwd).
+func (s *StorageManager) isSafePath(basePath, targetPath string) bool {
+	rel, err := filepath.Rel(basePath, targetPath)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == ".." {
+		return false
+	}
+	return true
+}
+
+// SaveFile scrive o aggiorna un file (nota o allegato) nella cartella dell'utente.
+func (s *StorageManager) SaveFile(userID int64, filename string, data []byte) error {
+	if err := s.EnsureUserDir(userID); err != nil {
+		return fmt.Errorf("impossibile creare la directory utente: %w", err)
 	}
 
-	base := s.UserNotesDir(userID)
-	full := filepath.Join(base, clean)
+	userDir := s.GetUserDir(userID)
+	targetPath := filepath.Clean(filepath.Join(userDir, filename))
 
-	// Verifica finale: il path risolto deve restare dentro alla base dir.
-	rel, err := filepath.Rel(base, full)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path traversal rilevato")
-	}
-	return full, nil
-}
-
-// LockPath serializza tutte le operazioni (lettura+scrittura, upsert metadati, ecc.)
-// relative allo stesso file, per lo stesso utente. Va usato dal chiamante per
-// racchiudere l'intera sequenza "leggi stato -> decidi -> scrivi" (es. la
-// risoluzione dei conflitti nella sync) evitando race condition tra richieste
-// concorrenti sullo stesso file (stesso utente che sincronizza da più dispositivi
-// in parallelo). Restituisce una funzione da chiamare (tipicamente via defer)
-// per rilasciare il lock. Il mutex per-path viene creato on demand e rimosso
-// automaticamente quando non più referenziato, evitando memory leak.
-func (s *Store) LockPath(fullPath string) func() {
-	return s.locks.lock(fullPath)
-}
-
-// AtomicWrite scrive il contenuto su file in modo atomico: scrive su un file
-// temporaneo (.tmp) nella stessa directory e poi esegue os.Rename. os.Rename
-// è atomico sullo stesso filesystem, quindi eventuali lettori vedranno sempre
-// o il contenuto precedente o quello nuovo completo, mai uno stato parziale.
-func (s *Store) AtomicWrite(fullPath string, content []byte) error {
-	dir := filepath.Dir(fullPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+	if !s.isSafePath(userDir, targetPath) {
+		return fmt.Errorf("tentativo di path traversal rilevato: %s", filename)
 	}
 
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	return os.WriteFile(targetPath, data, 0644)
+}
+
+// ReadFile legge il contenuto di un file dell'utente dal disco.
+func (s *StorageManager) ReadFile(userID int64, filename string) ([]byte, error) {
+	userDir := s.GetUserDir(userID)
+	targetPath := filepath.Clean(filepath.Join(userDir, filename))
+
+	if !s.isSafePath(userDir, targetPath) {
+		return nil, fmt.Errorf("tentativo di path traversal rilevato: %s", filename)
+	}
+
+	return os.ReadFile(targetPath)
+}
+
+// DeleteFile rimuove un singolo file dalla cartella dell'utente.
+func (s *StorageManager) DeleteFile(userID int64, filename string) error {
+	userDir := s.GetUserDir(userID)
+	targetPath := filepath.Clean(filepath.Join(userDir, filename))
+
+	if !s.isSafePath(userDir, targetPath) {
+		return fmt.Errorf("tentativo di path traversal rilevato: %s", filename)
+	}
+
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("impossibile eliminare il file %s: %w", filename, err)
+	}
+	return nil
+}
+
+// ListUserFiles restituisce i nomi di tutti i file contenuti nella directory dell'utente.
+func (s *StorageManager) ListUserFiles(userID int64) ([]string, error) {
+	userDir := s.GetUserDir(userID)
+	entries, err := os.ReadDir(userDir)
 	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-
-	// Se qualcosa fallisce dopo la creazione, ripuliamo il temp file residuo.
-	// Dopo un rename riuscito il file non esiste più: os.Remove fallirà con
-	// ErrNotExist, che ignoriamo silenziosamente (nessuna Stat extra necessaria).
-	renamed := false
-	defer func() {
-		if !renamed {
-			_ = os.Remove(tmpPath)
+		if os.IsNotExist(err) {
+			return []string{}, nil
 		}
-	}()
-
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, fullPath); err != nil {
-		return fmt.Errorf("rename: %w", err)
-	}
-	renamed = true
-	return nil
-}
-
-// Delete rimuove il file .md dal filesystem (usato per note soft-deleted).
-func (s *Store) Delete(fullPath string) error {
-	err := os.Remove(fullPath)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
-// ReadFile legge il contenuto grezzo di un file .md.
-func (s *Store) ReadFile(fullPath string) ([]byte, error) {
-	return os.ReadFile(fullPath)
-}
-
-// ReadFileCtx si comporta come ReadFile ma rispetta la cancellazione del
-// contesto della richiesta HTTP: se il client si disconnette o la richiesta
-// scade prima della lettura, evitiamo di eseguire I/O disco inutile.
-func (s *Store) ReadFileCtx(ctx context.Context, fullPath string) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return os.ReadFile(fullPath)
+
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			files = append(files, entry.Name())
+		}
+	}
+	return files, nil
 }
 
-// keyedMutex fornisce un lock per-chiave (striping "perfetto" per path).
-// Le voci vengono create on-demand e rimosse quando non più referenziate,
-// così la mappa non cresce indefinitamente sotto carico prolungato.
-type keyedMutex struct {
-	mu sync.Mutex
-	m  map[string]*refCountedMutex
-}
+// DeleteUserDataDir rimuove in modo sicuro l'intera directory fisica dell'utente e il suo contenuto.
+func (s *StorageManager) DeleteUserDataDir(userID int64) error {
+	userDir := filepath.Clean(s.GetUserDir(userID))
+	baseDir := filepath.Clean(s.BaseDir)
 
-type refCountedMutex struct {
-	mu   sync.Mutex
-	refs int
-}
-
-func (k *keyedMutex) lock(key string) func() {
-	k.mu.Lock()
-	if k.m == nil {
-		k.m = make(map[string]*refCountedMutex)
+	if !s.isSafePath(baseDir, userDir) || userDir == baseDir {
+		return fmt.Errorf("tentativo di eliminazione directory non valido: %s", userDir)
 	}
-	rc, ok := k.m[key]
-	if !ok {
-		rc = &refCountedMutex{}
-		k.m[key] = rc
-	}
-	rc.refs++
-	k.mu.Unlock()
 
-	rc.mu.Lock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			rc.mu.Unlock()
-			k.mu.Lock()
-			rc.refs--
-			if rc.refs == 0 {
-				delete(k.m, key)
-			}
-			k.mu.Unlock()
-		})
+	if err := os.RemoveAll(userDir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("impossibile rimuovere la directory utente %s: %w", userDir, err)
 	}
+
+	return nil
 }
