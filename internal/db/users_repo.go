@@ -75,6 +75,18 @@ func (r *UsersRepository) Create(username, passwordHash string, isAdmin bool) (*
 	return r.GetByID(id)
 }
 
+func (r *UsersRepository) UpdatePassword(id int64, passwordHash string) error {
+	query := `UPDATE users SET password_hash = ? WHERE id = ?`
+	_, err := r.db.Exec(query, passwordHash, id)
+	return err
+}
+
+func (r *UsersRepository) UpdateRole(id int64, isAdmin bool) error {
+	query := `UPDATE users SET is_admin = ? WHERE id = ?`
+	_, err := r.db.Exec(query, isAdmin, id)
+	return err
+}
+
 func (r *UsersRepository) DeleteUser(id int64) error {
 	tx, err := r.db.Begin()
 	if err != nil {
@@ -82,7 +94,6 @@ func (r *UsersRepository) DeleteUser(id int64) error {
 	}
 	defer tx.Rollback()
 
-	// Eliminazione dei dati associati nelle tabelle correlate
 	_, _ = tx.Exec(`DELETE FROM notes WHERE user_id = ?`, id)
 	_, _ = tx.Exec(`DELETE FROM user_settings WHERE user_id = ?`, id)
 	_, _ = tx.Exec(`DELETE FROM tokens WHERE user_id = ?`, id)
