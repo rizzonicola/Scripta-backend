@@ -1,103 +1,106 @@
 package db
 
 import (
-	"context"
 	"database/sql"
-	"time"
-
-	"github.com/google/uuid"
-
-	"notes-server/internal/models"
+	"fmt"
 )
 
-type UsersRepo struct {
+type User struct {
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"-"`
+	IsAdmin      bool   `json:"is_admin"`
+	CreatedAt    string `json:"created_at"`
+}
+
+type UsersRepository struct {
 	db *sql.DB
 }
 
-func NewUsersRepo(db *sql.DB) *UsersRepo {
-	return &UsersRepo{db: db}
+func NewUsersRepository(db *sql.DB) *UsersRepository {
+	return &UsersRepository{db: db}
 }
 
-// Create inserisce un nuovo utente con la password già cifrata (bcrypt hash).
-func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (*models.User, error) {
-	u := &models.User{
-		ID:           uuid.NewString(),
-		Username:     username,
-		PasswordHash: passwordHash,
-		CreatedAt:    time.Now().UnixMilli(),
-	}
-	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
-		u.ID, u.Username, u.PasswordHash, u.CreatedAt,
-	)
+func (r *UsersRepository) GetByID(id int64) (*User, error) {
+	u := &User{}
+	query := `SELECT id, username, password_hash, is_admin, created_at FROM users WHERE id = ?`
+	err := r.db.QueryRow(query, id).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return u, nil
 }
 
-// List restituisce tutti gli utenti (senza esporre l'hash della password nella UI, se non necessario).
-func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, password_hash, created_at FROM users ORDER BY created_at DESC`)
+func (r *UsersRepository) GetByUsername(username string) (*User, error) {
+	u := &User{}
+	query := `SELECT id, username, password_hash, is_admin, created_at FROM users WHERE username = ?`
+	err := r.db.QueryRow(query, username).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.IsAdmin, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (r *UsersRepository) GetAll() ([]User, error) {
+	query := `SELECT id, username, is_admin, created_at FROM users ORDER BY id ASC`
+	rows, err := r.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var users []models.User
+	var users []User
 	for rows.Next() {
-		var u models.User
-		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt); err != nil {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Username, &u.IsAdmin, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
 	}
-	return users, rows.Err()
+	return users, nil
 }
 
-// GetByUsername recupera un utente per username (usato dal login).
-func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models.User, error) {
-	var u models.User
-	err := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE username = ?`, username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+func (r *UsersRepository) Create(username, passwordHash string, isAdmin bool) (*User, error) {
+	query := `INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, ?)`
+	res, err := r.db.Exec(query, username, passwordHash, isAdmin)
 	if err != nil {
 		return nil, err
 	}
-	return &u, nil
-}
 
-// GetByID recupera un utente per ID.
-func (r *UsersRepo) GetByID(ctx context.Context, id string) (*models.User, error) {
-	var u models.User
-	err := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE id = ?`, id,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+	id, err := res.LastInsertId()
 	if err != nil {
 		return nil, err
 	}
-	return &u, nil
+
+	return r.GetByID(id)
 }
 
-// UpdatePassword sovrascrive l'hash della password di un utente esistente (reset password).
-// La vecchia password non è mai leggibile: viene semplicemente sostituito l'hash.
-func (r *UsersRepo) UpdatePassword(ctx context.Context, userID, newPasswordHash string) error {
-	res, err := r.db.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, newPasswordHash, userID)
+func (r *UsersRepository) DeleteUser(id int64) error {
+	tx, err := r.db.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	n, err := res.RowsAffected()
+	defer tx.Rollback()
+
+	// Eliminazione dei dati associati nelle tabelle correlate
+	_, _ = tx.Exec(`DELETE FROM notes WHERE user_id = ?`, id)
+	_, _ = tx.Exec(`DELETE FROM user_settings WHERE user_id = ?`, id)
+	_, _ = tx.Exec(`DELETE FROM tokens WHERE user_id = ?`, id)
+	_, _ = tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, id)
+
+	res, err := tx.Exec(`DELETE FROM users WHERE id = ?`, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to delete user record: %w", err)
 	}
-	if n == 0 {
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+
+	return tx.Commit()
 }
