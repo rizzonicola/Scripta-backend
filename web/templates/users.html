@@ -1,319 +1,315 @@
+{{define "users.html"}}
 <!DOCTYPE html>
 <html lang="it">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title data-i18n="title">Dashboard Admin - Gestione Utenti</title>
-    <style>
-        :root {
-            --bg-color: #f4f6f8;
-            --card-bg: #ffffff;
-            --text-color: #333333;
-            --primary: #0066cc;
-            --danger: #dc3545;
-            --border: #e0e0e0;
-        }
+  <meta charset="UTF-8" />
+  <title data-i18n="pageTitle">Admin · Note Markdown</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }
+    h1 { font-size: 22px; }
+    h2 { font-size: 16px; margin-top: 40px; color: #444; }
+    header.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+    .lang-picker { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #555; }
+    .lang-picker select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; background: #fff; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #fff; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 14px; }
+    th { background: #f0f0f0; font-weight: 600; }
+    form.inline { display: inline; }
+    .actions-cell { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+    .card { background: #fff; border: 1px solid #eee; border-radius: 8px; padding: 20px; margin-top: 12px; }
+    input { padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; margin-right: 8px; }
+    button { padding: 8px 14px; border: none; border-radius: 6px; background: #2563eb; color: #fff; font-size: 14px; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button.secondary { background: #6b7280; }
+    button.secondary:hover { background: #4b5563; }
+    button.danger { background: #dc2626; }
+    button.danger:hover { background: #b91c1c; }
+    .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
+    .flash.ok { background: #dcfce7; color: #166534; }
+    .flash.error { background: #fee2e2; color: #991b1b; }
+    .mono { font-family: monospace; font-size: 12px; color: #666; }
+    details summary { cursor: pointer; color: #2563eb; font-size: 13px; }
 
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-color);
-            margin: 0;
-            padding: 20px;
-        }
-
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: var(--card-bg);
-            padding: 15px 25px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            margin-bottom: 25px;
-        }
-
-        .lang-container {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        select {
-            padding: 6px 12px;
-            border-radius: 4px;
-            border: 1px solid var(--border);
-            background: white;
-            font-size: 14px;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: var(--card-bg);
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        }
-
-        th, td {
-            padding: 12px 18px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-        }
-
-        th {
-            background-color: #f8f9fa;
-            font-weight: 600;
-        }
-
-        .btn-delete {
-            background-color: var(--danger);
-            color: white;
-            border: none;
-            padding: 6px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 13px;
-        }
-
-        .btn-delete:hover {
-            opacity: 0.9;
-        }
-
-        /* Modal styling */
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.5);
-            justify-content: center;
-            align-items: center;
-            z-index: 1000;
-        }
-
-        .modal-content {
-            background: white;
-            padding: 25px;
-            border-radius: 8px;
-            max-width: 450px;
-            width: 90%;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        }
-
-        .modal-actions {
-            display: flex;
-            justify-content: flex-end;
-            gap: 10px;
-            margin-top: 20px;
-        }
-
-        .btn-cancel {
-            background: #6c757d;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-    </style>
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; align-items: center; justify-content: center; z-index: 100; }
+    .modal-overlay.open { display: flex; }
+    .modal-box { background: #fff; border-radius: 10px; padding: 24px; max-width: 420px; width: 90%; box-shadow: 0 10px 30px rgba(0,0,0,.2); }
+    .modal-box h3 { margin-top: 0; font-size: 17px; }
+    .modal-box p { font-size: 14px; color: #333; line-height: 1.5; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  </style>
 </head>
 <body>
-
-    <header>
-        <h1 data-i18n="header_title">Gestione Utenti Server</h1>
-        <div class="lang-container">
-            <label for="languageSelect" data-i18n="lang_label">Lingua:</label>
-            <select id="languageSelect" onchange="changeLanguage(this.value)">
-                <option value="system" data-i18n="lang_system">Sistema (Auto)</option>
-                <option value="it">Italiano</option>
-                <option value="en">English</option>
-                <option value="fr">Français</option>
-            </select>
-        </div>
-    </header>
-
-    <main>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th data-i18n="th_username">Nome Utente</th>
-                    <th data-i18n="th_role">Ruolo</th>
-                    <th data-i18n="th_actions">Azioni</th>
-                </tr>
-            </thead>
-            <tbody id="usersTableBody">
-                <!-- I dati verranno caricati tramite JS -->
-            </tbody>
-        </table>
-    </main>
-
-    <!-- Modal di Conferma Eliminazione -->
-    <div id="deleteModal" class="modal-overlay">
-        <div class="modal-content">
-            <h3 data-i18n="modal_title">Conferma Eliminazione</h3>
-            <p data-i18n="modal_body">Sei sicuro di voler eliminare questo utente e tutte le sue note? L'azione è irreversibile.</p>
-            <div class="modal-actions">
-                <button class="btn-cancel" onclick="closeDeleteModal()" data-i18n="btn_cancel">Annulla</button>
-                <button class="btn-delete" onclick="confirmDeleteUser()" data-i18n="btn_confirm">Elimina Definivamente</button>
-            </div>
-        </div>
+  <header class="topbar">
+    <h1 data-i18n="heading">📝 Amministrazione — Note Markdown</h1>
+    <div class="lang-picker">
+      <label for="lang-select" data-i18n="langLabel">Lingua</label>
+      <select id="lang-select">
+        <option value="auto" data-i18n="langAuto">Sistema / Auto</option>
+        <option value="it" data-i18n="langIt">Italiano</option>
+        <option value="en" data-i18n="langEn">English</option>
+        <option value="fr" data-i18n="langFr">Français</option>
+      </select>
     </div>
+  </header>
 
-    <script>
-        const translations = {
-            it: {
-                title: "Dashboard Admin - Gestione Utenti",
-                header_title: "Gestione Utenti Server",
-                lang_label: "Lingua:",
-                lang_system: "Sistema (Auto)",
-                th_username: "Nome Utente",
-                th_role: "Ruolo",
-                th_actions: "Azioni",
-                btn_delete: "Elimina",
-                modal_title: "Conferma Eliminazione",
-                modal_body: "Sei sicuro di voler eliminare questo utente e tutte le sue note? L'azione è irreversibile.",
-                btn_cancel: "Annulla",
-                btn_confirm: "Elimina Definitivamente",
-                role_admin: "Amministratore",
-                role_user: "Utente"
-            },
-            en: {
-                title: "Admin Dashboard - User Management",
-                header_title: "Server User Management",
-                lang_label: "Language:",
-                lang_system: "System (Auto)",
-                th_username: "Username",
-                th_role: "Role",
-                th_actions: "Actions",
-                btn_delete: "Delete",
-                modal_title: "Confirm Deletion",
-                modal_body: "Are you sure you want to delete this user and all associated notes? This action cannot be undone.",
-                btn_cancel: "Cancel",
-                btn_confirm: "Delete Permanently",
-                role_admin: "Administrator",
-                role_user: "User"
-            },
-            fr: {
-                title: "Tableau de bord Admin - Gestion des utilisateurs",
-                header_title: "Gestion des utilisateurs du serveur",
-                lang_label: "Langue :",
-                lang_system: "Système (Auto)",
-                th_username: "Nom d'utilisateur",
-                th_role: "Rôle",
-                th_actions: "Actions",
-                btn_delete: "Supprimer",
-                modal_title: "Confirmer la suppression",
-                modal_body: "Êtes-vous sûr de vouloir supprimer cet utilisateur et toutes ses notes ? Cette action est irréversible.",
-                btn_cancel: "Annuler",
-                btn_confirm: "Supprimer définitivement",
-                role_admin: "Administrateur",
-                role_user: "Utilisateur"
-            }
-        };
+  {{if .Flash}}
+    <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}">{{.Flash}}</div>
+  {{end}}
 
-        let selectedUserIdToDelete = null;
+  <h2 data-i18n="usersHeading">Utenti registrati</h2>
+  <table>
+    <thead>
+      <tr>
+        <th data-i18n="colUsername">Username</th>
+        <th data-i18n="colId">ID</th>
+        <th data-i18n="colCreated">Creato il</th>
+        <th data-i18n="colActions">Azioni</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Users}}
+      <tr>
+        <td>{{.Username}}</td>
+        <td class="mono">{{.ID}}</td>
+        <td>{{.CreatedAt}}</td>
+        <td>
+          <div class="actions-cell">
+            <details>
+              <summary data-i18n="resetPwd">Reset password</summary>
+              <form class="inline" method="POST" action="/admin/users/reset-password" style="margin-top:8px;">
+                <input type="hidden" name="user_id" value="{{.ID}}" />
+                <input type="password" name="new_password" data-i18n-placeholder="newPwdPlaceholder" placeholder="Nuova password" minlength="8" required />
+                <button type="submit" class="secondary" data-i18n="resetBtn">Reset</button>
+              </form>
+            </details>
+            <button type="button" class="danger" data-i18n="deleteBtn"
+              onclick="openDeleteModal('{{.ID}}', '{{.Username}}')">Elimina</button>
+          </div>
+        </td>
+      </tr>
+      {{else}}
+      <tr><td colspan="4" data-i18n="noUsers">Nessun utente registrato.</td></tr>
+      {{end}}
+    </tbody>
+  </table>
 
-        function getBrowserLanguage() {
-            const lang = navigator.language || navigator.userLanguage;
-            const shortLang = lang.split('-')[0];
-            return ['it', 'en', 'fr'].includes(shortLang) ? shortLang : 'en';
+  <h2 data-i18n="createHeading">Crea nuovo utente</h2>
+  <div class="card">
+    <form method="POST" action="/admin/users/create">
+      <input type="text" name="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Username" required autocomplete="off" />
+      <input type="password" name="password" data-i18n-placeholder="passwordPlaceholder" placeholder="Password (min 8 caratteri)" minlength="8" required autocomplete="new-password" />
+      <button type="submit" data-i18n="createBtn">Crea utente</button>
+    </form>
+  </div>
+
+  <p class="mono" style="margin-top:30px;" data-i18n="pwdNote">La password viene cifrata con bcrypt prima di essere salvata; non è mai visibile in chiaro né qui né nel database.</p>
+
+  <h2 data-i18n="infoHeading">ℹ️ Crediti &amp; Info Sistema</h2>
+  <div class="card" style="font-size: 13px; line-height: 1.6;">
+    <p><strong>Scripta Notes Server</strong> — v1.2.0 (Go 1.22+)</p>
+    <p data-i18n="license">Licenza: <strong>GNU General Public License v3.0 (GPL-3.0)</strong></p>
+    <p style="margin-top:8px;"><strong data-i18n="depsHeading">Librerie e dipendenze Open Source:</strong></p>
+    <ul style="margin: 4px 0 0 16px; padding: 0;">
+      <li><code>github.com/tursodatabase/go-libsql</code>: <span data-i18n="depDb">Driver SQLite/libSQL puro Go con supporto WAL e embedded replicas.</span></li>
+      <li><code>github.com/golang-jwt/jwt/v5</code>: <span data-i18n="depJwt">Creazione e verifica token JWT con firma HMAC-SHA256.</span></li>
+      <li><code>golang.org/x/crypto/bcrypt</code>: <span data-i18n="depBcrypt">Funzione crittografica adattiva per hashing password.</span></li>
+      <li><code>github.com/google/uuid</code>: <span data-i18n="depUuid">Generazione crittograficamente sicura di identificatori UUIDv4.</span></li>
+    </ul>
+  </div>
+
+  <!-- Modale di conferma eliminazione utente -->
+  <div id="delete-modal" class="modal-overlay">
+    <div class="modal-box">
+      <h3 data-i18n="deleteConfirmTitle">Conferma eliminazione</h3>
+      <p>
+        <span data-i18n="deleteConfirmText">Sei sicuro di voler eliminare questo utente e tutti i suoi dati? L'azione è irreversibile.</span>
+        <br />
+        <strong id="delete-modal-username" class="mono"></strong>
+      </p>
+      <form method="POST" action="/admin/users/delete">
+        <input type="hidden" id="delete-form-user-id" name="user_id" value="" />
+        <div class="modal-actions">
+          <button type="button" class="secondary" data-i18n="deleteConfirmCancel" onclick="closeDeleteModal()">Annulla</button>
+          <button type="submit" class="danger" data-i18n="deleteConfirmYes">Elimina definitivamente</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    // --- Modale di conferma eliminazione ---
+    function openDeleteModal(userId, username) {
+      document.getElementById('delete-form-user-id').value = userId;
+      document.getElementById('delete-modal-username').textContent = username;
+      document.getElementById('delete-modal').classList.add('open');
+    }
+    function closeDeleteModal() {
+      document.getElementById('delete-modal').classList.remove('open');
+    }
+    // Chiudi la modale cliccando fuori dal box, o con Esc.
+    document.addEventListener('click', function (ev) {
+      if (ev.target && ev.target.id === 'delete-modal') closeDeleteModal();
+    });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') closeDeleteModal();
+    });
+
+    // --- Selettore lingua interfaccia (Sistema/Auto, IT, EN, FR) ---
+    var translations = {
+      it: {
+        pageTitle: 'Admin · Note Markdown',
+        heading: '📝 Amministrazione — Note Markdown',
+        langLabel: 'Lingua',
+        langAuto: 'Sistema / Auto',
+        langIt: 'Italiano',
+        langEn: 'English',
+        langFr: 'Français',
+        usersHeading: 'Utenti registrati',
+        colUsername: 'Username',
+        colId: 'ID',
+        colCreated: 'Creato il',
+        colActions: 'Azioni',
+        resetPwd: 'Reset password',
+        newPwdPlaceholder: 'Nuova password',
+        resetBtn: 'Reset',
+        deleteBtn: 'Elimina',
+        noUsers: 'Nessun utente registrato.',
+        createHeading: 'Crea nuovo utente',
+        usernamePlaceholder: 'Username',
+        passwordPlaceholder: 'Password (min 8 caratteri)',
+        createBtn: 'Crea utente',
+        pwdNote: "La password viene cifrata con bcrypt prima di essere salvata; non è mai visibile in chiaro né qui né nel database.",
+        infoHeading: 'ℹ️ Crediti & Info Sistema',
+        license: 'Licenza: <strong>GNU General Public License v3.0 (GPL-3.0)</strong>',
+        depsHeading: 'Librerie e dipendenze Open Source:',
+        depDb: 'Driver SQLite/libSQL puro Go con supporto WAL e embedded replicas.',
+        depJwt: 'Creazione e verifica token JWT con firma HMAC-SHA256.',
+        depBcrypt: 'Funzione crittografica adattiva per hashing password.',
+        depUuid: 'Generazione crittograficamente sicura di identificatori UUIDv4.',
+        deleteConfirmTitle: 'Conferma eliminazione',
+        deleteConfirmText: "Sei sicuro di voler eliminare questo utente e tutti i suoi dati? L'azione è irreversibile.",
+        deleteConfirmCancel: 'Annulla',
+        deleteConfirmYes: 'Elimina definitivamente'
+      },
+      en: {
+        pageTitle: 'Admin · Markdown Notes',
+        heading: '📝 Administration — Markdown Notes',
+        langLabel: 'Language',
+        langAuto: 'System / Auto',
+        langIt: 'Italiano',
+        langEn: 'English',
+        langFr: 'Français',
+        usersHeading: 'Registered users',
+        colUsername: 'Username',
+        colId: 'ID',
+        colCreated: 'Created on',
+        colActions: 'Actions',
+        resetPwd: 'Reset password',
+        newPwdPlaceholder: 'New password',
+        resetBtn: 'Reset',
+        deleteBtn: 'Delete',
+        noUsers: 'No registered users.',
+        createHeading: 'Create new user',
+        usernamePlaceholder: 'Username',
+        passwordPlaceholder: 'Password (min 8 characters)',
+        createBtn: 'Create user',
+        pwdNote: 'The password is hashed with bcrypt before being stored; it is never visible in plain text, neither here nor in the database.',
+        infoHeading: 'ℹ️ Credits & System Info',
+        license: 'License: <strong>GNU General Public License v3.0 (GPL-3.0)</strong>',
+        depsHeading: 'Open Source libraries & dependencies:',
+        depDb: 'Pure Go SQLite/libSQL driver with WAL support and embedded replicas.',
+        depJwt: 'JWT token creation and verification with HMAC-SHA256 signing.',
+        depBcrypt: 'Adaptive cryptographic function for password hashing.',
+        depUuid: 'Cryptographically secure generation of UUIDv4 identifiers.',
+        deleteConfirmTitle: 'Confirm deletion',
+        deleteConfirmText: 'Are you sure you want to delete this user and all their data? This action is irreversible.',
+        deleteConfirmCancel: 'Cancel',
+        deleteConfirmYes: 'Delete permanently'
+      },
+      fr: {
+        pageTitle: 'Admin · Notes Markdown',
+        heading: '📝 Administration — Notes Markdown',
+        langLabel: 'Langue',
+        langAuto: 'Système / Auto',
+        langIt: 'Italiano',
+        langEn: 'English',
+        langFr: 'Français',
+        usersHeading: 'Utilisateurs enregistrés',
+        colUsername: "Nom d'utilisateur",
+        colId: 'ID',
+        colCreated: 'Créé le',
+        colActions: 'Actions',
+        resetPwd: 'Réinitialiser le mot de passe',
+        newPwdPlaceholder: 'Nouveau mot de passe',
+        resetBtn: 'Réinitialiser',
+        deleteBtn: 'Supprimer',
+        noUsers: 'Aucun utilisateur enregistré.',
+        createHeading: 'Créer un nouvel utilisateur',
+        usernamePlaceholder: "Nom d'utilisateur",
+        passwordPlaceholder: 'Mot de passe (8 caractères min.)',
+        createBtn: 'Créer utilisateur',
+        pwdNote: "Le mot de passe est chiffré avec bcrypt avant d'être enregistré ; il n'est jamais visible en clair, ni ici ni dans la base de données.",
+        infoHeading: 'ℹ️ Crédits & Infos système',
+        license: 'Licence : <strong>GNU General Public License v3.0 (GPL-3.0)</strong>',
+        depsHeading: 'Bibliothèques et dépendances Open Source :',
+        depDb: 'Pilote SQLite/libSQL en Go pur avec support WAL et répliques embarquées.',
+        depJwt: 'Création et vérification de jetons JWT signés en HMAC-SHA256.',
+        depBcrypt: 'Fonction cryptographique adaptative pour le hachage des mots de passe.',
+        depUuid: "Génération cryptographiquement sûre d'identifiants UUIDv4.",
+        deleteConfirmTitle: 'Confirmer la suppression',
+        deleteConfirmText: 'Êtes-vous sûr de vouloir supprimer cet utilisateur et toutes ses données ? Cette action est irréversible.',
+        deleteConfirmCancel: 'Annuler',
+        deleteConfirmYes: 'Supprimer définitivement'
+      }
+    };
+
+    function detectSystemLang() {
+      var nav = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
+      if (nav.indexOf('it') === 0) return 'it';
+      if (nav.indexOf('fr') === 0) return 'fr';
+      return 'en';
+    }
+
+    function resolveLang(pref) {
+      if (!pref || pref === 'auto') return detectSystemLang();
+      if (translations[pref]) return pref;
+      return detectSystemLang();
+    }
+
+    function applyTranslations(lang) {
+      var dict = translations[lang] || translations.en;
+      document.documentElement.lang = lang;
+      document.querySelectorAll('[data-i18n]').forEach(function (el) {
+        var key = el.getAttribute('data-i18n');
+        if (dict[key] === undefined) return;
+        // 'license' contiene markup (<strong>) inline, va impostato come HTML;
+        // tutte le altre chiavi sono testo semplice.
+        if (key === 'license') {
+          el.innerHTML = dict[key];
+        } else {
+          el.textContent = dict[key];
         }
+      });
+      document.querySelectorAll('[data-i18n-placeholder]').forEach(function (el) {
+        var key = el.getAttribute('data-i18n-placeholder');
+        if (dict[key] !== undefined) el.setAttribute('placeholder', dict[key]);
+      });
+    }
 
-        function getCurrentLanguage() {
-            const savedLang = localStorage.getItem('app_lang') || 'system';
-            if (savedLang === 'system') {
-                return getBrowserLanguage();
-            }
-            return savedLang;
-        }
+    function initLanguageSwitcher() {
+      var STORAGE_KEY = 'scripta_admin_lang';
+      var select = document.getElementById('lang-select');
+      var stored = localStorage.getItem(STORAGE_KEY) || 'auto';
+      select.value = stored;
+      applyTranslations(resolveLang(stored));
+      select.addEventListener('change', function () {
+        localStorage.setItem(STORAGE_KEY, select.value);
+        applyTranslations(resolveLang(select.value));
+      });
+    }
 
-        function applyTranslations() {
-            const lang = getCurrentLanguage();
-            const dict = translations[lang] || translations['en'];
-
-            document.querySelectorAll('[data-i18n]').forEach(element => {
-                const key = element.getAttribute('data-i18n');
-                if (dict[key]) {
-                    element.textContent = dict[key];
-                }
-            });
-        }
-
-        function changeLanguage(langKey) {
-            localStorage.setItem('app_lang', langKey);
-            applyTranslations();
-            loadUsers();
-        }
-
-        function initLanguage() {
-            const savedSetting = localStorage.getItem('app_lang') || 'system';
-            document.getElementById('languageSelect').value = savedSetting;
-            applyTranslations();
-        }
-
-        async function loadUsers() {
-            try {
-                const response = await fetch('/api/admin/users');
-                const users = await response.json();
-                const tbody = document.getElementById('usersTableBody');
-                tbody.innerHTML = '';
-
-                const currentLang = getCurrentLanguage();
-                const dict = translations[currentLang] || translations['en'];
-
-                users.forEach(user => {
-                    const tr = document.createElement('tr');
-                    tr.innerHTML = `
-                        <td>${user.id}</td>
-                        <td>${user.username}</td>
-                        <td>${user.is_admin ? dict.role_admin : dict.role_user}</td>
-                        <td>
-                            <button class="btn-delete" onclick="openDeleteModal(${user.id})">${dict.btn_delete}</button>
-                        </td>
-                    `;
-                    tbody.appendChild(tr);
-                });
-            } catch (err) {
-                console.error("Errore nel caricamento utenti:", err);
-            }
-        }
-
-        function openDeleteModal(userId) {
-            selectedUserIdToDelete = userId;
-            document.getElementById('deleteModal').style.display = 'flex';
-        }
-
-        function closeDeleteModal() {
-            selectedUserIdToDelete = null;
-            document.getElementById('deleteModal').style.display = 'none';
-        }
-
-        async function confirmDeleteUser() {
-            if (!selectedUserIdToDelete) return;
-
-            try {
-                const response = await fetch(`/admin/users/${selectedUserIdToDelete}`, {
-                    method: 'DELETE'
-                });
-
-                if (response.ok) {
-                    closeDeleteModal();
-                    loadUsers();
-                } else {
-                    const errText = await response.text();
-                    alert("Errore: " + errText);
-                }
-            } catch (err) {
-                alert("Impossibile completare la richiesta di eliminazione.");
-            }
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            initLanguage();
-            loadUsers();
-        });
-    </script>
+    document.addEventListener('DOMContentLoaded', initLanguageSwitcher);
+  </script>
 </body>
 </html>
+{{end}}

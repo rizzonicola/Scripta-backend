@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"notes-server/internal/auth"
@@ -18,6 +17,12 @@ func NewAuthHandler(users *db.UsersRepo, tokens *auth.TokenManager) *AuthHandler
 	return &AuthHandler{Users: users, Tokens: tokens}
 }
 
+// maxLoginBodyBytes limita il body di login: username+password non superano
+// mai qualche decina di byte in un uso legittimo; 4 KiB è già ampiamente
+// generoso e chiude ogni possibilità di allocazione incontrollata su questo
+// endpoint pubblico (raggiungibile senza autenticazione).
+const maxLoginBodyBytes = 4 << 10 // 4 KiB
+
 // Login gestisce POST /api/v1/auth/login
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -26,8 +31,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req models.LoginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
 	if req.Username == "" || req.Password == "" {

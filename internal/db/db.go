@@ -278,6 +278,7 @@ var migrationStatements = []string{
 		updated_at    INTEGER NOT NULL,
 		deleted       INTEGER NOT NULL DEFAULT 0,
 		checksum      TEXT NOT NULL DEFAULT '',
+		is_folder     INTEGER NOT NULL DEFAULT 0,
 		UNIQUE(user_id, relative_path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)`,
@@ -294,5 +295,47 @@ func migrate(conn *sql.DB) error {
 			return fmt.Errorf("statement %q: %w", stmt, err)
 		}
 	}
+	// CREATE TABLE IF NOT EXISTS non altera una tabella "notes" già esistente
+	// creata da una versione precedente del server (prima dell'introduzione
+	// del supporto alle cartelle vuote): su un DB già in produzione la colonna
+	// is_folder andrebbe quindi aggiunta esplicitamente con ALTER TABLE.
+	return ensureNotesIsFolderColumn(conn)
+}
+
+// ensureNotesIsFolderColumn aggiunge la colonna "is_folder" alla tabella
+// "notes" se manca ancora (DB creato da una versione precedente del server),
+// così la migrazione è sicura sia su installazioni nuove (dove la colonna è
+// già presente dalla CREATE TABLE sopra) sia su installazioni esistenti.
+func ensureNotesIsFolderColumn(conn *sql.DB) error {
+	rows, err := conn.Query(`PRAGMA table_info(notes)`)
+	if err != nil {
+		return fmt.Errorf("pragma table_info(notes): %w", err)
+	}
+	defer rows.Close()
+
+	hasColumn := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan table_info(notes): %w", err)
+		}
+		if name == "is_folder" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterazione table_info(notes): %w", err)
+	}
+	if hasColumn {
+		return nil
+	}
+
+	if _, err := conn.Exec(`ALTER TABLE notes ADD COLUMN is_folder INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("alter table notes add is_folder: %w", err)
+	}
+	log.Println("migrazione: aggiunta colonna 'is_folder' alla tabella 'notes' (supporto cartelle vuote)")
 	return nil
 }

@@ -8,9 +8,11 @@ type User struct {
 	CreatedAt    int64 // unix millis
 }
 
-// Note rappresenta i metadati di una nota Markdown tracciati nel DB.
-// Il contenuto vero e proprio vive su filesystem in:
+// Note rappresenta i metadati di una nota Markdown (o di una cartella)
+// tracciati nel DB. Il contenuto vero e proprio vive su filesystem in:
 // /data/users/{UserID}/notes/{RelativePath}
+// Se IsFolder è true, RelativePath punta a una directory (eventualmente
+// vuota) e non a un file .md: Checksum e Content non hanno senso in quel caso.
 type Note struct {
 	ID           string
 	UserID       string
@@ -18,23 +20,49 @@ type Note struct {
 	UpdatedAt    int64 // unix millis, usato per la risoluzione dei conflitti LWW
 	Deleted      bool
 	Checksum     string
+	IsFolder     bool // true se questa voce rappresenta una cartella (anche vuota), non un file .md
 }
 
 // NoteChange è il payload inviato dal client mobile durante la sync.
+//
+// NOTA DI COMPATIBILITÀ: OldRelativePath e IsFolder sono campi AGGIUNTIVI
+// con "omitempty". Un client mobile che continua a inviare il payload nella
+// forma storica (senza questi due campi) ottiene ESATTAMENTE lo stesso
+// comportamento di prima: OldRelativePath decodifica a stringa vuota e
+// IsFolder a false, che è la via di codice preesistente e invariata
+// (vedi SyncHandler.syncFile). Nessun campo esistente è stato rimosso,
+// rinominato o ha cambiato semantica.
 type NoteChange struct {
 	RelativePath string `json:"relative_path"`
 	Content      string `json:"content"`
 	UpdatedAt    int64  `json:"updated_at"` // unix millis
 	Deleted      bool   `json:"deleted"`
+
+	// OldRelativePath, se valorizzato e diverso da RelativePath, indica che
+	// la nota (o la cartella, se IsFolder è true) è stata spostata/rinominata
+	// dal path indicato qui a RelativePath. Il server sposta fisicamente il
+	// file/cartella sul disco (rename) invece di ricrearlo da zero, così il
+	// contenuto esistente non viene perso né duplicato. Campo opzionale,
+	// assente per il client mobile "storico": in quel caso il comportamento
+	// è quello originale (nessun rename, solo creazione/aggiornamento sul
+	// path indicato da RelativePath).
+	OldRelativePath string `json:"old_relative_path,omitempty"`
+
+	// IsFolder, se true, indica che questa voce rappresenta una cartella
+	// (eventualmente senza alcun file .md al suo interno) e non una nota.
+	// Campo opzionale: un client che non lo invia mai continua a sincronizzare
+	// solo file, esattamente come oggi.
+	IsFolder bool `json:"is_folder,omitempty"`
 }
 
-// NoteResult è la rappresentazione di una nota restituita al client
-// (sia per conferma sync sia per conflitti risolti dal server).
+// NoteResult è la rappresentazione di una nota (o cartella) restituita al
+// client (sia per conferma sync sia per conflitti risolti dal server).
 type NoteResult struct {
 	RelativePath string `json:"relative_path"`
 	Content      string `json:"content,omitempty"`
 	UpdatedAt    int64  `json:"updated_at"`
 	Deleted      bool   `json:"deleted"`
+	IsFolder     bool   `json:"is_folder,omitempty"`
 }
 
 // SyncRequest è il body di POST /api/v1/sync.

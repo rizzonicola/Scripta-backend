@@ -68,8 +68,21 @@ func BasicAuthAdmin(adminUser, adminPass string) func(http.Handler) http.Handler
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			user, pass, ok := r.BasicAuth()
-			if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(adminUser)) != 1 ||
-				subtle.ConstantTimeCompare([]byte(pass), []byte(adminPass)) != 1 {
+
+			// Valutiamo ENTRAMBI i confronti a tempo costante incondizionatamente,
+			// invece di combinarli con "||" (che andrebbe in short-circuit): con
+			// "||", se lo username è già sbagliato il confronto della password
+			// verrebbe saltato del tutto, rendendo il tempo di esecuzione
+			// osservabile diverso a seconda che sia sbagliato lo username o la
+			// password — un side-channel timing che vanifica in parte lo scopo
+			// stesso di usare subtle.ConstantTimeCompare. Calcolando sempre
+			// entrambi i risultati prima di combinarli con un semplice "&&"
+			// booleano (non short-circuit su valori già calcolati), il tempo
+			// impiegato non dipende da quale credenziale sia corretta.
+			userOK := subtle.ConstantTimeCompare([]byte(user), []byte(adminUser)) == 1
+			passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(adminPass)) == 1
+
+			if !ok || !userOK || !passOK {
 				w.Header().Set("WWW-Authenticate", `Basic realm="admin"`)
 				writeJSONError(w, http.StatusUnauthorized, "non autorizzato")
 				return

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"notes-server/internal/db"
@@ -41,6 +40,11 @@ func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, settings)
 }
 
+// maxSettingsBodyBytes limita il body di PUT /api/v1/user/settings: è un
+// oggetto piatto di pochi campi scalari, 16 KiB è già ordini di grandezza
+// oltre il necessario.
+const maxSettingsBodyBytes = 16 << 10 // 16 KiB
+
 // UpdateSettings gestisce PUT /api/v1/user/settings.
 // Il body deve contenere l'intero oggetto impostazioni (sostituzione completa,
 // non merge parziale) — l'app client invia sempre lo stato corrente completo.
@@ -57,8 +61,7 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 	}
 
 	var incoming models.UserSettings
-	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+	if !decodeJSONBody(w, r, &incoming, maxSettingsBodyBytes) {
 		return
 	}
 
