@@ -1,88 +1,319 @@
-{{define "users.html"}}
 <!DOCTYPE html>
 <html lang="it">
 <head>
-  <meta charset="UTF-8" />
-  <title>Admin · Note Markdown</title>
-  <style>
-    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }
-    h1 { font-size: 22px; }
-    h2 { font-size: 16px; margin-top: 40px; color: #444; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #fff; }
-    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 14px; }
-    th { background: #f0f0f0; font-weight: 600; }
-    form.inline { display: inline; }
-    .card { background: #fff; border: 1px solid #eee; border-radius: 8px; padding: 20px; margin-top: 12px; }
-    input { padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; margin-right: 8px; }
-    button { padding: 8px 14px; border: none; border-radius: 6px; background: #2563eb; color: #fff; font-size: 14px; cursor: pointer; }
-    button:hover { background: #1d4ed8; }
-    button.secondary { background: #6b7280; }
-    button.secondary:hover { background: #4b5563; }
-    .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
-    .flash.ok { background: #dcfce7; color: #166534; }
-    .flash.error { background: #fee2e2; color: #991b1b; }
-    .mono { font-family: monospace; font-size: 12px; color: #666; }
-    details summary { cursor: pointer; color: #2563eb; font-size: 13px; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="title">Dashboard Admin - Gestione Utenti</title>
+    <style>
+        :root {
+            --bg-color: #f4f6f8;
+            --card-bg: #ffffff;
+            --text-color: #333333;
+            --primary: #0066cc;
+            --danger: #dc3545;
+            --border: #e0e0e0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: var(--card-bg);
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            margin-bottom: 25px;
+        }
+
+        .lang-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        select {
+            padding: 6px 12px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: white;
+            font-size: 14px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--card-bg);
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+
+        th, td {
+            padding: 12px 18px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+        }
+
+        .btn-delete {
+            background-color: var(--danger);
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .btn-delete:hover {
+            opacity: 0.9;
+        }
+
+        /* Modal styling */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+
+        .modal-content {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            max-width: 450px;
+            width: 90%;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .btn-cancel {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+    </style>
 </head>
 <body>
-  <h1>📝 Amministrazione — Note Markdown</h1>
 
-  {{if .Flash}}
-    <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}">{{.Flash}}</div>
-  {{end}}
+    <header>
+        <h1 data-i18n="header_title">Gestione Utenti Server</h1>
+        <div class="lang-container">
+            <label for="languageSelect" data-i18n="lang_label">Lingua:</label>
+            <select id="languageSelect" onchange="changeLanguage(this.value)">
+                <option value="system" data-i18n="lang_system">Sistema (Auto)</option>
+                <option value="it">Italiano</option>
+                <option value="en">English</option>
+                <option value="fr">Français</option>
+            </select>
+        </div>
+    </header>
 
-  <h2>Utenti registrati</h2>
-  <table>
-    <thead>
-      <tr><th>Username</th><th>ID</th><th>Creato il</th><th>Azioni</th></tr>
-    </thead>
-    <tbody>
-      {{range .Users}}
-      <tr>
-        <td>{{.Username}}</td>
-        <td class="mono">{{.ID}}</td>
-        <td>{{.CreatedAt}}</td>
-        <td>
-          <details>
-            <summary>Reset password</summary>
-            <form class="inline" method="POST" action="/admin/users/reset-password" style="margin-top:8px;">
-              <input type="hidden" name="user_id" value="{{.ID}}" />
-              <input type="password" name="new_password" placeholder="Nuova password" minlength="8" required />
-              <button type="submit" class="secondary">Reset</button>
-            </form>
-          </details>
-        </td>
-      </tr>
-      {{else}}
-      <tr><td colspan="4">Nessun utente registrato.</td></tr>
-      {{end}}
-    </tbody>
-  </table>
+    <main>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th data-i18n="th_username">Nome Utente</th>
+                    <th data-i18n="th_role">Ruolo</th>
+                    <th data-i18n="th_actions">Azioni</th>
+                </tr>
+            </thead>
+            <tbody id="usersTableBody">
+                <!-- I dati verranno caricati tramite JS -->
+            </tbody>
+        </table>
+    </main>
 
-  <h2>Crea nuovo utente</h2>
-  <div class="card">
-    <form method="POST" action="/admin/users/create">
-      <input type="text" name="username" placeholder="Username" required autocomplete="off" />
-      <input type="password" name="password" placeholder="Password (min 8 caratteri)" minlength="8" required autocomplete="new-password" />
-      <button type="submit">Crea utente</button>
-    </form>
-  </div>
+    <!-- Modal di Conferma Eliminazione -->
+    <div id="deleteModal" class="modal-overlay">
+        <div class="modal-content">
+            <h3 data-i18n="modal_title">Conferma Eliminazione</h3>
+            <p data-i18n="modal_body">Sei sicuro di voler eliminare questo utente e tutte le sue note? L'azione è irreversibile.</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeDeleteModal()" data-i18n="btn_cancel">Annulla</button>
+                <button class="btn-delete" onclick="confirmDeleteUser()" data-i18n="btn_confirm">Elimina Definivamente</button>
+            </div>
+        </div>
+    </div>
 
-  <p class="mono" style="margin-top:30px;">La password viene cifrata con bcrypt prima di essere salvata; non è mai visibile in chiaro né qui né nel database.</p>
+    <script>
+        const translations = {
+            it: {
+                title: "Dashboard Admin - Gestione Utenti",
+                header_title: "Gestione Utenti Server",
+                lang_label: "Lingua:",
+                lang_system: "Sistema (Auto)",
+                th_username: "Nome Utente",
+                th_role: "Ruolo",
+                th_actions: "Azioni",
+                btn_delete: "Elimina",
+                modal_title: "Conferma Eliminazione",
+                modal_body: "Sei sicuro di voler eliminare questo utente e tutte le sue note? L'azione è irreversibile.",
+                btn_cancel: "Annulla",
+                btn_confirm: "Elimina Definitivamente",
+                role_admin: "Amministratore",
+                role_user: "Utente"
+            },
+            en: {
+                title: "Admin Dashboard - User Management",
+                header_title: "Server User Management",
+                lang_label: "Language:",
+                lang_system: "System (Auto)",
+                th_username: "Username",
+                th_role: "Role",
+                th_actions: "Actions",
+                btn_delete: "Delete",
+                modal_title: "Confirm Deletion",
+                modal_body: "Are you sure you want to delete this user and all associated notes? This action cannot be undone.",
+                btn_cancel: "Cancel",
+                btn_confirm: "Delete Permanently",
+                role_admin: "Administrator",
+                role_user: "User"
+            },
+            fr: {
+                title: "Tableau de bord Admin - Gestion des utilisateurs",
+                header_title: "Gestion des utilisateurs du serveur",
+                lang_label: "Langue :",
+                lang_system: "Système (Auto)",
+                th_username: "Nom d'utilisateur",
+                th_role: "Rôle",
+                th_actions: "Actions",
+                btn_delete: "Supprimer",
+                modal_title: "Confirmer la suppression",
+                modal_body: "Êtes-vous sûr de vouloir supprimer cet utilisateur et toutes ses notes ? Cette action est irréversible.",
+                btn_cancel: "Annuler",
+                btn_confirm: "Supprimer définitivement",
+                role_admin: "Administrateur",
+                role_user: "Utilisateur"
+            }
+        };
 
-  <h2>ℹ️ Crediti & Info Sistema</h2>
-  <div class="card" style="font-size: 13px; line-height: 1.6;">
-    <p><strong>Scripta Notes Server</strong> — v1.2.0 (Go 1.22+)</p>
-    <p>Licenza: <strong>GNU General Public License v3.0 (GPL-3.0)</strong></p>
-    <p style="margin-top:8px;"><strong>Librerie e dipendenze Open Source:</strong></p>
-    <ul style="margin: 4px 0 0 16px; padding: 0;">
-      <li><code>github.com/tursodatabase/go-libsql</code>: Driver SQLite/libSQL puro Go con supporto WAL e embedded replicas.</li>
-      <li><code>github.com/golang-jwt/jwt/v5</code>: Creazione e verifica token JWT con firma HMAC-SHA256.</li>
-      <li><code>golang.org/x/crypto/bcrypt</code>: Funzione crittografica adattiva per hashing password.</li>
-      <li><code>github.com/google/uuid</code>: Generazione crittograficamente sicura di identificatori UUIDv4.</li>
-    </ul>
-  </div>
+        let selectedUserIdToDelete = null;
+
+        function getBrowserLanguage() {
+            const lang = navigator.language || navigator.userLanguage;
+            const shortLang = lang.split('-')[0];
+            return ['it', 'en', 'fr'].includes(shortLang) ? shortLang : 'en';
+        }
+
+        function getCurrentLanguage() {
+            const savedLang = localStorage.getItem('app_lang') || 'system';
+            if (savedLang === 'system') {
+                return getBrowserLanguage();
+            }
+            return savedLang;
+        }
+
+        function applyTranslations() {
+            const lang = getCurrentLanguage();
+            const dict = translations[lang] || translations['en'];
+
+            document.querySelectorAll('[data-i18n]').forEach(element => {
+                const key = element.getAttribute('data-i18n');
+                if (dict[key]) {
+                    element.textContent = dict[key];
+                }
+            });
+        }
+
+        function changeLanguage(langKey) {
+            localStorage.setItem('app_lang', langKey);
+            applyTranslations();
+            loadUsers();
+        }
+
+        function initLanguage() {
+            const savedSetting = localStorage.getItem('app_lang') || 'system';
+            document.getElementById('languageSelect').value = savedSetting;
+            applyTranslations();
+        }
+
+        async function loadUsers() {
+            try {
+                const response = await fetch('/api/admin/users');
+                const users = await response.json();
+                const tbody = document.getElementById('usersTableBody');
+                tbody.innerHTML = '';
+
+                const currentLang = getCurrentLanguage();
+                const dict = translations[currentLang] || translations['en'];
+
+                users.forEach(user => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td>${user.id}</td>
+                        <td>${user.username}</td>
+                        <td>${user.is_admin ? dict.role_admin : dict.role_user}</td>
+                        <td>
+                            <button class="btn-delete" onclick="openDeleteModal(${user.id})">${dict.btn_delete}</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (err) {
+                console.error("Errore nel caricamento utenti:", err);
+            }
+        }
+
+        function openDeleteModal(userId) {
+            selectedUserIdToDelete = userId;
+            document.getElementById('deleteModal').style.display = 'flex';
+        }
+
+        function closeDeleteModal() {
+            selectedUserIdToDelete = null;
+            document.getElementById('deleteModal').style.display = 'none';
+        }
+
+        async function confirmDeleteUser() {
+            if (!selectedUserIdToDelete) return;
+
+            try {
+                const response = await fetch(`/admin/users/${selectedUserIdToDelete}`, {
+                    method: 'DELETE'
+                });
+
+                if (response.ok) {
+                    closeDeleteModal();
+                    loadUsers();
+                } else {
+                    const errText = await response.text();
+                    alert("Errore: " + errText);
+                }
+            } catch (err) {
+                alert("Impossibile completare la richiesta di eliminazione.");
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            initLanguage();
+            loadUsers();
+        });
+    </script>
 </body>
 </html>
-{{end}}
