@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"notes-server/internal/auth"
 	"notes-server/internal/db"
 	"notes-server/internal/storage"
 )
@@ -22,14 +23,6 @@ func NewAdminHandler(usersRepo *db.UsersRepository, storageManager *storage.Stor
 }
 
 func (h *AdminHandler) RenderUsersPage(w http.ResponseWriter, r *http.Request) {
-	users, err := h.usersRepo.GetAll()
-	if err != nil {
-		http.Error(w, "Errore nel recupero degli utenti", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Render del template web/templates/users.html eseguito dal router/template engine
 	http.ServeFile(w, r, "web/templates/users.html")
 }
 
@@ -42,6 +35,43 @@ func (h *AdminHandler) ListUsersAPI(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(users)
+}
+
+type CreateUserRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	IsAdmin  bool   `json:"is_admin"`
+}
+
+func (h *AdminHandler) CreateUserHandler(w http.ResponseWriter, r *http.Request) {
+	var req CreateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Payload non valido", http.StatusBadRequest)
+		return
+	}
+
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, "Username e password sono obbligatori", http.StatusBadRequest)
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(req.Password)
+	if err != nil {
+		http.Error(w, "Errore durante la cifratura della password", http.StatusInternalServerError)
+		return
+	}
+
+	user, err := h.usersRepo.Create(req.Username, hashedPassword, req.IsAdmin)
+	if err != nil {
+		http.Error(w, "Impossibile creare l'utente: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	_ = h.storageManager.EnsureUserDir(user.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(user)
 }
 
 func (h *AdminHandler) DeleteUserHandler(w http.ResponseWriter, r *http.Request) {
@@ -61,21 +91,17 @@ func (h *AdminHandler) DeleteUserHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Previene l'auto-eliminazione dell'admin loggato se presente in contesto
 	if currentUserID, ok := r.Context().Value("user_id").(int64); ok && currentUserID == userID {
 		http.Error(w, "Impossibile eliminare l'account amministratore attualmente in uso", http.StatusForbidden)
 		return
 	}
 
-	// 1. Rimuove l'utente dal Database
 	if err := h.usersRepo.DeleteUser(userID); err != nil {
 		http.Error(w, "Errore durante la cancellazione dal database: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 2. Rimuove la cartella e i file fisici dall'archivio
 	if err := h.storageManager.DeleteUserDataDir(userID); err != nil {
-		// Log dell'errore storage, ma la risposta utente prosegue siccome l'utente DB è rimosso
 		_ = err
 	}
 
@@ -83,6 +109,6 @@ func (h *AdminHandler) DeleteUserHandler(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "success",
-		"message": "Utente e file relativi eliminati con successo",
+		"message": "Utente e dati rimossi con successo",
 	})
 }
