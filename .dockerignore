@@ -1,0 +1,5 @@
+data/
+.git/
+.gitignore
+*.md
+notes-server
