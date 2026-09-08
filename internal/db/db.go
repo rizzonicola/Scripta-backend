@@ -137,6 +137,20 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
+	if rawConnector == nil {
+		// Solo in modalità locale pura: abilita auto_vacuum=INCREMENTAL (con
+		// un VACUUM di conversione una-tantum se necessario) così che la
+		// manutenzione periodica in background (vedi RunMaintenance in
+		// maintenance.go, avviata da main.go) possa recuperare lo spazio
+		// liberato dagli hard-delete tramite PRAGMA incremental_vacuum,
+		// un'operazione economica ripetibile spesso senza bloccare il
+		// server. In modalità embedded replica questo passo viene saltato
+		// di proposito: vedi il commento su RunMaintenance per il motivo.
+		if err := bootstrapIncrementalVacuum(conn); err != nil {
+			log.Printf("attenzione: impossibile abilitare auto_vacuum incrementale (%v); il recupero automatico dello spazio su disco resterà disattivato finché il problema persiste, ma la cancellazione dei dati (hard-delete dei tombstone) non è comunque affetta", err)
+		}
+	}
+
 	log.Printf("database aperto via libSQL in modalità %s (WAL, synchronous=NORMAL, max_open_conns=%d): %s", mode, maxOpen, cfg.Path)
 	return conn, nil
 }
@@ -297,6 +311,14 @@ var migrationStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_folders_updated ON folders(user_id, updated_at)`,
+	// Indice parziale: PurgeExpiredTombstones (folders_repo.go) filtra
+	// "WHERE deleted_at IS NOT NULL AND deleted_at < ?" senza user_id (è un
+	// job di manutenzione globale, non per-utente). Senza questo indice
+	// quella DELETE fa uno scan completo della tabella folders ad ogni
+	// ciclo di purge (main.go, ogni 24h); essendo parziale (solo le righe
+	// con deleted_at valorizzato, cioè i soli tombstone) resta piccolo e
+	// economico da mantenere anche sulle scritture normali di righe attive.
+	`CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
 	`CREATE TABLE IF NOT EXISTS notes (
 		id         TEXT PRIMARY KEY,
 		user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -309,6 +331,8 @@ var migrationStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(user_id, updated_at)`,
+	// Stessa motivazione di idx_folders_deleted_at, per NotesRepo.PurgeExpiredTombstones.
+	`CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
 	`CREATE TABLE IF NOT EXISTS user_settings (
 		user_id       TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
 		settings_json TEXT NOT NULL,

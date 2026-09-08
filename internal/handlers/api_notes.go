@@ -75,17 +75,23 @@ func (h *NotesHandler) DownloadMarkdown(w http.ResponseWriter, r *http.Request) 
 	_, _ = w.Write([]byte(note.Content))
 }
 
+// filenameReplacer è package-level e non ricreato ad ogni chiamata: un
+// *strings.Replacer costruito con NewReplacer alloca internamente una
+// tabella di lookup, farlo per ogni singola richiesta di download è uno
+// spreco (l'oggetto è immutabile e completamente riutilizzabile, e
+// *strings.Replacer è safe per l'uso concorrente).
+var filenameReplacer = strings.NewReplacer(
+	"/", "-", "\\", "-", ":", "-", "*", "-", "?", "-",
+	"\"", "-", "<", "-", ">", "-", "|", "-", "\x00", "",
+)
+
 // sanitizeFilename produce un nome file sicuro a partire dal titolo di una
 // nota: rimuove i separatori di percorso e i caratteri tipicamente non validi
 // nei nomi file su Windows/macOS/Linux, e ricade su "nota" se il titolo,
 // dopo la pulizia, risultasse vuoto.
 func sanitizeFilename(title string) string {
 	title = strings.TrimSpace(title)
-	replacer := strings.NewReplacer(
-		"/", "-", "\\", "-", ":", "-", "*", "-", "?", "-",
-		"\"", "-", "<", "-", ">", "-", "|", "-", "\x00", "",
-	)
-	title = replacer.Replace(title)
+	title = filenameReplacer.Replace(title)
 	if title == "" {
 		title = "nota"
 	}

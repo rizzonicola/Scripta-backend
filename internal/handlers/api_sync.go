@@ -306,12 +306,6 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 	return nil
 }
 
-// sqlTx è il sottoinsieme di *sql.Tx usato da beginTxWithRetry.
-type sqlTx interface {
-	Commit() error
-	Rollback() error
-}
-
 // beginTxWithRetry avvia una transazione ritentando, con backoff crescente,
 // solo in caso di contesa transitoria del database. È sicuro ritentare qui
 // perché nessuna scrittura è ancora avvenuta.
@@ -336,8 +330,3 @@ func (h *SyncHandler) beginTxWithRetry(ctx context.Context) (*sql.Tx, error) {
 	}
 	return nil, lastErr
 }
-
-// ensure sqlTx stays referenced for interface documentation purposes even
-// though *sql.Tx already satisfies it structurally and no variable of type
-// sqlTx is otherwise declared.
-var _ sqlTx = (*sql.Tx)(nil)
