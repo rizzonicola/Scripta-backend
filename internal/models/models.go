@@ -31,13 +31,16 @@ type Folder struct {
 // database (Content), non un file su disco: questo elimina ogni necessità
 // di risolvere/validare percorsi e ogni possibilità di path traversal.
 type Note struct {
-	ID        string
-	UserID    string
-	Title     string
-	Content   string
-	FolderID  *string // nil = nota nella radice ("Tutte le note" la mostra comunque)
-	UpdatedAt int64   // unix millis UTC
-	DeletedAt *int64  // nil = attiva; non-nil = soft-deleted (tombstone)
+	ID         string
+	UserID     string
+	Title      string
+	Content    string
+	FolderID   *string // nil = nota nella radice ("Tutte le note" la mostra comunque)
+	IsFavorite bool
+	IsPinned   bool
+	OrderIndex int
+	UpdatedAt  int64  // unix millis UTC
+	DeletedAt  *int64 // nil = attiva; non-nil = soft-deleted (tombstone)
 }
 
 // FolderDTO è la rappresentazione JSON di una cartella scambiata durante la
@@ -51,13 +54,26 @@ type FolderDTO struct {
 }
 
 // NoteDTO è la rappresentazione JSON di una nota scambiata durante la sync.
+//
+// IsFavorite/IsPinned/OrderIndex viaggiano nel protocollo di sync esattamente
+// come title/content/folder_id: sono metadati mutabili dell'entità "nota", e
+// come tali soggetti alla stessa risoluzione LWW basata su UpdatedAt. Prima
+// della loro introduzione qui, lo stato "pinned" impostato sul client non
+// veniva MAI inviato al server (il DTO non aveva il campo) né, di
+// conseguenza, mai restituito dalla pull: il giro di sync successivo
+// applicava comunque localmente la nota appena echeggiata dal server con
+// updated_at >= a quello locale, sovrascrivendo silenziosamente isPinned con
+// il default false. Vedi lo stesso commento in NoteChangeDto lato client.
 type NoteDTO struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Content   string  `json:"content"`
-	FolderID  *string `json:"folder_id"`
-	UpdatedAt int64   `json:"updated_at"`
-	DeletedAt *int64  `json:"deleted_at"`
+	ID         string  `json:"id"`
+	Title      string  `json:"title"`
+	Content    string  `json:"content"`
+	FolderID   *string `json:"folder_id"`
+	IsFavorite bool    `json:"is_favorite"`
+	IsPinned   bool    `json:"is_pinned"`
+	OrderIndex int     `json:"order_index"`
+	UpdatedAt  int64   `json:"updated_at"`
+	DeletedAt  *int64  `json:"deleted_at"`
 }
 
 // SyncRequest è il body di POST /api/v1/sync.

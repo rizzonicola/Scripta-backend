@@ -196,13 +196,16 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		note := &models.Note{
-			ID:        nc.ID,
-			UserID:    userID,
-			Title:     nc.Title,
-			Content:   nc.Content,
-			FolderID:  nc.FolderID,
-			UpdatedAt: nc.UpdatedAt,
-			DeletedAt: nc.DeletedAt,
+			ID:         nc.ID,
+			UserID:     userID,
+			Title:      nc.Title,
+			Content:    nc.Content,
+			FolderID:   nc.FolderID,
+			IsFavorite: nc.IsFavorite,
+			IsPinned:   nc.IsPinned,
+			OrderIndex: nc.OrderIndex,
+			UpdatedAt:  nc.UpdatedAt,
+			DeletedAt:  nc.DeletedAt,
 		}
 		if err := notesTx.UpsertLWW(ctx, note); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "errore elaborazione nota")
@@ -254,12 +257,15 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, n := range notes {
 		resp.Notes = append(resp.Notes, models.NoteDTO{
-			ID:        n.ID,
-			Title:     n.Title,
-			Content:   n.Content,
-			FolderID:  n.FolderID,
-			UpdatedAt: n.UpdatedAt,
-			DeletedAt: n.DeletedAt,
+			ID:         n.ID,
+			Title:      n.Title,
+			Content:    n.Content,
+			FolderID:   n.FolderID,
+			IsFavorite: n.IsFavorite,
+			IsPinned:   n.IsPinned,
+			OrderIndex: n.OrderIndex,
+			UpdatedAt:  n.UpdatedAt,
+			DeletedAt:  n.DeletedAt,
 		})
 	}
 

@@ -320,13 +320,16 @@ var migrationStatements = []string{
 	// economico da mantenere anche sulle scritture normali di righe attive.
 	`CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
 	`CREATE TABLE IF NOT EXISTS notes (
-		id         TEXT PRIMARY KEY,
-		user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		title      TEXT NOT NULL DEFAULT '',
-		content    TEXT NOT NULL DEFAULT '',
-		folder_id  TEXT,
-		updated_at INTEGER NOT NULL,
-		deleted_at INTEGER
+		id          TEXT PRIMARY KEY,
+		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		title       TEXT NOT NULL DEFAULT '',
+		content     TEXT NOT NULL DEFAULT '',
+		folder_id   TEXT,
+		is_favorite INTEGER NOT NULL DEFAULT 0,
+		is_pinned   INTEGER NOT NULL DEFAULT 0,
+		order_index INTEGER NOT NULL DEFAULT 0,
+		updated_at  INTEGER NOT NULL,
+		deleted_at  INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
@@ -355,6 +358,65 @@ func migrate(conn *sql.DB) error {
 		if _, err := conn.Exec(stmt); err != nil {
 			return fmt.Errorf("statement %q: %w", stmt, err)
 		}
+	}
+
+	// CREATE TABLE IF NOT EXISTS sopra non altera una tabella "notes" già
+	// esistente nel nuovo schema ID-based ma creata PRIMA dell'introduzione
+	// di is_favorite/is_pinned/order_index: su un'installazione del genere
+	// queste colonne mancherebbero silenziosamente, e ogni UPSERT/SELECT che
+	// le referenzia fallirebbe. addNotesPinningColumns le aggiunge in modo
+	// additivo (ALTER TABLE ADD COLUMN, idempotente) quando risultano assenti.
+	if err := addNotesPinningColumns(conn); err != nil {
+		return fmt.Errorf("migrazione colonne pin/favorite: %w", err)
+	}
+	return nil
+}
+
+// addNotesPinningColumns aggiunge is_favorite, is_pinned e order_index alla
+// tabella "notes" se non sono già presenti. È sicuro chiamarla ad ogni avvio
+// (idempotente): interroga PRAGMA table_info prima di ogni ALTER TABLE e
+// salta le colonne già esistenti, esattamente come quarantineLegacyNotesTable
+// fa per il rilevamento dello schema legacy.
+func addNotesPinningColumns(conn *sql.DB) error {
+	rows, err := conn.Query(`PRAGMA table_info(notes)`)
+	if err != nil {
+		return fmt.Errorf("pragma table_info(notes): %w", err)
+	}
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan table_info(notes): %w", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterazione table_info(notes): %w", err)
+	}
+	rows.Close()
+
+	wanted := []struct {
+		column string
+		ddl    string
+	}{
+		{"is_favorite", `ALTER TABLE notes ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0`},
+		{"is_pinned", `ALTER TABLE notes ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0`},
+		{"order_index", `ALTER TABLE notes ADD COLUMN order_index INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, w := range wanted {
+		if existing[w.column] {
+			continue
+		}
+		if _, err := conn.Exec(w.ddl); err != nil {
+			return fmt.Errorf("alter table %q: %w", w.column, err)
+		}
+		log.Printf("migrazione: aggiunta colonna notes.%s mancante (default 0)", w.column)
 	}
 	return nil
 }

@@ -38,10 +38,10 @@ func NewNotesRepo(d execer) *NotesRepo {
 func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, error) {
 	var n models.Note
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, user_id, title, content, folder_id, updated_at, deleted_at
+		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at
 		 FROM notes WHERE id = ? AND user_id = ?`,
 		id, userID,
-	).Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.UpdatedAt, &n.DeletedAt)
+	).Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.DeletedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -75,17 +75,20 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 		n.ID = uuid.NewString()
 	}
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO notes (id, user_id, title, content, folder_id, updated_at, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			title      = excluded.title,
-			content    = excluded.content,
-			folder_id  = excluded.folder_id,
-			updated_at = excluded.updated_at,
-			deleted_at = excluded.deleted_at
+			title       = excluded.title,
+			content     = excluded.content,
+			folder_id   = excluded.folder_id,
+			is_favorite = excluded.is_favorite,
+			is_pinned   = excluded.is_pinned,
+			order_index = excluded.order_index,
+			updated_at  = excluded.updated_at,
+			deleted_at  = excluded.deleted_at
 		WHERE excluded.updated_at >= notes.updated_at
 		  AND notes.user_id = excluded.user_id
-	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.UpdatedAt, n.DeletedAt)
+	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.UpdatedAt, n.DeletedAt)
 	return err
 }
 
@@ -111,7 +114,7 @@ func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt i
 // nella stessa transazione).
 func (r *NotesRepo) ListUpdatedSince(ctx context.Context, userID string, since int64) ([]models.Note, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, user_id, title, content, folder_id, updated_at, deleted_at
+		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at
 		 FROM notes WHERE user_id = ? AND updated_at > ? ORDER BY updated_at ASC`,
 		userID, since,
 	)
@@ -123,7 +126,7 @@ func (r *NotesRepo) ListUpdatedSince(ctx context.Context, userID string, since i
 	var notes []models.Note
 	for rows.Next() {
 		var n models.Note
-		if err := rows.Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.UpdatedAt, &n.DeletedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.DeletedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
