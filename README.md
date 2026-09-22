@@ -28,7 +28,7 @@ notes-server/
 │   │   ├── settings.go              # GET/PUT /api/v1/user/settings
 │   │   └── helpers.go
 │   ├── middleware/
-│   │   └── auth.go                  # middleware JWT + Basic Auth admin
+│   │   └── auth.go                  # middleware JWT + sessione admin (cookie)
 │   ├── models/
 │   │   └── models.go
 │   └── storage/
@@ -55,7 +55,7 @@ ADMIN_USER=admin ADMIN_PASS=supersegreta \
 ```
 
 Il server parte su `:8080`. Dashboard admin: `http://localhost:8080/admin`
-(protetta con HTTP Basic Auth, credenziali da `ADMIN_USER` / `ADMIN_PASS`).
+(protetta da login form-based con cookie di sessione; credenziali da `ADMIN_USER` / `ADMIN_PASS`).
 
 > Nota: in questo ambiente di generazione del codice non è stato possibile eseguire
 > `go mod tidy` / `go build` perché la rete è disabilitata (impossibile scaricare
@@ -79,8 +79,10 @@ gli utenti. Ricordarsi di **cambiare** `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS`
 |-------------------|-------------------------|------------------------------------------------|
 | `DB_PATH`         | `data/app.db`           | Percorso file SQLite (contiene TUTTI i dati: utenti, cartelle, note) |
 | `JWT_SECRET`      | *(insicuro, da cambiare)* | Chiave HMAC per firma JWT                   |
-| `ADMIN_USER`      | `admin`                 | Username Basic Auth dashboard `/admin`        |
-| `ADMIN_PASS`      | `admin`                 | Password Basic Auth dashboard `/admin`        |
+| `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `30m`) |
+| `ADMIN_SESSION_TTL` | `8h`                  | Durata del cookie di sessione admin (`time.Duration`) |
+| `ADMIN_USER`      | `admin`                 | Username login dashboard `/admin`             |
+| `ADMIN_PASS`      | `admin`                 | Password login dashboard `/admin`             |
 | `PORT`            | `8080`                  | Porta HTTP                                    |
 
 ---
@@ -254,7 +256,7 @@ Content-Disposition: attachment; filename="riunione-2026-09-01.md"
 
 ## Dashboard Admin (`/admin`)
 
-Protetta da HTTP Basic Auth (`ADMIN_USER` / `ADMIN_PASS`).
+Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sessione HttpOnly/Secure/SameSite=Strict, invece del popup nativo Basic Auth: i campi sono riconosciuti dai password manager e il logout (`/admin/logout`) è esplicito.
 
 - **`GET /admin`** — elenco utenti registrati (username, ID, data creazione) + form
   di creazione nuovo utente.

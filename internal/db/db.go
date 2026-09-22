@@ -369,7 +369,162 @@ func migrate(conn *sql.DB) error {
 	if err := addNotesPinningColumns(conn); err != nil {
 		return fmt.Errorf("migrazione colonne pin/favorite: %w", err)
 	}
+
+	// Vincola a livello di schema che folders.parent_id e notes.folder_id
+	// possano riferire SOLO una cartella dello stesso user_id (mai di un
+	// altro utente): vedi addOwnershipForeignKeys per i dettagli.
+	if err := addOwnershipForeignKeys(conn); err != nil {
+		return fmt.Errorf("migrazione foreign key di ownership: %w", err)
+	}
 	return nil
+}
+
+// addOwnershipForeignKeys ricostruisce folders/notes con una FOREIGN KEY
+// composita su (parent_id/folder_id, user_id) che referenzia folders(id,
+// user_id): SQLite valuta questo vincolo direttamente nell'INSERT/UPDATE,
+// quindi UpsertLWW non ha bisogno di alcuna SELECT applicativa preventiva
+// per verificare che un parent_id/folder_id appartenga davvero al chiamante
+// — un singolo round-trip, con l'ownership imposta dal motore stesso.
+//
+// SQLite non supporta "ALTER TABLE ... ADD CONSTRAINT": un vincolo FK può
+// essere introdotto solo ricreando la tabella (la procedura in 12 passi
+// documentata da sqlite.org per ALTER TABLE avanzato). La migrazione:
+//
+//  1. è idempotente: viene saltata se l'indice univoco idx_folders_id_user
+//     (creato solo all'ultimo passo di una ricostruzione riuscita) esiste
+//     già, quindi è sicuro chiamarla ad ogni avvio;
+//  2. disattiva temporaneamente PRAGMA foreign_keys (obbligatorio: SQLite
+//     rifiuta di cambiarlo dentro una transazione, e va comunque disattivato
+//     mentre le tabelle vengono rinominate/ricreate) e lo riattiva sempre
+//     al termine, con o senza errore;
+//  3. esegue l'intera ricostruzione in un'unica transazione;
+//  4. PRIMA del commit, esegue PRAGMA foreign_key_check: se un'installazione
+//     preesistente avesse già righe con parent_id/folder_id orfani o
+//     puntanti a un altro utente (possibile solo su dati creati prima di
+//     questo fix), la migrazione fallisce esplicitamente invece di
+//     applicare in silenzio un vincolo che i dati correnti violerebbero.
+func addOwnershipForeignKeys(conn *sql.DB) error {
+	already, err := indexExists(conn, "idx_folders_id_user")
+	if err != nil {
+		return fmt.Errorf("verifica migrazione già applicata: %w", err)
+	}
+	if already {
+		return nil
+	}
+
+	if err := queryDiscard(conn, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("disattivazione temporanea foreign_keys: %w", err)
+	}
+	defer func() {
+		if err := queryDiscard(conn, "PRAGMA foreign_keys=ON"); err != nil {
+			log.Printf("attenzione: impossibile riattivare PRAGMA foreign_keys dopo la migrazione ownership: %v", err)
+		}
+	}()
+
+	tx, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("avvio transazione migrazione: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	rebuildStatements := []string{
+		`CREATE TABLE folders_new (
+			id         TEXT PRIMARY KEY,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name       TEXT NOT NULL,
+			parent_id  TEXT,
+			updated_at INTEGER NOT NULL,
+			deleted_at INTEGER,
+			FOREIGN KEY (parent_id, user_id) REFERENCES folders(id, user_id) ON DELETE CASCADE
+		)`,
+		`INSERT INTO folders_new (id, user_id, name, parent_id, updated_at, deleted_at)
+		 SELECT id, user_id, name, parent_id, updated_at, deleted_at FROM folders`,
+		`DROP TABLE folders`,
+		`ALTER TABLE folders_new RENAME TO folders`,
+
+		`CREATE TABLE notes_new (
+			id          TEXT PRIMARY KEY,
+			user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			title       TEXT NOT NULL DEFAULT '',
+			content     TEXT NOT NULL DEFAULT '',
+			folder_id   TEXT,
+			is_favorite INTEGER NOT NULL DEFAULT 0,
+			is_pinned   INTEGER NOT NULL DEFAULT 0,
+			order_index INTEGER NOT NULL DEFAULT 0,
+			updated_at  INTEGER NOT NULL,
+			deleted_at  INTEGER,
+			FOREIGN KEY (folder_id, user_id) REFERENCES folders(id, user_id) ON DELETE CASCADE
+		)`,
+		`INSERT INTO notes_new (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at)
+		 SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at FROM notes`,
+		`DROP TABLE notes`,
+		`ALTER TABLE notes_new RENAME TO notes`,
+
+		// Indici: ricreati identici a quelli originari, persi con il DROP
+		// TABLE. idx_folders_id_user in più: è l'indice univoco richiesto da
+		// SQLite come target della FK composita "(parent_id, user_id)
+		// REFERENCES folders(id, user_id)", ed è anche il marcatore che
+		// indexExists usa per riconoscere che questa migrazione è già stata
+		// applicata in un avvio precedente.
+		`CREATE UNIQUE INDEX idx_folders_id_user ON folders(id, user_id)`,
+		`CREATE INDEX idx_folders_user ON folders(user_id)`,
+		`CREATE INDEX idx_folders_parent ON folders(user_id, parent_id)`,
+		`CREATE INDEX idx_folders_updated ON folders(user_id, updated_at)`,
+		`CREATE INDEX idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
+		`CREATE INDEX idx_notes_user ON notes(user_id)`,
+		`CREATE INDEX idx_notes_folder ON notes(user_id, folder_id)`,
+		`CREATE INDEX idx_notes_updated ON notes(user_id, updated_at)`,
+		`CREATE INDEX idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
+	}
+
+	for _, stmt := range rebuildStatements {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("statement %q: %w", stmt, err)
+		}
+	}
+
+	if err := foreignKeyCheck(tx); err != nil {
+		return fmt.Errorf("dati esistenti incompatibili con i nuovi vincoli di ownership "+
+			"(parent_id/folder_id orfani o appartenenti a un altro utente): %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migrazione ownership: %w", err)
+	}
+	committed = true
+	log.Printf("migrazione schema: aggiunta foreign key composita di ownership su folders.parent_id / notes.folder_id")
+	return nil
+}
+
+// indexExists verifica se un indice con quel nome esiste già nel DB.
+func indexExists(conn *sql.DB, name string) (bool, error) {
+	var n int
+	err := conn.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// foreignKeyCheck esegue PRAGMA foreign_key_check dentro la transazione di
+// migrazione: restituisce errore se una qualunque riga violasse i vincoli
+// FK appena introdotti (incluse le righe pre-esistenti, non solo quelle
+// toccate da questa transazione).
+func foreignKeyCheck(tx *sql.Tx) error {
+	rows, err := tx.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return fmt.Errorf("PRAGMA foreign_key_check ha rilevato violazioni di integrità referenziale")
+	}
+	return rows.Err()
 }
 
 // addNotesPinningColumns aggiunge is_favorite, is_pinned e order_index alla

@@ -2,11 +2,30 @@ package handlers
 
 import (
 	"net/http"
+	"time"
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
 	"notes-server/internal/models"
 )
+
+// minLoginResponseTime appiattisce la differenza di tempo osservabile tra
+// "username inesistente" (una sola query DB, quasi gratis) e "username
+// esistente ma password sbagliata" (query + bcrypt, qualche decina di ms),
+// che altrimenti permetterebbe la user enumeration via timing.
+//
+// Deliberatamente un floor con time.Sleep e NON un bcrypt.CompareHashAndPassword
+// contro un hash "decoy" quando l'utente non esiste: quell'approccio,
+// proposto in un primo momento, trasformerebbe ogni tentativo di login con
+// username inventato (oggi quasi gratuito) in uno che consuma sempre un
+// hash bcrypt completo, dando a un attaccante un moltiplicatore di costo
+// enorme per un DoS volumetrico — un rischio più concreto del timing leak
+// che dovrebbe mitigare. time.Sleep blocca la sola goroutine su un timer
+// (nessun uso di CPU in busy-loop), quindi non è amplificabile allo stesso
+// modo. Resta comunque una misura di secondo piano: la difesa primaria
+// contro il volume di tentativi è la Cloudflare WAF Rate Limiting Rule a
+// monte (vedi main.go).
+const minLoginResponseTime = 100 * time.Millisecond
 
 type AuthHandler struct {
 	Users  *db.UsersRepo
@@ -30,6 +49,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
+
 	var req models.LoginRequest
 	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
@@ -45,6 +66,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user == nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
+		sleepUntilMinResponseTime(start)
 		writeJSONError(w, http.StatusUnauthorized, "credenziali non valide")
 		return
 	}
@@ -61,4 +83,14 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		UserID:    user.ID,
 		Username:  user.Username,
 	})
+}
+
+// sleepUntilMinResponseTime attende, se necessario, fino a raggiungere
+// minLoginResponseTime dall'istante di partenza start. Se il tentativo era
+// già più lento del floor (caso tipico: utente esistente, bcrypt già speso)
+// non attende affatto.
+func sleepUntilMinResponseTime(start time.Time) {
+	if elapsed := time.Since(start); elapsed < minLoginResponseTime {
+		time.Sleep(minLoginResponseTime - elapsed)
+	}
 }

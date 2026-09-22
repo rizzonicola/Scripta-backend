@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"log"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -71,6 +72,25 @@ func isTransientBusyErr(err error) bool {
 	return strings.Contains(msg, "database is locked") ||
 		strings.Contains(msg, "database table is locked") ||
 		strings.Contains(msg, "sqlite_busy")
+}
+
+// isForeignKeyViolation riconosce il rifiuto, da parte di SQLite/libSQL, di
+// un INSERT/UPDATE che violerebbe la FK composita di ownership introdotta in
+// internal/db/db.go (addOwnershipForeignKeys): parent_id/folder_id che punta
+// a una cartella inesistente o appartenente a un altro utente.
+//
+// A differenza di una busy-error, questa non è transitoria: significa che
+// il singolo elemento del batch inviato dal client è, di per sé, invalido.
+// SQLite di default risolve una violazione FK con ABORT: annulla solo gli
+// effetti dello statement che l'ha causata, la transazione in corso resta
+// pienamente utilizzabile per gli statement successivi — per questo il
+// chiamante può semplicemente scartare l'elemento incriminato e proseguire
+// il resto del batch, invece di far fallire l'intera sync.
+func isForeignKeyViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "foreign key constraint")
 }
 
 // Sync gestisce POST /api/v1/sync applicando il protocollo Delta Sync
@@ -167,6 +187,15 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 			DeletedAt: fc.DeletedAt,
 		}
 		if err := foldersTx.UpsertLWW(ctx, folder); err != nil {
+			if isForeignKeyViolation(err) {
+				// parent_id inesistente o di un altro utente: si scarta
+				// questa singola cartella (coerente con la filosofia
+				// "server accetta il batch anche se un elemento è
+				// incoerente" già usata per il caso LWW "server wins") e
+				// si prosegue con il resto del batch.
+				log.Printf("sync: cartella %s scartata, parent_id non valido o non dell'utente", fc.ID)
+				continue
+			}
 			writeJSONError(w, http.StatusInternalServerError, "errore elaborazione cartella")
 			return
 		}
@@ -208,6 +237,12 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 			DeletedAt:  nc.DeletedAt,
 		}
 		if err := notesTx.UpsertLWW(ctx, note); err != nil {
+			if isForeignKeyViolation(err) {
+				// folder_id inesistente o di un altro utente: stesso
+				// trattamento del caso analogo sulle cartelle sopra.
+				log.Printf("sync: nota %s scartata, folder_id non valido o non dell'utente", nc.ID)
+				continue
+			}
 			writeJSONError(w, http.StatusInternalServerError, "errore elaborazione nota")
 			return
 		}

@@ -3,6 +3,7 @@
 <html lang="it">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title data-i18n="pageTitle">Admin · Note Markdown</title>
   <style>
     body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }
@@ -49,6 +50,9 @@
         <option value="en" data-i18n="langEn">English</option>
         <option value="fr" data-i18n="langFr">Français</option>
       </select>
+      <form method="POST" action="/admin/logout" class="inline">
+        <button type="submit" class="secondary" data-i18n="logoutBtn">Esci</button>
+      </form>
     </div>
   </header>
 
@@ -164,6 +168,7 @@
         langIt: 'Italiano',
         langEn: 'English',
         langFr: 'Français',
+        logoutBtn: 'Esci',
         usersHeading: 'Utenti registrati',
         colUsername: 'Username',
         colId: 'ID',
@@ -199,6 +204,7 @@
         langIt: 'Italiano',
         langEn: 'English',
         langFr: 'Français',
+        logoutBtn: 'Log out',
         usersHeading: 'Registered users',
         colUsername: 'Username',
         colId: 'ID',
@@ -234,6 +240,7 @@
         langIt: 'Italiano',
         langEn: 'English',
         langFr: 'Français',
+        logoutBtn: 'Déconnexion',
         usersHeading: 'Utilisateurs enregistrés',
         colUsername: "Nom d'utilisateur",
         colId: 'ID',

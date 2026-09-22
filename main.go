@@ -36,6 +36,37 @@ func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
 	}
 }
 
+// adminLoginDispatch instrada GET (mostra il form) e POST (verifica le
+// credenziali) su /admin/login verso i rispettivi handler, applicando al
+// solo POST il rate limiting e il controllo same-origin: il GET si limita a
+// servire una pagina statica e non ha bisogno di nessuna delle due difese.
+func adminLoginDispatch(h *handlers.AdminHandler, loginGuards func(http.Handler) http.Handler) http.HandlerFunc {
+	post := loginGuards(http.HandlerFunc(h.Login))
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			h.LoginPage(w, r)
+		case http.MethodPost:
+			post.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
+		}
+	}
+}
+
+// chain compone più middleware in ordine di applicazione (il primo elencato
+// è il più esterno, eseguito per primo).
+func chain(mws ...func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(h http.Handler) http.Handler {
+		for i := len(mws) - 1; i >= 0; i-- {
+			h = mws[i](h)
+		}
+		return h
+	}
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -83,12 +114,40 @@ func main() {
 	usersRepo := db.NewUsersRepo(sqlDB)
 	notesRepo := db.NewNotesRepo(sqlDB)
 	settingsRepo := db.NewSettingsRepo(sqlDB)
-	tokenManager := auth.NewTokenManager(jwtSecret, 7*24*time.Hour)
+
+	// jwtTTL: 24h di default (era 7 giorni). Un TTL corto limita la finestra
+	// di validità di un token rubato SENZA bisogno di consultare il DB ad
+	// ogni richiesta (la revoca esplicita, vedi TokenManager.Revoke, resta
+	// riservata ai soli eventi rari — reset password, cancellazione utente
+	// — dove serve invalidare un token PRIMA della sua scadenza naturale).
+	jwtTTL := 24 * time.Hour
+	if raw := getEnv("JWT_TTL", ""); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			jwtTTL = d
+		} else {
+			log.Printf("JWT_TTL non valido (%q), uso il default (%s)", raw, jwtTTL)
+		}
+	}
+	tokenManager := auth.NewTokenManager(jwtSecret, jwtTTL)
+
+	// adminSessionTTL: durata del cookie di sessione della dashboard /admin
+	// (login form-based, vedi handlers.AdminHandler.Login). Volutamente più
+	// lunga del TTL dei token utente: è un'area amministrativa usata
+	// saltuariamente, non uno strumento su cui forzare re-login frequenti.
+	adminSessionTTL := 8 * time.Hour
+	if raw := getEnv("ADMIN_SESSION_TTL", ""); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			adminSessionTTL = d
+		} else {
+			log.Printf("ADMIN_SESSION_TTL non valido (%q), uso il default (%s)", raw, adminSessionTTL)
+		}
+	}
+	adminSessions := auth.NewAdminSessionManager(jwtSecret, adminSessionTTL)
 
 	// --- Handlers ---
 	// Nessuno storage su filesystem da inizializzare: cartelle e note vivono
 	// interamente nel database (schema ID-based in internal/db/db.go).
-	adminHandler, err := handlers.NewAdminHandler(usersRepo, templatesFS)
+	adminHandler, err := handlers.NewAdminHandler(usersRepo, tokenManager, adminSessions, adminUser, adminPass, templatesFS)
 	if err != nil {
 		log.Fatalf("errore caricamento template admin: %v", err)
 	}
@@ -122,15 +181,37 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// --- Dashboard Admin (protetta con Basic Auth) ---
-	adminAuth := middleware.BasicAuthAdmin(adminUser, adminPass)
+	// --- Rate limiting locale (seconda linea di difesa) ---
+	// La difesa PRIMARIA contro credential stuffing/brute force è la
+	// Cloudflare WAF Rate Limiting Rule configurata davanti al tunnel
+	// (valutata al edge, prima ancora che la richiesta arrivi qui, senza
+	// consumare CPU di questo processo): vedi README/documentazione di
+	// deploy. Questi limiter locali restano comunque attivi come seconda
+	// linea, per il caso in cui il WAF sia assente, disattivato o
+	// mal configurato, e per l'uso in sviluppo locale senza Cloudflare
+	// davanti. Le soglie sono volutamente permissive (l'utente legittimo non
+	// deve mai accorgersene): 1 richiesta ogni 2s a regime, burst di 5.
+	loginRateLimit := middleware.RateLimit(0.5, 5)
+
+	// --- Difesa CSRF per le rotte POST della dashboard admin ---
+	sameOrigin := middleware.RequireSameOrigin
+
+	// --- Dashboard Admin (login form-based + cookie di sessione) ---
+	// Sostituisce il precedente HTTP Basic Auth: vedi
+	// internal/handlers/admin.go e web/templates/admin_login.html per i
+	// dettagli (login riconosciuto dai password manager, logout esplicito).
+	// Su Cloudflare Tunnel è comunque consigliato affiancare Cloudflare
+	// Access/Zero Trust davanti a questo path per un'autenticazione a monte.
+	adminAuth := middleware.SessionAuthAdmin(adminSessions)
+	mux.HandleFunc("/admin/login", adminLoginDispatch(adminHandler, chain(loginRateLimit, sameOrigin)))
+	mux.Handle("/admin/logout", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.Logout))))
 	mux.Handle("/admin", adminAuth(http.HandlerFunc(adminHandler.UsersPage)))
-	mux.Handle("/admin/users/create", adminAuth(http.HandlerFunc(adminHandler.CreateUser)))
-	mux.Handle("/admin/users/reset-password", adminAuth(http.HandlerFunc(adminHandler.ResetPassword)))
-	mux.Handle("/admin/users/delete", adminAuth(http.HandlerFunc(adminHandler.DeleteUser)))
+	mux.Handle("/admin/users/create", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.CreateUser))))
+	mux.Handle("/admin/users/reset-password", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.ResetPassword))))
+	mux.Handle("/admin/users/delete", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.DeleteUser))))
 
 	// --- API pubbliche (mobile app) ---
-	mux.HandleFunc("/api/v1/auth/login", authHandler.Login)
+	mux.Handle("/api/v1/auth/login", loginRateLimit(http.HandlerFunc(authHandler.Login)))
 
 	// --- API protette da JWT ---
 	requireJWT := middleware.RequireJWT(tokenManager)
@@ -147,11 +228,14 @@ func main() {
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/health", healthHandler)
 
-	// Gzip avvolge l'intero mux: comprime le risposte JSON dell'API, le
-	// pagine HTML della dashboard admin e gli export Markdown quando il
-	// client dichiara supporto, senza alcuna modifica ai contratti/endpoint
-	// esposti (vedi internal/middleware/compress.go).
-	handler := middleware.Gzip(mux)
+	// SecurityHeaders avvolge l'intero mux (economico da tenere comunque nel
+	// backend anche dietro Cloudflare: riguarda il rendering della singola
+	// risposta HTML, non qualcosa che un WAF di rete possa sostituire).
+	// Gzip comprime le risposte JSON dell'API, le pagine HTML della
+	// dashboard admin e gli export Markdown quando il client dichiara
+	// supporto, senza alcuna modifica ai contratti/endpoint esposti (vedi
+	// internal/middleware/compress.go).
+	handler := middleware.SecurityHeaders(middleware.Gzip(mux))
 
 	addr := ":" + port
 	log.Printf("server in ascolto su %s (admin: http://localhost%s/admin)", addr, addr)

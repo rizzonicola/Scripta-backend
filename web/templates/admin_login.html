@@ -1,0 +1,250 @@
+{{define "admin_login.html"}}
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title data-i18n="pageTitle">Accesso Admin · Note Markdown</title>
+  <style>
+    /* Stessa identità visiva di users.html: stesso font stack, stessa
+       palette, stessi raggi/ombre delle card, per rendere il login
+       indistinguibile in stile dal resto della dashboard. */
+    body {
+      font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+      color: #1a1a1a;
+      background: #fafafa;
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    .login-wrap {
+      width: 100%;
+      max-width: 360px;
+    }
+    .login-header {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .login-header h1 {
+      font-size: 20px;
+      margin: 0 0 4px;
+    }
+    .login-header p {
+      font-size: 13px;
+      color: #666;
+      margin: 0;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #eee;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, .04);
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: #444;
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+    .field {
+      margin-bottom: 16px;
+    }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 15px;
+      box-sizing: border-box;
+      /* 16px minimo evita lo zoom automatico su iOS Safari quando si
+         mette a fuoco un input: qui usiamo 15px + questa regola per gli
+         schermi realmente piccoli, dove l'ingrandimento sarebbe fastidioso. */
+    }
+    @media (max-width: 480px) {
+      input { font-size: 16px; }
+    }
+    button {
+      width: 100%;
+      padding: 11px 14px;
+      border: none;
+      border-radius: 6px;
+      background: #2563eb;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    .flash {
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    .flash.ok { background: #dcfce7; color: #166534; }
+    .flash.error { background: #fee2e2; color: #991b1b; }
+    .lang-picker {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #666;
+      margin-top: 18px;
+    }
+    .lang-picker select {
+      padding: 4px 6px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 12px;
+      background: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-header">
+      <h1 data-i18n="heading">📝 Amministrazione — Note Markdown</h1>
+      <p data-i18n="subheading">Accesso riservato agli amministratori</p>
+    </div>
+
+    <div class="card">
+      {{if .Flash}}
+        <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}">{{.Flash}}</div>
+      {{end}}
+
+      <!-- Form HTML standard (niente popup nativo del browser tipo Basic
+           Auth): i campi con name/type/autocomplete corretti sono
+           riconosciuti da qualunque gestore di password (nativo del
+           browser, 1Password, Bitwarden, ecc.), che può offrire di
+           salvare le credenziali qui come per qualsiasi altro sito. -->
+      <form method="POST" action="/admin/login">
+        <div class="field">
+          <label for="username" data-i18n="usernameLabel">Username</label>
+          <input
+            type="text"
+            id="username"
+            name="username"
+            autocomplete="username"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+            required
+            autofocus
+          />
+        </div>
+        <div class="field">
+          <label for="password" data-i18n="passwordLabel">Password</label>
+          <input
+            type="password"
+            id="password"
+            name="password"
+            autocomplete="current-password"
+            required
+          />
+        </div>
+        <button type="submit" data-i18n="loginBtn">Accedi</button>
+      </form>
+    </div>
+
+    <div class="lang-picker">
+      <label for="lang-select" data-i18n="langLabel">Lingua</label>
+      <select id="lang-select">
+        <option value="auto" data-i18n="langAuto">Sistema / Auto</option>
+        <option value="it" data-i18n="langIt">Italiano</option>
+        <option value="en" data-i18n="langEn">English</option>
+        <option value="fr" data-i18n="langFr">Français</option>
+      </select>
+    </div>
+  </div>
+
+  <script>
+    // Stesso meccanismo di traduzione/persistenza lingua di users.html
+    // (stessa chiave di localStorage, così la preferenza resta coerente
+    // passando da una pagina all'altra della dashboard).
+    var translations = {
+      it: {
+        pageTitle: 'Accesso Admin · Note Markdown',
+        heading: '📝 Amministrazione — Note Markdown',
+        subheading: 'Accesso riservato agli amministratori',
+        usernameLabel: 'Username',
+        passwordLabel: 'Password',
+        loginBtn: 'Accedi',
+        langLabel: 'Lingua',
+        langAuto: 'Sistema / Auto',
+        langIt: 'Italiano',
+        langEn: 'English',
+        langFr: 'Français'
+      },
+      en: {
+        pageTitle: 'Admin Login · Markdown Notes',
+        heading: '📝 Administration — Markdown Notes',
+        subheading: 'Access restricted to administrators',
+        usernameLabel: 'Username',
+        passwordLabel: 'Password',
+        loginBtn: 'Log in',
+        langLabel: 'Language',
+        langAuto: 'System / Auto',
+        langIt: 'Italiano',
+        langEn: 'English',
+        langFr: 'Français'
+      },
+      fr: {
+        pageTitle: 'Connexion Admin · Notes Markdown',
+        heading: '📝 Administration — Notes Markdown',
+        subheading: 'Accès réservé aux administrateurs',
+        usernameLabel: "Nom d'utilisateur",
+        passwordLabel: 'Mot de passe',
+        loginBtn: 'Se connecter',
+        langLabel: 'Langue',
+        langAuto: 'Système / Auto',
+        langIt: 'Italiano',
+        langEn: 'English',
+        langFr: 'Français'
+      }
+    };
+
+    function detectSystemLang() {
+      var nav = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
+      if (nav.indexOf('it') === 0) return 'it';
+      if (nav.indexOf('fr') === 0) return 'fr';
+      return 'en';
+    }
+
+    function resolveLang(pref) {
+      if (!pref || pref === 'auto') return detectSystemLang();
+      if (translations[pref]) return pref;
+      return detectSystemLang();
+    }
+
+    function applyTranslations(lang) {
+      var dict = translations[lang] || translations.en;
+      document.documentElement.lang = lang;
+      document.title = dict.pageTitle;
+      document.querySelectorAll('[data-i18n]').forEach(function (el) {
+        var key = el.getAttribute('data-i18n');
+        if (dict[key] !== undefined) el.textContent = dict[key];
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      var STORAGE_KEY = 'scripta_admin_lang';
+      var select = document.getElementById('lang-select');
+      var stored = localStorage.getItem(STORAGE_KEY) || 'auto';
+      select.value = stored;
+      applyTranslations(resolveLang(stored));
+      select.addEventListener('change', function () {
+        localStorage.setItem(STORAGE_KEY, select.value);
+        applyTranslations(resolveLang(select.value));
+      });
+    });
+  </script>
+</body>
+</html>
+{{end}}

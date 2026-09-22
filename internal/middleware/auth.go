@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -49,6 +48,15 @@ func RequireJWT(tm *auth.TokenManager) func(http.Handler) http.Handler {
 				return
 			}
 
+			// Revoca istantanea (reset password / cancellazione utente):
+			// lookup O(1) in RAM, NESSUNA query a DB su questo percorso
+			// caldo. Vedi il commento su TokenManager.Revoke per il motivo
+			// per cui questo resta compatibile con la natura stateless di JWT.
+			if claims.IssuedAt != nil && tm.IsRevoked(claims.UserID, claims.IssuedAt.Time) {
+				writeJSONError(w, http.StatusUnauthorized, "token revocato")
+				return
+			}
+
 			ctx := context.WithValue(r.Context(), CtxUserID, claims.UserID)
 			ctx = context.WithValue(ctx, CtxUsername, claims.Username)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -62,29 +70,32 @@ func UserIDFromContext(ctx context.Context) (string, bool) {
 	return v, ok
 }
 
-// BasicAuthAdmin protegge la dashboard /admin con HTTP Basic Auth,
-// usando le credenziali definite dalle variabili d'ambiente ADMIN_USER / ADMIN_PASS.
-func BasicAuthAdmin(adminUser, adminPass string) func(http.Handler) http.Handler {
+// AdminSessionCookieName è il nome del cookie di sessione della dashboard
+// /admin. Esportata da questo package (letto da SessionAuthAdmin per
+// validarlo) e riusata identica da internal/handlers/admin.go (che lo
+// scrive/cancella), per evitare che le due stringhe letterali finiscano per
+// divergere.
+const AdminSessionCookieName = "admin_session"
+
+// SessionAuthAdmin protegge la dashboard /admin con un cookie di sessione
+// firmato (HttpOnly, Secure, SameSite=Strict), generato dal login form-based
+// di AdminHandler.Login dopo aver verificato ADMIN_USER/ADMIN_PASS.
+//
+// Sostituisce il precedente HTTP Basic Auth: a differenza del popup nativo
+// del browser, un login via <form> standard è riconosciuto e proposto in
+// salvataggio dai password manager (nativi o di terze parti), e permette
+// un vero logout esplicito (impossibile con Basic Auth, le cui credenziali
+// restano cachate dal browser finché non si chiude la finestra).
+func SessionAuthAdmin(sm *auth.AdminSessionManager) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			user, pass, ok := r.BasicAuth()
-
-			// Valutiamo ENTRAMBI i confronti a tempo costante incondizionatamente,
-			// invece di combinarli con "||" (che andrebbe in short-circuit): con
-			// "||", se lo username è già sbagliato il confronto della password
-			// verrebbe saltato del tutto, rendendo il tempo di esecuzione
-			// osservabile diverso a seconda che sia sbagliato lo username o la
-			// password — un side-channel timing che vanifica in parte lo scopo
-			// stesso di usare subtle.ConstantTimeCompare. Calcolando sempre
-			// entrambi i risultati prima di combinarli con un semplice "&&"
-			// booleano (non short-circuit su valori già calcolati), il tempo
-			// impiegato non dipende da quale credenziale sia corretta.
-			userOK := subtle.ConstantTimeCompare([]byte(user), []byte(adminUser)) == 1
-			passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(adminPass)) == 1
-
-			if !ok || !userOK || !passOK {
-				w.Header().Set("WWW-Authenticate", `Basic realm="admin"`)
-				writeJSONError(w, http.StatusUnauthorized, "non autorizzato")
+			cookie, err := r.Cookie(AdminSessionCookieName)
+			if err != nil || sm.Validate(cookie.Value) != nil {
+				// Redirect (non 401 JSON): queste rotte sono navigate da
+				// browser, non chiamate da un client API. Il redirect
+				// riporta l'utente al login mantenendo l'esperienza
+				// coerente con il resto della dashboard.
+				http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
 				return
 			}
 			next.ServeHTTP(w, r)
