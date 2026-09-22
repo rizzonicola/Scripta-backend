@@ -372,159 +372,103 @@ func migrate(conn *sql.DB) error {
 
 	// Vincola a livello di schema che folders.parent_id e notes.folder_id
 	// possano riferire SOLO una cartella dello stesso user_id (mai di un
-	// altro utente): vedi addOwnershipForeignKeys per i dettagli.
-	if err := addOwnershipForeignKeys(conn); err != nil {
-		return fmt.Errorf("migrazione foreign key di ownership: %w", err)
+	// altro utente): vedi addOwnershipTriggers per i dettagli e per il
+	// motivo per cui NON usiamo una vera FOREIGN KEY per questo.
+	if err := addOwnershipTriggers(conn); err != nil {
+		return fmt.Errorf("migrazione trigger di ownership: %w", err)
 	}
 	return nil
 }
 
-// addOwnershipForeignKeys ricostruisce folders/notes con una FOREIGN KEY
-// composita su (parent_id/folder_id, user_id) che referenzia folders(id,
-// user_id): SQLite valuta questo vincolo direttamente nell'INSERT/UPDATE,
-// quindi UpsertLWW non ha bisogno di alcuna SELECT applicativa preventiva
-// per verificare che un parent_id/folder_id appartenga davvero al chiamante
-// — un singolo round-trip, con l'ownership imposta dal motore stesso.
+// OwnershipViolationMarker è il prefisso del messaggio che i trigger sotto
+// sollevano con RAISE(ABORT, ...) quando parent_id/folder_id non appartiene
+// allo user_id della riga. Esportata perché internal/handlers/api_sync.go
+// la riconosce per scartare il singolo elemento del batch invece di far
+// fallire l'intera sync (vedi isOwnershipViolation).
+const OwnershipViolationMarker = "OWNERSHIP_VIOLATION"
+
+// addOwnershipTriggers impone, con quattro trigger SQLite, che
+// folders.parent_id e notes.folder_id possano riferire SOLO una cartella
+// dello STESSO user_id della riga che li imposta: è la difesa DB-level
+// contro un client che tenti di "agganciare" una propria nota/cartella a
+// quella di un altro utente (IDOR), richiesta esplicitamente al posto di una
+// SELECT applicativa preventiva in UpsertLWW — stesso identico costo (un
+// solo round-trip: il controllo avviene DENTRO lo statement INSERT/UPDATE
+// già in corso, valutato dal motore SQLite stesso).
 //
-// SQLite non supporta "ALTER TABLE ... ADD CONSTRAINT": un vincolo FK può
-// essere introdotto solo ricreando la tabella (la procedura in 12 passi
-// documentata da sqlite.org per ALTER TABLE avanzato). La migrazione:
+// Deliberatamente TRIGGER e non una vera FOREIGN KEY composita (approccio
+// tentato in un primo momento, poi scartato): una FK avrebbe richiesto di
+// ricreare interamente le tabelle folders/notes (SQLite non supporta ALTER
+// TABLE ADD CONSTRAINT), con due conseguenze inaccettabili su
+// un'installazione già in produzione con dati reali:
 //
-//  1. è idempotente: viene saltata se l'indice univoco idx_folders_id_user
-//     (creato solo all'ultimo passo di una ricostruzione riuscita) esiste
-//     già, quindi è sicuro chiamarla ad ogni avvio;
-//  2. disattiva temporaneamente PRAGMA foreign_keys (obbligatorio: SQLite
-//     rifiuta di cambiarlo dentro una transazione, e va comunque disattivato
-//     mentre le tabelle vengono rinominate/ricreate) e lo riattiva sempre
-//     al termine, con o senza errore;
-//  3. esegue l'intera ricostruzione in un'unica transazione;
-//  4. PRIMA del commit, esegue PRAGMA foreign_key_check: se un'installazione
-//     preesistente avesse già righe con parent_id/folder_id orfani o
-//     puntanti a un altro utente (possibile solo su dati creati prima di
-//     questo fix), la migrazione fallisce esplicitamente invece di
-//     applicare in silenzio un vincolo che i dati correnti violerebbero.
-func addOwnershipForeignKeys(conn *sql.DB) error {
-	already, err := indexExists(conn, "idx_folders_id_user")
-	if err != nil {
-		return fmt.Errorf("verifica migrazione già applicata: %w", err)
+//  1. PRAGMA foreign_key_check, eseguito sui dati esistenti prima del
+//     commit, avrebbe bloccato l'AVVIO DELL'INTERO SERVER se anche una sola
+//     riga storica avesse un folder_id/parent_id ormai "orfano" — scenario
+//     tutt'altro che raro: PurgeExpiredTombstones cancella fisicamente le
+//     cartelle tombstoned da più tempo della retention SENZA propagare la
+//     cancellazione a eventuali riferimenti rimasti (dispositivi offline che
+//     risincronizzano tardi una nota creata prima della cancellazione della
+//     sua cartella, per esempio). Con una FK, un singolo caso del genere
+//     avrebbe reso l'intero backend inutilizzabile fino a un intervento
+//     manuale sul database.
+//  2. "ON DELETE CASCADE"/"ON DELETE SET NULL" su una FK composita che
+//     include user_id nella chiave figlia (folder_id, user_id) si applica a
+//     TUTTE le colonne della chiave: CASCADE avrebbe fatto sì che il purge
+//     automatico di una vecchia cartella tombstoned cancellasse a sua volta,
+//     in modo silenzioso, ogni nota ancora "agganciata" a quell'id — anche
+//     note ATTIVE, mai cancellate dall'utente. SET NULL avrebbe invece
+//     tentato di azzerare anche user_id (parte della stessa chiave
+//     composita), violando il suo vincolo NOT NULL. Entrambe le opzioni
+//     rischiavano perdita di dati reali dell'utente.
+//
+// I trigger evitano interamente questi due problemi: si attivano SOLO sulle
+// scritture che avvengono da questo momento in poi (mai sui dati storici già
+// presenti, quindi nessun rischio per l'avvio), e non definiscono alcun
+// comportamento ON DELETE: la cancellazione/il purge di una cartella
+// continuano a funzionare esattamente come prima, senza alcuna propagazione
+// automatica.
+func addOwnershipTriggers(conn *sql.DB) error {
+	statements := []string{
+		`CREATE TRIGGER IF NOT EXISTS trg_folders_parent_ownership_ins
+		 BEFORE INSERT ON folders
+		 WHEN NEW.parent_id IS NOT NULL
+		 BEGIN
+		   SELECT CASE WHEN NOT EXISTS (
+		     SELECT 1 FROM folders WHERE id = NEW.parent_id AND user_id = NEW.user_id
+		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: parent_id non valido o non appartenente allo stesso utente') END;
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_folders_parent_ownership_upd
+		 BEFORE UPDATE OF parent_id ON folders
+		 WHEN NEW.parent_id IS NOT NULL
+		 BEGIN
+		   SELECT CASE WHEN NOT EXISTS (
+		     SELECT 1 FROM folders WHERE id = NEW.parent_id AND user_id = NEW.user_id
+		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: parent_id non valido o non appartenente allo stesso utente') END;
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_notes_folder_ownership_ins
+		 BEFORE INSERT ON notes
+		 WHEN NEW.folder_id IS NOT NULL
+		 BEGIN
+		   SELECT CASE WHEN NOT EXISTS (
+		     SELECT 1 FROM folders WHERE id = NEW.folder_id AND user_id = NEW.user_id
+		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: folder_id non valido o non appartenente allo stesso utente') END;
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_notes_folder_ownership_upd
+		 BEFORE UPDATE OF folder_id ON notes
+		 WHEN NEW.folder_id IS NOT NULL
+		 BEGIN
+		   SELECT CASE WHEN NOT EXISTS (
+		     SELECT 1 FROM folders WHERE id = NEW.folder_id AND user_id = NEW.user_id
+		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: folder_id non valido o non appartenente allo stesso utente') END;
+		 END`,
 	}
-	if already {
-		return nil
-	}
-
-	if err := queryDiscard(conn, "PRAGMA foreign_keys=OFF"); err != nil {
-		return fmt.Errorf("disattivazione temporanea foreign_keys: %w", err)
-	}
-	defer func() {
-		if err := queryDiscard(conn, "PRAGMA foreign_keys=ON"); err != nil {
-			log.Printf("attenzione: impossibile riattivare PRAGMA foreign_keys dopo la migrazione ownership: %v", err)
-		}
-	}()
-
-	tx, err := conn.Begin()
-	if err != nil {
-		return fmt.Errorf("avvio transazione migrazione: %w", err)
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	rebuildStatements := []string{
-		`CREATE TABLE folders_new (
-			id         TEXT PRIMARY KEY,
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			name       TEXT NOT NULL,
-			parent_id  TEXT,
-			updated_at INTEGER NOT NULL,
-			deleted_at INTEGER,
-			FOREIGN KEY (parent_id, user_id) REFERENCES folders(id, user_id) ON DELETE CASCADE
-		)`,
-		`INSERT INTO folders_new (id, user_id, name, parent_id, updated_at, deleted_at)
-		 SELECT id, user_id, name, parent_id, updated_at, deleted_at FROM folders`,
-		`DROP TABLE folders`,
-		`ALTER TABLE folders_new RENAME TO folders`,
-
-		`CREATE TABLE notes_new (
-			id          TEXT PRIMARY KEY,
-			user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			title       TEXT NOT NULL DEFAULT '',
-			content     TEXT NOT NULL DEFAULT '',
-			folder_id   TEXT,
-			is_favorite INTEGER NOT NULL DEFAULT 0,
-			is_pinned   INTEGER NOT NULL DEFAULT 0,
-			order_index INTEGER NOT NULL DEFAULT 0,
-			updated_at  INTEGER NOT NULL,
-			deleted_at  INTEGER,
-			FOREIGN KEY (folder_id, user_id) REFERENCES folders(id, user_id) ON DELETE CASCADE
-		)`,
-		`INSERT INTO notes_new (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at)
-		 SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at FROM notes`,
-		`DROP TABLE notes`,
-		`ALTER TABLE notes_new RENAME TO notes`,
-
-		// Indici: ricreati identici a quelli originari, persi con il DROP
-		// TABLE. idx_folders_id_user in più: è l'indice univoco richiesto da
-		// SQLite come target della FK composita "(parent_id, user_id)
-		// REFERENCES folders(id, user_id)", ed è anche il marcatore che
-		// indexExists usa per riconoscere che questa migrazione è già stata
-		// applicata in un avvio precedente.
-		`CREATE UNIQUE INDEX idx_folders_id_user ON folders(id, user_id)`,
-		`CREATE INDEX idx_folders_user ON folders(user_id)`,
-		`CREATE INDEX idx_folders_parent ON folders(user_id, parent_id)`,
-		`CREATE INDEX idx_folders_updated ON folders(user_id, updated_at)`,
-		`CREATE INDEX idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
-		`CREATE INDEX idx_notes_user ON notes(user_id)`,
-		`CREATE INDEX idx_notes_folder ON notes(user_id, folder_id)`,
-		`CREATE INDEX idx_notes_updated ON notes(user_id, updated_at)`,
-		`CREATE INDEX idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
-	}
-
-	for _, stmt := range rebuildStatements {
-		if _, err := tx.Exec(stmt); err != nil {
+	for _, stmt := range statements {
+		if _, err := conn.Exec(stmt); err != nil {
 			return fmt.Errorf("statement %q: %w", stmt, err)
 		}
 	}
-
-	if err := foreignKeyCheck(tx); err != nil {
-		return fmt.Errorf("dati esistenti incompatibili con i nuovi vincoli di ownership "+
-			"(parent_id/folder_id orfani o appartenenti a un altro utente): %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit migrazione ownership: %w", err)
-	}
-	committed = true
-	log.Printf("migrazione schema: aggiunta foreign key composita di ownership su folders.parent_id / notes.folder_id")
 	return nil
-}
-
-// indexExists verifica se un indice con quel nome esiste già nel DB.
-func indexExists(conn *sql.DB, name string) (bool, error) {
-	var n int
-	err := conn.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&n)
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
-}
-
-// foreignKeyCheck esegue PRAGMA foreign_key_check dentro la transazione di
-// migrazione: restituisce errore se una qualunque riga violasse i vincoli
-// FK appena introdotti (incluse le righe pre-esistenti, non solo quelle
-// toccate da questa transazione).
-func foreignKeyCheck(tx *sql.Tx) error {
-	rows, err := tx.Query(`PRAGMA foreign_key_check`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	if rows.Next() {
-		return fmt.Errorf("PRAGMA foreign_key_check ha rilevato violazioni di integrità referenziale")
-	}
-	return rows.Err()
 }
 
 // addNotesPinningColumns aggiunge is_favorite, is_pinned e order_index alla
