@@ -1,6 +1,6 @@
 # Notes Server — Backend Go per app di note Markdown
 
-Backend in Go 1.22+, SQLite (WAL, driver puro `modernc.org/sqlite`, senza CGO),
+Backend in Go 1.23+, SQLite/libSQL (WAL, driver `go-libsql`, CGO),
 con dashboard di amministrazione web integrata e API REST per app mobile.
 
 ## Struttura del progetto
@@ -70,7 +70,7 @@ docker compose up -d --build
 ```
 
 Il volume Docker `notes-data` persiste sia il database SQLite sia i file `.md` di tutti
-gli utenti. Ricordarsi di **cambiare** `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` nel
+gli utenti. `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il server non parte senza, né con valori d'esempio): impostarli nel
 `docker-compose.yml` prima di andare in produzione.
 
 ## Variabili d'ambiente
@@ -78,11 +78,12 @@ gli utenti. Ricordarsi di **cambiare** `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS`
 | Variabile        | Default                | Descrizione                                   |
 |-------------------|-------------------------|------------------------------------------------|
 | `DB_PATH`         | `data/app.db`           | Percorso file SQLite (contiene TUTTI i dati: utenti, cartelle, note) |
-| `JWT_SECRET`      | *(insicuro, da cambiare)* | Chiave HMAC per firma JWT                   |
+| `JWT_SECRET`      | **obbligatorio** (≥32 car.) | Chiave HMAC per firma JWT. Nessun default: valori mancanti/d'esempio bloccano l'avvio |
 | `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `30m`) |
 | `ADMIN_SESSION_TTL` | `8h`                  | Durata del cookie di sessione admin (`time.Duration`) |
-| `ADMIN_USER`      | `admin`                 | Username login dashboard `/admin`             |
-| `ADMIN_PASS`      | `admin`                 | Password login dashboard `/admin`             |
+| `ADMIN_USER`      | **obbligatorio**        | Username login dashboard `/admin`             |
+| `ADMIN_PASS`      | **obbligatorio** (≥12 car.) | Password login dashboard `/admin` (nessun default) |
+| `TRUSTED_PROXIES` | *(vuoto)*               | IP/CIDR dei reverse proxy fidati, separati da virgola. Solo da questi peer sono creduti `Cf-Connecting-IP` / `X-Forwarded-For` (rate limit per IP reale). Vuoto = si usa sempre l'IP del peer TCP |
 | `PORT`            | `8080`                  | Porta HTTP                                    |
 
 ---
@@ -282,3 +283,14 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
   contenuto nella cartella note dell'utente.
 - **JWT**: firma HMAC-SHA256, scadenza di default 7 giorni (`main.go`), claims con
   `user_id` e `username`.
+
+
+## Note di sicurezza e sincronizzazione (v2.1)
+
+- **Cursore di pull server-side**: ogni riga ha `synced_at`, assegnato dal server con uno stamp monotono. Il pull filtra solo su `synced_at`; `updated_at` (orologio del client) serve unicamente alla risoluzione LWW. Timestamp del client oltre *ora + 5 min* vengono riportati all'ora del server.
+- **Rifiuti espliciti**: un `folder_id`/`parent_id` non valido produce `422` con l'elenco `rejected` e rollback dell'intero batch; il client non riceve `server_time` e non avanza il cursore.
+- **Tombstone**: purge dopo 30 giorni dall'accettazione sul server (`synced_at`). Un client con cursore più vecchio riceve `full_resync: true` (stato completo) e ripulisce i residui locali.
+- **Revoca token persistente** (`user_token_revocations`, `revoked_tokens`) + `POST /api/v1/auth/logout`.
+- **Rate limit** basato sull'IP del peer; header di inoltro creduti solo da `TRUSTED_PROXIES`.
+- **Header di sicurezza** (CSP con nonce sulle pagine admin, HSTS, X-Frame-Options, ecc.); i messaggi della dashboard viaggiano come codici whitelisted, non come testo in query string.
+- **Migrazione**: al primo avvio viene aggiunta `synced_at` (backfill = ora). Dopo l'aggiornamento di `go.mod` eseguire una volta `go mod tidy` per rigenerare `go.sum`.

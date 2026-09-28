@@ -3,12 +3,17 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 
 	"notes-server/internal/models"
 )
+
+// ErrUsernameTaken: esiste già un utente con lo stesso username (confronto
+// case-insensitive).
+var ErrUsernameTaken = errors.New("username già in uso")
 
 type UsersRepo struct {
 	db *sql.DB
@@ -19,14 +24,23 @@ func NewUsersRepo(db *sql.DB) *UsersRepo {
 }
 
 // Create inserisce un nuovo utente con la password già cifrata (bcrypt hash).
+// L'username va già normalizzato dal chiamante (auth.NormalizeUsername); qui
+// si verifica comunque l'assenza di duplicati ignorando le maiuscole.
 func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (*models.User, error) {
+	existing, err := r.GetByUsername(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return nil, ErrUsernameTaken
+	}
 	u := &models.User{
 		ID:           uuid.NewString(),
 		Username:     username,
 		PasswordHash: passwordHash,
 		CreatedAt:    time.Now().UnixMilli(),
 	}
-	_, err := r.db.ExecContext(ctx,
+	_, err = r.db.ExecContext(ctx,
 		`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
 		u.ID, u.Username, u.PasswordHash, u.CreatedAt,
 	)
@@ -55,11 +69,12 @@ func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
 	return users, rows.Err()
 }
 
-// GetByUsername recupera un utente per username (usato dal login).
+// GetByUsername recupera un utente per username, ignorando maiuscole/minuscole
+// (usato dal login e dal controllo duplicati).
 func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models.User, error) {
 	var u models.User
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE username = ?`, username,
+		`SELECT id, username, password_hash, created_at FROM users WHERE username = ? COLLATE NOCASE`, username,
 	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil

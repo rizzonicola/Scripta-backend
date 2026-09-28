@@ -14,6 +14,7 @@ type ctxKey string
 const (
 	CtxUserID   ctxKey = "user_id"
 	CtxUsername ctxKey = "username"
+	CtxClaims   ctxKey = "claims"
 )
 
 // writeJSONError scrive una risposta di errore JSON coerente con quella usata
@@ -48,20 +49,28 @@ func RequireJWT(tm *auth.TokenManager) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Revoca istantanea (reset password / cancellazione utente):
+			// Revoca (logout / reset password / cancellazione utente):
 			// lookup O(1) in RAM, NESSUNA query a DB su questo percorso
-			// caldo. Vedi il commento su TokenManager.Revoke per il motivo
-			// per cui questo resta compatibile con la natura stateless di JWT.
-			if claims.IssuedAt != nil && tm.IsRevoked(claims.UserID, claims.IssuedAt.Time) {
+			// caldo. La cache è popolata all'avvio dalla tabella persistente
+			// delle revoche (vedi TokenManager.AttachStore), quindi la
+			// revoca resta valida anche dopo un riavvio del server.
+			if tm.IsRevoked(claims) {
 				writeJSONError(w, http.StatusUnauthorized, "token revocato")
 				return
 			}
 
 			ctx := context.WithValue(r.Context(), CtxUserID, claims.UserID)
 			ctx = context.WithValue(ctx, CtxUsername, claims.Username)
+			ctx = context.WithValue(ctx, CtxClaims, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// ClaimsFromContext restituisce le claims del token già validato da RequireJWT.
+func ClaimsFromContext(ctx context.Context) (*auth.Claims, bool) {
+	c, ok := ctx.Value(CtxClaims).(*auth.Claims)
+	return c, ok
 }
 
 // UserIDFromContext estrae l'ID utente autenticato dal contesto della richiesta.

@@ -5,7 +5,7 @@
 # glibc-based (Debian/Ubuntu). Alpine (musl) causa un mismatch del linker
 # dinamico e il binario non parte ("invalid ELF header" / crash al primo
 # uso del DB). Per questo la migrazione sposta anche l'immagine base.
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.23-bookworm AS builder
 
 WORKDIR /src
 
@@ -16,7 +16,7 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY go.mod go.sum* ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
@@ -50,6 +50,10 @@ USER app
 
 ENV DB_PATH=/data/app.db
 ENV PORT=8080
+# JWT_SECRET, ADMIN_USER e ADMIN_PASS NON hanno default: vanno passati a
+# runtime (docker run -e / compose / secret), altrimenti il server si rifiuta
+# di partire. Dietro un reverse proxy impostare anche TRUSTED_PROXIES (IP/CIDR
+# del proxy) per far leggere l'IP reale del client al rate limiter.
 # Opzionali, per abilitare la modalità embedded replica verso Turso/libSQL
 # server: se TURSO_SYNC_URL è vuoto il server resta in modalità file locale.
 ENV TURSO_SYNC_URL=""

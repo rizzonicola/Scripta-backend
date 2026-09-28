@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
+	"notes-server/internal/middleware"
 	"notes-server/internal/models"
 )
 
@@ -55,13 +58,23 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
-	if req.Username == "" || req.Password == "" {
+	// Username: trim + minuscolo (lookup case-insensitive). Un username
+	// vuoto o più lungo del massimo non può esistere: stessa risposta e
+	// stessa latenza di "credenziali errate", senza toccare il DB.
+	username := auth.CanonicalUsername(req.Username)
+	if username == "" || req.Password == "" {
 		writeJSONError(w, http.StatusBadRequest, "username e password sono obbligatori")
 		return
 	}
+	if utf8.RuneCountInString(username) > auth.MaxUsernameLen || len(req.Password) > auth.MaxPasswordBytes {
+		sleepUntilMinResponseTime(start)
+		writeJSONError(w, http.StatusUnauthorized, "credenziali non valide")
+		return
+	}
 
-	user, err := h.Users.GetByUsername(r.Context(), req.Username)
+	user, err := h.Users.GetByUsername(r.Context(), username)
 	if err != nil {
+		log.Printf("login: errore lettura utente: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "errore interno")
 		return
 	}
@@ -93,4 +106,27 @@ func sleepUntilMinResponseTime(start time.Time) {
 	if elapsed := time.Since(start); elapsed < minLoginResponseTime {
 		time.Sleep(minLoginResponseTime - elapsed)
 	}
+}
+
+// Logout gestisce POST /api/v1/auth/logout (protetto da JWT): revoca il token
+// usato per la richiesta. La revoca è persistita su DB (vedi
+// auth.TokenManager.AttachStore), quindi resta valida anche dopo un riavvio
+// del server. Prima non esisteva alcun logout lato server: il token restava
+// valido fino alla scadenza anche dopo il "logout" dell'app.
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		return
+	}
+	claims, ok := middleware.ClaimsFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		return
+	}
+	if err := h.Tokens.RevokeToken(r.Context(), claims); err != nil {
+		log.Printf("logout: revoca token fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "impossibile revocare il token")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

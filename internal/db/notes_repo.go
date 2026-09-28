@@ -38,10 +38,10 @@ func NewNotesRepo(d execer) *NotesRepo {
 func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, error) {
 	var n models.Note
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at
+		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, synced_at, deleted_at
 		 FROM notes WHERE id = ? AND user_id = ?`,
 		id, userID,
-	).Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.DeletedAt)
+	).Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.SyncedAt, &n.DeletedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -62,7 +62,7 @@ func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, e
 //   - altrimenti la riga resta invariata (il server ha già una versione più
 //     recente): non è un errore, è il caso "server wins", che il chiamante
 //     scoprirà semplicemente rileggendo lo stato con la successiva query di
-//     pull (vedi ListUpdatedSince), senza bisogno di alcuna segnalazione
+//     pull (vedi ListSyncedBetween), senza bisogno di alcuna segnalazione
 //     esplicita qui.
 //
 // La clausola "AND notes.user_id = excluded.user_id" è una difesa in
@@ -75,8 +75,8 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 		n.ID = uuid.NewString()
 	}
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, synced_at, deleted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title       = excluded.title,
 			content     = excluded.content,
@@ -85,10 +85,11 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 			is_pinned   = excluded.is_pinned,
 			order_index = excluded.order_index,
 			updated_at  = excluded.updated_at,
+			synced_at   = excluded.synced_at,
 			deleted_at  = excluded.deleted_at
 		WHERE excluded.updated_at >= notes.updated_at
 		  AND notes.user_id = excluded.user_id
-	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.UpdatedAt, n.DeletedAt)
+	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.UpdatedAt, n.SyncedAt, n.DeletedAt)
 	return err
 }
 
@@ -97,27 +98,33 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 // devono risultare cancellate indipendentemente dal loro updated_at
 // precedente, perché la cancellazione della cartella padre è per definizione
 // l'evento più recente che le riguarda).
-func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt int64, deletedAt *int64) error {
+func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt int64, deletedAt *int64) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE notes SET updated_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
-		updatedAt, deletedAt, id, userID,
+		`UPDATE notes SET updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
+		updatedAt, syncedAt, deletedAt, id, userID,
 	)
 	return err
 }
 
-// ListUpdatedSince restituisce tutte le note (incluse quelle soft-deleted,
-// cioè i tombstone) di un utente con updated_at strettamente maggiore di
-// "since". È la query di "pull" della sync: rappresenta sia le modifiche
-// arrivate da altri dispositivi sia l'esito (accettato o server-wins) delle
-// modifiche che il client ha appena inviato nella stessa richiesta (se questo
-// metodo viene chiamato, come fa SyncHandler, DOPO aver applicato i push
-// nella stessa transazione).
-func (r *NotesRepo) ListUpdatedSince(ctx context.Context, userID string, since int64) ([]models.Note, error) {
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, deleted_at
-		 FROM notes WHERE user_id = ? AND updated_at > ? ORDER BY updated_at ASC`,
-		userID, since,
-	)
+// ListSyncedBetween restituisce le note di un utente (tombstone inclusi se
+// includeTombstones) con synced_at nell'intervallo (since, upTo]. È la query
+// di "pull" della sync.
+//
+// Filtra ESCLUSIVAMENTE su synced_at (orologio SERVER, monotono), mai su
+// updated_at (orologio del client): così una modifica accettata dal server
+// dopo l'ultima pull di un dispositivo gli viene sempre consegnata, anche se
+// il client che l'ha scritta ha l'orologio indietro o è stato a lungo
+// offline. Il limite superiore upTo (= stamp della sync corrente) rende il
+// cursore restituito al client sicuro: tutto ciò che ha synced_at <= upTo è
+// già committato e incluso.
+func (r *NotesRepo) ListSyncedBetween(ctx context.Context, userID string, since, upTo int64, includeTombstones bool) ([]models.Note, error) {
+	query := `SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, synced_at, deleted_at
+		 FROM notes WHERE user_id = ? AND synced_at > ? AND synced_at <= ?`
+	if !includeTombstones {
+		query += ` AND deleted_at IS NULL`
+	}
+	query += ` ORDER BY synced_at ASC, id ASC`
+	rows, err := r.db.QueryContext(ctx, query, userID, since, upTo)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +133,7 @@ func (r *NotesRepo) ListUpdatedSince(ctx context.Context, userID string, since i
 	var notes []models.Note
 	for rows.Next() {
 		var n models.Note
-		if err := rows.Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.DeletedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.SyncedAt, &n.DeletedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
@@ -159,19 +166,39 @@ func (r *NotesRepo) ListActiveIDsByFolder(ctx context.Context, userID, folderID 
 	return ids, rows.Err()
 }
 
-// PurgeExpiredTombstones rimuove definitivamente (hard delete) i tombstone
-// (deleted_at valorizzato) più vecchi di "olderThan" (unix millis). Va
-// eseguita periodicamente in background (vedi main.go): la finestra di
-// retention deve essere abbastanza larga da garantire che ogni dispositivo
-// dell'utente abbia avuto modo di fare almeno una sync e ricevere quindi il
-// tombstone prima che sparisca definitivamente dal server.
+// PurgeExpiredTombstones rimuove definitivamente (hard delete) i tombstone il
+// cui synced_at (istante SERVER in cui il server ha accettato la
+// cancellazione) è più vecchio di "olderThan" (unix millis). Si usa
+// synced_at e non deleted_at perché quest'ultimo è scelto dal client (può
+// essere arbitrariamente vecchio o sbagliato per clock skew): la retention
+// deve contare da quando il server ha ricevuto la cancellazione, non da
+// quando il client dichiara di averla fatta.
+//
+// Va eseguita periodicamente (vedi main.go). La finestra di retention deve
+// essere abbastanza larga da garantire che ogni dispositivo attivo riceva il
+// tombstone prima che sparisca; i dispositivi più lenti vengono riallineati
+// da SyncResponse.FullResync (vedi handlers/api_sync.go).
 func (r *NotesRepo) PurgeExpiredTombstones(ctx context.Context, olderThan int64) (int64, error) {
 	res, err := r.db.ExecContext(ctx,
-		`DELETE FROM notes WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
+		`DELETE FROM notes WHERE deleted_at IS NOT NULL AND synced_at < ?`,
 		olderThan,
 	)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// TouchSynced aggiorna SOLO synced_at di una riga esistente dell'utente. Serve
+// quando un push perde il confronto LWW (il server ha già una versione più
+// recente): la riga vincente non cambia, ma va ri-consegnata al dispositivo
+// "perdente" nella pull della stessa richiesta, altrimenti quel dispositivo
+// resterebbe con una copia divergente (il suo cursore è già oltre il vecchio
+// synced_at della riga vincente).
+func (r *NotesRepo) TouchSynced(ctx context.Context, userID, id string, syncedAt int64) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE notes SET synced_at = ? WHERE id = ? AND user_id = ?`,
+		syncedAt, id, userID,
+	)
+	return err
 }

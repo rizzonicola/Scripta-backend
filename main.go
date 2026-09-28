@@ -4,10 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"notes-server/internal/auth"
@@ -18,6 +23,9 @@ import (
 
 //go:embed web/templates/*.html
 var templatesFS embed.FS
+
+// serverVersion è riportata da /healthz (e verificata dai test).
+const serverVersion = "2.1.0"
 
 // settingsDispatch instrada GET e PUT su /api/v1/user/settings verso i rispettivi
 // handler (mux.Handle non fa dispatch per metodo su un singolo pattern).
@@ -37,9 +45,8 @@ func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
 }
 
 // adminLoginDispatch instrada GET (mostra il form) e POST (verifica le
-// credenziali) su /admin/login verso i rispettivi handler, applicando al
-// solo POST il rate limiting e il controllo same-origin: il GET si limita a
-// servire una pagina statica e non ha bisogno di nessuna delle due difese.
+// credenziali) su /admin/login, applicando al solo POST il rate limiting e il
+// controllo same-origin.
 func adminLoginDispatch(h *handlers.AdminHandler, loginGuards func(http.Handler) http.Handler) http.HandlerFunc {
 	post := loginGuards(http.HandlerFunc(h.Login))
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -74,134 +81,148 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func main() {
-	dbPath := getEnv("DB_PATH", "data/app.db")
-	jwtSecret := getEnv("JWT_SECRET", "change-me-in-production-please")
-	adminUser := getEnv("ADMIN_USER", "admin")
-	adminPass := getEnv("ADMIN_PASS", "admin")
-	port := getEnv("PORT", "8080")
+// ---------------------------------------------------------------------------
+// Configurazione
+// ---------------------------------------------------------------------------
 
-	if jwtSecret == "change-me-in-production-please" {
-		log.Println("ATTENZIONE: JWT_SECRET non impostato, viene usato un valore di default INSICURO. Impostare la variabile d'ambiente JWT_SECRET in produzione.")
-	}
+type config struct {
+	DBPath          string
+	JWTSecret       string
+	AdminUser       string
+	AdminPass       string
+	Port            string
+	JWTTTL          time.Duration
+	AdminSessionTTL time.Duration
+	TrustedProxies  []string
+	SyncMaxBody     int64
 
-	// TURSO_SYNC_URL / TURSO_AUTH_TOKEN sono opzionali: se assenti il server
-	// funziona come prima, con un file .db locale puro. Se TURSO_SYNC_URL è
-	// impostato, dbPath diventa una embedded replica sincronizzata con quel
-	// server libSQL/Turso remoto.
-	tursoSyncURL := getEnv("TURSO_SYNC_URL", "")
-	tursoAuthToken := getEnv("TURSO_AUTH_TOKEN", "")
-	var tursoSyncInterval time.Duration
-	if raw := getEnv("TURSO_SYNC_INTERVAL", ""); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil {
-			tursoSyncInterval = d
-		} else {
-			log.Printf("TURSO_SYNC_INTERVAL non valido (%q), ignorato: %v", raw, err)
+	TursoURL      string
+	TursoToken    string
+	TursoInterval time.Duration
+}
+
+// Segreti di esempio/placeholder che NON devono mai essere accettati.
+var insecureValues = []string{"admin", "password", "changeme", "change-me", "cambiami", "secret", "change-me-in-production-please"}
+
+func looksInsecure(v string) bool {
+	l := strings.ToLower(strings.TrimSpace(v))
+	for _, bad := range insecureValues {
+		if l == bad || strings.HasPrefix(l, bad+"-") || strings.HasPrefix(l, bad+"_") {
+			return true
 		}
 	}
+	return false
+}
 
-	sqlDB, err := db.OpenWithConfig(db.Config{
-		Path:         dbPath,
-		PrimaryURL:   tursoSyncURL,
-		AuthToken:    tursoAuthToken,
-		SyncInterval: tursoSyncInterval,
-	})
-	if err != nil {
-		log.Fatalf("errore apertura database: %v", err)
+const (
+	minJWTSecretLen = 32
+	minAdminPassLen = 12
+)
+
+// loadConfig legge e VALIDA la configurazione. Non esiste più alcun valore
+// di default per i segreti: JWT_SECRET e ADMIN_PASS sono obbligatori e un
+// valore mancante, di esempio o troppo corto blocca l'avvio con un errore
+// esplicito (prima il server partiva con JWT_SECRET pubblico e ADMIN_PASS=
+// admin, permettendo a chiunque di forgiare token o entrare nella dashboard).
+func loadConfig() (config, error) {
+	c := config{
+		DBPath:          getEnv("DB_PATH", "data/app.db"),
+		JWTSecret:       os.Getenv("JWT_SECRET"),
+		AdminUser:       os.Getenv("ADMIN_USER"),
+		AdminPass:       os.Getenv("ADMIN_PASS"),
+		Port:            getEnv("PORT", "8080"),
+		JWTTTL:          24 * time.Hour,
+		AdminSessionTTL: 8 * time.Hour,
+		TrustedProxies:  middleware.ParseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
+		TursoURL:        os.Getenv("TURSO_SYNC_URL"),
+		TursoToken:      os.Getenv("TURSO_AUTH_TOKEN"),
 	}
-	defer sqlDB.Close()
 
-	usersRepo := db.NewUsersRepo(sqlDB)
-	notesRepo := db.NewNotesRepo(sqlDB)
-	settingsRepo := db.NewSettingsRepo(sqlDB)
+	var problems []string
+	if c.JWTSecret == "" {
+		problems = append(problems, "JWT_SECRET non impostato")
+	} else if looksInsecure(c.JWTSecret) || len(c.JWTSecret) < minJWTSecretLen {
+		problems = append(problems, fmt.Sprintf("JWT_SECRET troppo corto (<%d caratteri) o di esempio", minJWTSecretLen))
+	}
+	if c.AdminUser == "" {
+		problems = append(problems, "ADMIN_USER non impostato")
+	}
+	if c.AdminPass == "" {
+		problems = append(problems, "ADMIN_PASS non impostato")
+	} else if looksInsecure(c.AdminPass) || len(c.AdminPass) < minAdminPassLen {
+		problems = append(problems, fmt.Sprintf("ADMIN_PASS troppo corta (<%d caratteri) o di esempio", minAdminPassLen))
+	}
+	if len(problems) > 0 {
+		return c, errors.New("configurazione non valida: " + strings.Join(problems, "; ") +
+			". Generare un segreto con: openssl rand -base64 48")
+	}
 
-	// jwtTTL: 24h di default (era 7 giorni). Un TTL corto limita la finestra
-	// di validità di un token rubato SENZA bisogno di consultare il DB ad
-	// ogni richiesta (la revoca esplicita, vedi TokenManager.Revoke, resta
-	// riservata ai soli eventi rari — reset password, cancellazione utente
-	// — dove serve invalidare un token PRIMA della sua scadenza naturale).
-	jwtTTL := 24 * time.Hour
-	if raw := getEnv("JWT_TTL", ""); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-			jwtTTL = d
-		} else {
-			log.Printf("JWT_TTL non valido (%q), uso il default (%s)", raw, jwtTTL)
+	parseDur := func(key string, dst *time.Duration) {
+		if raw := os.Getenv(key); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+				*dst = d
+			} else {
+				log.Printf("%s non valido (%q), uso il default (%s)", key, raw, *dst)
+			}
 		}
 	}
-	tokenManager := auth.NewTokenManager(jwtSecret, jwtTTL)
+	parseDur("JWT_TTL", &c.JWTTTL)
+	parseDur("ADMIN_SESSION_TTL", &c.AdminSessionTTL)
+	parseDur("TURSO_SYNC_INTERVAL", &c.TursoInterval)
 
-	// adminSessionTTL: durata del cookie di sessione della dashboard /admin
-	// (login form-based, vedi handlers.AdminHandler.Login). Volutamente più
-	// lunga del TTL dei token utente: è un'area amministrativa usata
-	// saltuariamente, non uno strumento su cui forzare re-login frequenti.
-	adminSessionTTL := 8 * time.Hour
-	if raw := getEnv("ADMIN_SESSION_TTL", ""); raw != "" {
-		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
-			adminSessionTTL = d
-		} else {
-			log.Printf("ADMIN_SESSION_TTL non valido (%q), uso il default (%s)", raw, adminSessionTTL)
-		}
-	}
-	adminSessions := auth.NewAdminSessionManager(jwtSecret, adminSessionTTL)
-
-	// --- Handlers ---
-	// Nessuno storage su filesystem da inizializzare: cartelle e note vivono
-	// interamente nel database (schema ID-based in internal/db/db.go).
-	adminHandler, err := handlers.NewAdminHandler(usersRepo, tokenManager, adminSessions, adminUser, adminPass, templatesFS)
-	if err != nil {
-		log.Fatalf("errore caricamento template admin: %v", err)
-	}
-	authHandler := handlers.NewAuthHandler(usersRepo, tokenManager)
-	syncHandler := handlers.NewSyncHandler(sqlDB)
-	if raw := getEnv("SYNC_MAX_BODY_BYTES", ""); raw != "" {
+	if raw := os.Getenv("SYNC_MAX_BODY_BYTES"); raw != "" {
 		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
-			syncHandler.MaxBodyBytes = n
+			c.SyncMaxBody = n
 		} else {
 			log.Printf("SYNC_MAX_BODY_BYTES non valido (%q), uso il default", raw)
 		}
 	}
+	return c, nil
+}
+
+// healthHandler risponde a /health e /healthz.
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok","name":"Scripta Notes Server","version":"` + serverVersion + `","architecture":"local-first delta-sync (id-based, last-write-wins, server-stamped cursor)","license":"GPL-3.0","credits":{"database":"github.com/tursodatabase/go-libsql","jwt":"github.com/golang-jwt/jwt/v5","security":"golang.org/x/crypto/bcrypt","uuid":"github.com/google/uuid"}}` + "\n"))
+}
+
+// buildRouter assembla l'intero handler HTTP (rotte + middleware). È separato
+// da main() per poter essere esercitato dai test di integrazione (main_test.go)
+// con un database temporaneo, esattamente come in produzione.
+func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler, error) {
+	usersRepo := db.NewUsersRepo(sqlDB)
+	notesRepo := db.NewNotesRepo(sqlDB)
+	settingsRepo := db.NewSettingsRepo(sqlDB)
+
+	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminSessionTTL)
+
+	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, adminSessions, cfg.AdminUser, cfg.AdminPass, templatesFS)
+	if err != nil {
+		return nil, fmt.Errorf("caricamento template admin: %w", err)
+	}
+	authHandler := handlers.NewAuthHandler(usersRepo, tm)
+	syncHandler := handlers.NewSyncHandler(sqlDB)
+	if cfg.SyncMaxBody > 0 {
+		syncHandler.MaxBodyBytes = cfg.SyncMaxBody
+	}
 	notesHandler := handlers.NewNotesHandler(notesRepo)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 
-	// --- Purge periodico dei tombstone scaduti + recupero spazio su disco ---
-	// Una cancellazione (soft-delete) resta visibile ai client tramite la
-	// pull della sync per handlers.TombstoneRetention, poi viene rimossa
-	// definitivamente dal database: questo mantiene le tabelle folders/notes
-	// libere da tombstone ormai propagati a tutti i dispositivi, senza dover
-	// tracciare esplicitamente quali device abbiano già fatto pull di quale
-	// tombstone (complessità non necessaria per il caso d'uso di Scripta).
-	//
-	// L'hard-delete SQL da solo NON riduce la dimensione di app.db/app.db-wal
-	// su disco (le pagine liberate restano nel file, vedi maintenance.go):
-	// isLocalDB seleziona se la manutenzione (incremental_vacuum +
-	// wal_checkpoint TRUNCATE) è applicabile, cosa vera solo quando il DB è
-	// aperto in modalità locale pura e non come embedded replica remota.
-	isLocalDB := tursoSyncURL == ""
-	startTombstonePurgeLoop(notesRepo, db.NewFoldersRepo(sqlDB), sqlDB, isLocalDB)
+	// Rate limiting: la chiave è l'IP del peer TCP; Cf-Connecting-IP /
+	// X-Forwarded-For sono creduti SOLO se il peer è in TRUSTED_PROXIES
+	// (vedi middleware.ClientIPResolver). Il WAF Cloudflare resta la prima
+	// linea di difesa; questa è la seconda.
+	ips, err := middleware.NewClientIPResolver(cfg.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
+	loginRateLimit := middleware.RateLimit(0.5, 5, ips)
+	sameOrigin := middleware.RequireSameOrigin
 
 	mux := http.NewServeMux()
 
-	// --- Rate limiting locale (seconda linea di difesa) ---
-	// La difesa PRIMARIA contro credential stuffing/brute force è la
-	// Cloudflare WAF Rate Limiting Rule configurata davanti al tunnel
-	// (valutata al edge, prima ancora che la richiesta arrivi qui, senza
-	// consumare CPU di questo processo): vedi README/documentazione di
-	// deploy. Questi limiter locali restano comunque attivi come seconda
-	// linea, per il caso in cui il WAF sia assente, disattivato o
-	// mal configurato, e per l'uso in sviluppo locale senza Cloudflare
-	// davanti. Le soglie sono volutamente permissive (l'utente legittimo non
-	// deve mai accorgersene): 1 richiesta ogni 2s a regime, burst di 5.
-	loginRateLimit := middleware.RateLimit(0.5, 5)
-
-	// --- Difesa CSRF per le rotte POST della dashboard admin ---
-	sameOrigin := middleware.RequireSameOrigin
-
 	// --- Dashboard Admin (login form-based + cookie di sessione) ---
-	// Sostituisce il precedente HTTP Basic Auth: vedi
-	// internal/handlers/admin.go e web/templates/admin_login.html per i
-	// dettagli (login riconosciuto dai password manager, logout esplicito).
-	// Su Cloudflare Tunnel è comunque consigliato affiancare Cloudflare
-	// Access/Zero Trust davanti a questo path per un'autenticazione a monte.
 	adminAuth := middleware.SessionAuthAdmin(adminSessions)
 	mux.HandleFunc("/admin/login", adminLoginDispatch(adminHandler, chain(loginRateLimit, sameOrigin)))
 	mux.Handle("/admin/logout", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.Logout))))
@@ -210,37 +231,97 @@ func main() {
 	mux.Handle("/admin/users/reset-password", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.ResetPassword))))
 	mux.Handle("/admin/users/delete", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.DeleteUser))))
 
-	// --- API pubbliche (mobile app) ---
+	// --- API pubbliche ---
 	mux.Handle("/api/v1/auth/login", loginRateLimit(http.HandlerFunc(authHandler.Login)))
 
 	// --- API protette da JWT ---
-	requireJWT := middleware.RequireJWT(tokenManager)
+	requireJWT := middleware.RequireJWT(tm)
+	mux.Handle("/api/v1/auth/logout", requireJWT(http.HandlerFunc(authHandler.Logout)))
 	mux.Handle("/api/v1/sync", requireJWT(http.HandlerFunc(syncHandler.Sync)))
 	mux.Handle("/api/v1/notes/download", requireJWT(http.HandlerFunc(notesHandler.DownloadMarkdown)))
 	mux.Handle("/api/v1/user/settings", requireJWT(http.HandlerFunc(settingsDispatch(settingsHandler))))
 
-	// --- Health check & System info ---
-	healthHandler := func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok","name":"Scripta Notes Server","version":"2.0.0","architecture":"local-first delta-sync (id-based, last-write-wins)","license":"GPL-3.0","credits":{"database":"github.com/tursodatabase/go-libsql","jwt":"github.com/golang-jwt/jwt/v5","security":"golang.org/x/crypto/bcrypt","uuid":"github.com/google/uuid"}}` + "\n"))
-	}
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/health", healthHandler)
 
-	// SecurityHeaders avvolge l'intero mux (economico da tenere comunque nel
-	// backend anche dietro Cloudflare: riguarda il rendering della singola
-	// risposta HTML, non qualcosa che un WAF di rete possa sostituire).
-	// Gzip comprime le risposte JSON dell'API, le pagine HTML della
-	// dashboard admin e gli export Markdown quando il client dichiara
-	// supporto, senza alcuna modifica ai contratti/endpoint esposti (vedi
-	// internal/middleware/compress.go).
-	handler := middleware.SecurityHeaders(middleware.Gzip(mux))
+	return middleware.SecurityHeaders(middleware.Gzip(mux)), nil
+}
 
-	addr := ":" + port
-	log.Printf("server in ascolto su %s (admin: http://localhost%s/admin)", addr, addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("errore server: %v", err)
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("avvio bloccato: %v", err)
+	}
+
+	sqlDB, err := db.OpenWithConfig(db.Config{
+		Path:         cfg.DBPath,
+		PrimaryURL:   cfg.TursoURL,
+		AuthToken:    cfg.TursoToken,
+		SyncInterval: cfg.TursoInterval,
+	})
+	if err != nil {
+		log.Fatalf("errore apertura database: %v", err)
+	}
+	defer sqlDB.Close()
+
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Revoca token persistente: le revoche ancora rilevanti vengono
+	// ricaricate dal DB, quindi logout/reset password/cancellazione utente
+	// restano validi anche dopo un riavvio.
+	tokenManager := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTTTL)
+	if err := tokenManager.AttachStore(rootCtx, db.NewRevocationRepo(sqlDB)); err != nil {
+		log.Fatalf("caricamento revoche token: %v", err)
+	}
+
+	handler, err := buildRouter(cfg, sqlDB, tokenManager)
+	if err != nil {
+		log.Fatalf("errore inizializzazione server: %v", err)
+	}
+
+	isLocalDB := cfg.TursoURL == ""
+	startTombstonePurgeLoop(rootCtx, tokenManager, db.NewNotesRepo(sqlDB), db.NewFoldersRepo(sqlDB), sqlDB, isLocalDB)
+
+	// Timeout espliciti: senza di essi un client lento (slowloris) può
+	// tenere aperte connessioni all'infinito. ReadTimeout/WriteTimeout sono
+	// generosi perché un batch di sync può pesare decine di MiB.
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 16,
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Printf("server in ascolto su %s (admin: /admin)", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+		close(serveErr)
+	}()
+
+	// Graceful shutdown: su SIGINT/SIGTERM smette di accettare connessioni,
+	// attende (max 30s) il completamento delle richieste in corso (in
+	// particolare le transazioni di sync), poi chiude il DB (defer sopra).
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatalf("errore server: %v", err)
+		}
+	case <-rootCtx.Done():
+		log.Println("segnale di arresto ricevuto, chiusura ordinata in corso...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown non completato entro il timeout: %v", err)
+			_ = srv.Close()
+		}
+		log.Println("server arrestato")
 	}
 }
 
@@ -261,7 +342,8 @@ const tombstonePurgeInterval = 24 * time.Hour
 //
 //   - ogni tombstonePurgeInterval (e una volta subito all'avvio, per ripulire
 //     eventuale arretrato): rimuove definitivamente dal database le cartelle
-//     e le note soft-deleted da più tempo di handlers.TombstoneRetention, poi
+//     e le note il cui tombstone è stato accettato dal server (synced_at) da
+//     più di handlers.TombstoneRetention, pota le revoche JWT scadute, poi
 //     – solo in modalità locale pura (isLocalDB) e solo se qualcosa è stato
 //     effettivamente cancellato – recupera lo spazio liberato sul file .db
 //     con un incremental_vacuum, e in ogni caso tenta un wal_checkpoint
@@ -269,9 +351,10 @@ const tombstonePurgeInterval = 24 * time.Hour
 //   - ogni walCheckpointInterval: solo wal_checkpoint(TRUNCATE), per non
 //     lasciare che il WAL cresca troppo tra un ciclo di purge e l'altro.
 //
-// Non blocca mai l'avvio del server: eventuali errori vengono solo loggati,
-// il giro successivo riprova.
-func startTombstonePurgeLoop(notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, sqlDB *sql.DB, isLocalDB bool) {
+// Si ferma quando ctx viene annullato (graceful shutdown). Non blocca mai
+// l'avvio del server: eventuali errori vengono solo loggati, il giro
+// successivo riprova.
+func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, sqlDB *sql.DB, isLocalDB bool) {
 	purgeAndReclaim := func() {
 		cutoff := time.Now().Add(-handlers.TombstoneRetention).UnixMilli()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -311,6 +394,7 @@ func startTombstonePurgeLoop(notesRepo *db.NotesRepo, foldersRepo *db.FoldersRep
 
 	go func() {
 		purgeAndReclaim()
+		tm.PurgeExpired(ctx)
 
 		purgeTicker := time.NewTicker(tombstonePurgeInterval)
 		defer purgeTicker.Stop()
@@ -319,8 +403,11 @@ func startTombstonePurgeLoop(notesRepo *db.NotesRepo, foldersRepo *db.FoldersRep
 
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-purgeTicker.C:
 				purgeAndReclaim()
+				tm.PurgeExpired(ctx)
 			case <-checkpointTicker.C:
 				checkpointOnly()
 			}

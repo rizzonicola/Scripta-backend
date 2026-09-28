@@ -5,7 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title data-i18n="pageTitle">Accesso Admin · Note Markdown</title>
-  <style>
+  <style nonce="{{.Nonce}}">
     /* Stessa identità visiva di users.html: stesso font stack, stessa
        palette, stessi raggi/ombre delle card, per rendere il login
        indistinguibile in stile dal resto della dashboard. */
@@ -164,7 +164,7 @@
     </div>
   </div>
 
-  <script>
+  <script nonce="{{.Nonce}}">
     // Stesso meccanismo di traduzione/persistenza lingua di users.html
     // (stessa chiave di localStorage, così la preferenza resta coerente
     // passando da una pagina all'altra della dashboard).

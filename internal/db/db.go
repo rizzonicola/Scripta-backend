@@ -97,13 +97,24 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 			maxOpen = 4
 		}
 	} else {
-		// Modalità locale pura: driver registrato standard, connessione
-		// singola serializzata (come da comportamento storico) con i PRAGMA
-		// applicati una sola volta all'apertura.
-		conn, err = sql.Open("libsql", "file:"+cfg.Path)
-		if err != nil {
-			return nil, fmt.Errorf("open libsql locale: %w", err)
+		// Modalità locale pura: connessione singola serializzata, MA con i
+		// PRAGMA applicati a OGNI nuova connessione fisica (vedi
+		// newLocalConnector). Prima venivano applicati una sola volta
+		// dopo l'apertura: con SetConnMaxIdleTime la connessione veniva
+		// chiusa dopo l'inattività e quella riaperta dal pool partiva con
+		// foreign_keys=OFF (default di SQLite), disattivando in silenzio
+		// le ON DELETE CASCADE (cancellazione utente) e i vincoli FK.
+		//
+		// NB: il driver libSQL NON supporta parametri DSN tipo
+		// "_fk=1&_busy_timeout=5000" (sono specifici di mattn/go-sqlite3 e
+		// modernc): verrebbero ignorati. L'equivalente corretto per questo
+		// driver è un init-hook per-connessione, che è ciò che fa il
+		// pragmaConnector già usato per la modalità embedded replica.
+		localConnector, cerr := newLocalConnector("file:" + cfg.Path)
+		if cerr != nil {
+			return nil, fmt.Errorf("open libsql locale: %w", cerr)
 		}
+		conn = sql.OpenDB(wrapWithPragmas(localConnector, pragmaStatements))
 		maxOpen = 1
 	}
 
@@ -116,21 +127,10 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping libsql: %w", err)
 	}
 
-	if rawConnector == nil {
-		// Applicazione one-shot dei PRAGMA: con MaxOpenConns=1 la stessa
-		// connessione fisica viene riutilizzata per tutta la vita del pool,
-		// quindi non serve riapplicarli ad ogni nuova connessione.
-		//
-		// NB: usiamo Query e non Exec. A differenza di molti driver SQLite,
-		// go-libsql restituisce un errore ("Execute returned rows") se un
-		// PRAGMA che produce un risultato (es. journal_mode, busy_timeout
-		// rispondono col valore impostato) viene lanciato con Exec invece
-		// che con Query.
-		for _, stmt := range pragmaStatements {
-			if err := queryDiscard(conn, stmt); err != nil {
-				return nil, fmt.Errorf("pragma %q: %w", stmt, err)
-			}
-		}
+	// Verifica esplicita: se foreign_keys non risulta attivo, meglio non
+	// avviare il server che perdere in silenzio l'integrità referenziale.
+	if err := verifyForeignKeys(conn); err != nil {
+		return nil, err
 	}
 
 	if err := migrate(conn); err != nil {
@@ -160,19 +160,14 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 // primario remoto (libsql.NewEmbeddedReplicaConnector).
 //
 // Nota implementativa: il driver go-libsql espone un *libsql.Connector
-// "pubblico" (con Connect/Driver/Close, decorabile con pragmaConnector) solo
-// per la modalità embedded replica. Per l'apertura di un semplice file locale
-// il driver si registra invece come driver SQL standard sotto il nome
-// "libsql" (sql.Register("libsql", ...)), senza esporre un Connector
-// pubblico: per questo la modalità locale usa sql.OpenDB tramite il registry
-// standard di database/sql, e i PRAGMA vengono applicati una sola volta sulla
-// connessione dopo l'apertura (esattamente come faceva il driver precedente),
-// mantenendo MaxOpenConns=1 per coerenza. La modalità embedded replica,
-// invece, sfrutta pienamente il pragmaConnector per abilitare più connessioni
-// in lettura in sicurezza.
+// "pubblico" solo per la modalità embedded replica. Per il file locale il
+// driver è registrato in database/sql sotto il nome "libsql": newLocalConnector
+// ne ricava un driver.Connector, così ENTRAMBE le modalità passano da
+// wrapWithPragmas e i PRAGMA (foreign_keys incluso) sono applicati a ogni
+// connessione fisica, anche dopo che il pool chiude quelle inattive.
 func newLibsqlConnector(cfg Config) (driver.Connector, string, error) {
 	if cfg.PrimaryURL == "" {
-		return nil, "locale", nil // nil = usa il percorso sql.Open("libsql", ...) in OpenWithConfig
+		return nil, "locale", nil // nil = connector locale costruito da newLocalConnector in OpenWithConfig
 	}
 
 	opts := []libsql.Option{libsql.WithAuthToken(cfg.AuthToken)}
@@ -260,16 +255,43 @@ func drainRows(rows driver.Rows) error {
 	}
 }
 
-func queryDiscard(conn *sql.DB, query string) error {
-	rows, err := conn.Query(query)
+// verifyForeignKeys controlla che PRAGMA foreign_keys sia effettivamente
+// attivo sulla connessione del pool.
+func verifyForeignKeys(conn *sql.DB) error {
+	var on int
+	if err := conn.QueryRow("PRAGMA foreign_keys").Scan(&on); err != nil {
+		return fmt.Errorf("lettura PRAGMA foreign_keys: %w", err)
+	}
+	if on != 1 {
+		return fmt.Errorf("PRAGMA foreign_keys non attivo: le ON DELETE CASCADE non sarebbero applicate")
+	}
+	return nil
+}
+
+// dsnConnector adatta un driver.Driver "classico" (solo Open(dsn)) a
+// driver.Connector, così da poterlo decorare con pragmaConnector.
+type dsnConnector struct {
+	drv driver.Driver
+	dsn string
+}
+
+func (c *dsnConnector) Connect(context.Context) (driver.Conn, error) { return c.drv.Open(c.dsn) }
+func (c *dsnConnector) Driver() driver.Driver                        { return c.drv }
+
+// newLocalConnector costruisce un driver.Connector per il file locale a
+// partire dal driver "libsql" registrato in database/sql, senza dipendere da
+// API non pubbliche del binding.
+func newLocalConnector(dsn string) (driver.Connector, error) {
+	probe, err := sql.Open("libsql", dsn)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer rows.Close()
-	// Scarica il result set (se presente) e propaga eventuali errori di lettura.
-	for rows.Next() {
+	drv := probe.Driver()
+	_ = probe.Close() // sql.Open non apre connessioni: chiude solo il pool "sonda"
+	if dc, ok := drv.(driver.DriverContext); ok {
+		return dc.OpenConnector(dsn)
 	}
-	return rows.Err()
+	return &dsnConnector{drv: drv, dsn: dsn}, nil
 }
 
 // migrationStatements sono le singole DDL dello schema attuale, ID-based e
@@ -306,6 +328,7 @@ var migrationStatements = []string{
 		name       TEXT NOT NULL,
 		parent_id  TEXT,
 		updated_at INTEGER NOT NULL,
+		synced_at  INTEGER NOT NULL DEFAULT 0,
 		deleted_at INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)`,
@@ -329,6 +352,7 @@ var migrationStatements = []string{
 		is_pinned   INTEGER NOT NULL DEFAULT 0,
 		order_index INTEGER NOT NULL DEFAULT 0,
 		updated_at  INTEGER NOT NULL,
+		synced_at   INTEGER NOT NULL DEFAULT 0,
 		deleted_at  INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)`,
@@ -341,6 +365,24 @@ var migrationStatements = []string{
 		settings_json TEXT NOT NULL,
 		updated_at    INTEGER NOT NULL
 	)`,
+	// Revoca persistente dei token (sopravvive al riavvio del server).
+	// Volutamente SENZA foreign key verso users: la revoca di un utente
+	// cancellato deve restare valida anche dopo la DELETE della sua riga.
+	//
+	//  - user_token_revocations: "tutti i token emessi prima di revoked_at
+	//    per questo utente sono invalidi" (reset password, cancellazione).
+	//  - revoked_tokens: revoca del singolo token (logout esplicito),
+	//    identificato dal claim jti, conservata fino alla scadenza naturale.
+	`CREATE TABLE IF NOT EXISTS user_token_revocations (
+		user_id    TEXT PRIMARY KEY,
+		revoked_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS revoked_tokens (
+		jti        TEXT PRIMARY KEY,
+		user_id    TEXT NOT NULL,
+		expires_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_revoked_tokens_exp ON revoked_tokens(expires_at)`,
 }
 
 func migrate(conn *sql.DB) error {
@@ -369,6 +411,15 @@ func migrate(conn *sql.DB) error {
 	if err := addNotesPinningColumns(conn); err != nil {
 		return fmt.Errorf("migrazione colonne pin/favorite: %w", err)
 	}
+
+	// synced_at: timestamp SERVER monotono, unico cursore di pull (vedi
+	// addSyncedAtColumns).
+	if err := addSyncedAtColumns(conn); err != nil {
+		return fmt.Errorf("migrazione colonne synced_at: %w", err)
+	}
+
+	// Unicità username case-insensitive (best effort, vedi funzione).
+	ensureUsernameUniqueNoCase(conn)
 
 	// Vincola a livello di schema che folders.parent_id e notes.folder_id
 	// possano riferire SOLO una cartella dello stesso user_id (mai di un
@@ -518,6 +569,75 @@ func addNotesPinningColumns(conn *sql.DB) error {
 		log.Printf("migrazione: aggiunta colonna notes.%s mancante (default 0)", w.column)
 	}
 	return nil
+}
+
+// addSyncedAtColumns aggiunge folders.synced_at / notes.synced_at.
+//
+// PERCHÉ: il cursore di pull era confrontato con updated_at, cioè con
+// l'orologio del CLIENT che ha scritto la riga. Con clock skew (o con un
+// dispositivo rimasto offline) una modifica pushata DOPO l'ultima pull di un
+// altro dispositivo poteva avere updated_at < cursore di quest'ultimo e non
+// venirgli mai consegnata. synced_at è invece assegnato dal SERVER (monotono,
+// vedi handlers.SyncHandler) al momento dell'accettazione: il pull filtra
+// solo su di esso, mentre updated_at resta usato esclusivamente per la
+// risoluzione LWW.
+//
+// Le righe preesistenti ricevono synced_at = adesso: ogni dispositivo le
+// riscaricherà una volta sola (idempotente) e ne risulta riparato anche
+// qualsiasi aggiornamento perso in passato per skew.
+func addSyncedAtColumns(conn *sql.DB) error {
+	for _, table := range []string{"folders", "notes"} {
+		cols, err := tableColumns(conn, table)
+		if err != nil {
+			return err
+		}
+		if !cols["synced_at"] {
+			if _, err := conn.Exec(`ALTER TABLE ` + table + ` ADD COLUMN synced_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return fmt.Errorf("alter table %s: %w", table, err)
+			}
+			if _, err := conn.Exec(`UPDATE `+table+` SET synced_at = ? WHERE synced_at = 0`, time.Now().UnixMilli()); err != nil {
+				return fmt.Errorf("backfill %s.synced_at: %w", table, err)
+			}
+			log.Printf("migrazione: aggiunta colonna %s.synced_at (backfill = ora corrente del server)", table)
+		}
+		if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_` + table + `_synced ON ` + table + `(user_id, synced_at)`); err != nil {
+			return fmt.Errorf("index %s.synced_at: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// tableColumns restituisce l'insieme dei nomi colonna di una tabella.
+func tableColumns(conn *sql.DB, table string) (map[string]bool, error) {
+	rows, err := conn.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, fmt.Errorf("pragma table_info(%s): %w", table, err)
+	}
+	defer rows.Close()
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return nil, fmt.Errorf("scan table_info(%s): %w", table, err)
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// ensureUsernameUniqueNoCase impone l'unicità degli username ignorando
+// maiuscole/minuscole ("Mario" e "mario" sono lo stesso utente). Best
+// effort: se nel DB esistono già username che collidono case-insensitive
+// l'indice non può essere creato; il server NON si blocca (i login
+// continuano a funzionare, la creazione applicativa controlla comunque i
+// duplicati) ma viene loggato un avviso per la correzione manuale.
+func ensureUsernameUniqueNoCase(conn *sql.DB) {
+	if _, err := conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)`); err != nil {
+		log.Printf("ATTENZIONE: impossibile creare l'indice univoco case-insensitive sugli username (%v). Esistono probabilmente utenti con username uguali a meno delle maiuscole: risolverli manualmente.", err)
+	}
 }
 
 // quarantineLegacyNotesTable rileva lo schema "notes" della generazione

@@ -23,7 +23,8 @@ type Folder struct {
 	UserID    string
 	Name      string
 	ParentID  *string // nil = cartella radice
-	UpdatedAt int64   // unix millis UTC, usato per la risoluzione LWW
+	UpdatedAt int64   // unix millis UTC (orologio CLIENT), usato SOLO per la risoluzione LWW
+	SyncedAt  int64   // unix millis (orologio SERVER, monotono), usato SOLO come cursore di pull
 	DeletedAt *int64  // nil = attiva; non-nil = soft-deleted (tombstone)
 }
 
@@ -39,7 +40,8 @@ type Note struct {
 	IsFavorite bool
 	IsPinned   bool
 	OrderIndex int
-	UpdatedAt  int64  // unix millis UTC
+	UpdatedAt  int64  // unix millis UTC (orologio CLIENT), usato SOLO per la risoluzione LWW
+	SyncedAt   int64  // unix millis (orologio SERVER, monotono), usato SOLO come cursore di pull
 	DeletedAt  *int64 // nil = attiva; non-nil = soft-deleted (tombstone)
 }
 
@@ -78,13 +80,12 @@ type NoteDTO struct {
 
 // SyncRequest è il body di POST /api/v1/sync.
 //
-// LastSyncedAt è il "cursore" di sincronizzazione del client: il timestamp
-// (unix millis, tempo SERVER) restituito dall'ultima sync riuscita. Folders e
-// Notes contengono tutte le entità che il client ha modificato localmente
-// (create/update/move/delete) da quel momento in poi, cioè con il proprio
-// updated_at locale > LastSyncedAt. Non è necessaria alcuna coda/outbox
-// esplicita lato client: la query "tutto ciò che ha updated_at più recente
-// del cursore" È l'outbox.
+// LastSyncedAt è il "cursore" di pull del client: il server_time (unix
+// millis, tempo SERVER) restituito dall'ultima sync riuscita. Il server lo
+// confronta SOLO con synced_at (stamp del server). Folders e Notes sono le
+// entità modificate localmente e non ancora inviate: il client le individua
+// con un flag "dirty" locale, NON confrontando il proprio updated_at con il
+// cursore (orologi diversi: con clock skew si perderebbero modifiche).
 type SyncRequest struct {
 	LastSyncedAt int64       `json:"last_synced_at"`
 	Folders      []FolderDTO `json:"folders"`
@@ -93,14 +94,14 @@ type SyncRequest struct {
 
 // SyncResponse è la risposta di POST /api/v1/sync.
 //
-// ServerTime è il timestamp del server catturato ad inizio elaborazione: il
-// client lo salva come proprio LastSyncedAt per la sync successiva (evita
-// problemi di clock skew tra dispositivi diversi, dato che l'unico orologio
-// che conta per il cursore è quello del server).
+// ServerTime è lo stamp monotono del server assegnato a questa sync: il
+// client lo salva come proprio LastSyncedAt per la sync successiva. È
+// l'unico orologio che conta per il cursore; updated_at (orologio del
+// client) serve solo alla risoluzione LWW.
 //
 // Folders e Notes contengono TUTTE le entità dell'utente con
-// updated_at > SyncRequest.LastSyncedAt calcolato DOPO aver applicato le
-// modifiche push del client in questa stessa richiesta. Questo include, in
+// synced_at in (SyncRequest.LastSyncedAt, ServerTime], calcolato DOPO aver
+// applicato le modifiche push del client in questa stessa richiesta. Questo include, in
 // un colpo solo:
 //   - le modifiche remote arrivate da altri dispositivi dall'ultima sync;
 //   - le voci che il client ha appena inviato e che sono state accettate
@@ -113,10 +114,34 @@ type SyncRequest struct {
 // Non esistono più liste separate "accepted"/"server_wins": la pull unificata
 // è già la risposta corretta in tutti e tre i casi, il che semplifica sia il
 // protocollo sia il client (non deve più distinguere i tre casi).
+//
+// FullResync è true quando il cursore inviato dal client è più vecchio della
+// finestra di retention dei tombstone (o non plausibile): i tombstone che il
+// client non ha mai visto potrebbero essere già stati eliminati fisicamente,
+// quindi il server risponde con lo stato COMPLETO dell'utente e il client
+// deve eliminare le righe locali "pulite" che non compaiono nella risposta.
 type SyncResponse struct {
 	ServerTime int64       `json:"server_time"`
+	FullResync bool        `json:"full_resync"`
 	Folders    []FolderDTO `json:"folders"`
 	Notes      []NoteDTO   `json:"notes"`
+}
+
+// RejectedItem descrive un singolo record del batch di push rifiutato dal
+// server (es. folder_id/parent_id inesistente o di un altro utente).
+type RejectedItem struct {
+	Kind   string `json:"kind"` // "folder" | "note"
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
+// SyncRejectedResponse è il body dell'errore 422 restituito da POST
+// /api/v1/sync quando almeno un record è stato rifiutato. In quel caso il
+// server ha eseguito il ROLLBACK dell'intero batch (nessuna modifica
+// applicata) e il client NON deve avanzare il proprio cursore.
+type SyncRejectedResponse struct {
+	Error    string         `json:"error"`
+	Rejected []RejectedItem `json:"rejected"`
 }
 
 // UserSettings rappresenta le preferenze dell'utente (tema, font, lingua, layout).

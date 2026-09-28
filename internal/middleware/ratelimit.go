@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -17,11 +16,14 @@ import (
 //
 // Implementazione volutamente senza dipendenze esterne (niente
 // golang.org/x/time/rate): un semplice token bucket per IP.
-func RateLimit(ratePerSec, burst float64) func(http.Handler) http.Handler {
+func RateLimit(ratePerSec, burst float64, ips *ClientIPResolver) func(http.Handler) http.Handler {
 	limiter := newIPRateLimiter(ratePerSec, burst, 30*time.Minute)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !limiter.allow(clientIP(r)) {
+			// ips == nil => nessun proxy fidato: si usa solo r.RemoteAddr
+			// (vedi ClientIPResolver: gli header di inoltro non sono mai
+			// creduti se la richiesta non arriva da un proxy configurato).
+			if !limiter.allow(ips.ClientIP(r)) {
 				w.Header().Set("Retry-After", "5")
 				writeJSONError(w, http.StatusTooManyRequests, "troppi tentativi, riprova più tardi")
 				return
@@ -29,24 +31,6 @@ func RateLimit(ratePerSec, burst float64) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-// clientIP estrae l'IP reale del client. Dietro Cloudflare Tunnel,
-// r.RemoteAddr è SEMPRE l'IP del processo cloudflared locale (o localhost):
-// usarlo direttamente farebbe collassare tutti gli utenti su un unico
-// bucket, bloccandoli o sbloccandoli tutti insieme. L'unico IP affidabile è
-// quello che l'edge Cloudflare stesso inietta nell'header Cf-Connecting-IP,
-// non falsificabile dal client finché l'origin accetta traffico SOLO dal
-// tunnel (nessuna porta esposta direttamente su Internet).
-func clientIP(r *http.Request) string {
-	if ip := r.Header.Get("Cf-Connecting-IP"); ip != "" {
-		return ip
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // rateLimitEntry è lo stato del token bucket di un singolo IP.

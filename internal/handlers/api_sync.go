@@ -7,7 +7,9 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"notes-server/internal/db"
 	"notes-server/internal/middleware"
@@ -39,6 +41,22 @@ var beginTxBackoff = [maxBeginTxRetries]time.Duration{20 * time.Millisecond, 60 
 // che il server la dimentichi.
 const TombstoneRetention = 30 * 24 * time.Hour
 
+// MaxClockSkew è la tolleranza massima accettata tra l'orologio del client e
+// quello del server: un updated_at/deleted_at che supera "adesso + 5 minuti"
+// non è una modifica reale ma un orologio sballato (o un tentativo di
+// "bloccare" una riga per sempre: con LWW un timestamp nel futuro vincerebbe
+// contro qualunque modifica legittima successiva). Il server lo CORREGGE
+// riportandolo all'istante corrente del server.
+const MaxClockSkew = 5 * time.Minute
+
+// Limiti di sanità sui campi ricevuti dal client.
+const (
+	maxIDLen     = 64
+	maxNameLen   = 255
+	maxTitleLen  = 1024
+	maxBatchSize = 100000
+)
+
 // SyncHandler gestisce POST /api/v1/sync: l'unico endpoint necessario per
 // tenere sincronizzati local-first client e server, con risoluzione dei
 // conflitti Last-Write-Wins interamente ID-based (nessun percorso testuale,
@@ -51,6 +69,13 @@ type SyncHandler struct {
 	// MaxBodyBytes limita la dimensione del body accettato da Sync tramite
 	// http.MaxBytesReader. Se zero, NewSyncHandler applica il default.
 	MaxBodyBytes int64
+
+	// stampMu serializza le sync e garantisce che gli stamp (synced_at)
+	// assegnati siano strettamente crescenti nell'ordine di commit: vedi
+	// nextStamp. Il server è un singolo processo con un singolo writer
+	// SQLite, quindi la serializzazione non costa throughput reale.
+	stampMu   sync.Mutex
+	lastStamp int64
 }
 
 func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
@@ -72,6 +97,43 @@ func isTransientBusyErr(err error) bool {
 	return strings.Contains(msg, "database is locked") ||
 		strings.Contains(msg, "database table is locked") ||
 		strings.Contains(msg, "sqlite_busy")
+}
+
+// nextStamp restituisce lo stamp SERVER per la sync corrente: l'orologio
+// del server, ma mai <= dello stamp precedente (monotono anche se l'orologio
+// di sistema torna indietro). DEVE essere chiamata con stampMu acquisito,
+// DENTRO la sezione critica che comprende anche il commit.
+func (h *SyncHandler) nextStamp() int64 {
+	now := time.Now().UnixMilli()
+	if now <= h.lastStamp {
+		now = h.lastStamp + 1
+	}
+	h.lastStamp = now
+	return now
+}
+
+// clampClientTime corregge un timestamp del client: mai nel futuro oltre
+// MaxClockSkew, mai <= 0. Restituisce anche se è stato modificato.
+func clampClientTime(ts, serverNow int64) (int64, bool) {
+	if ts <= 0 {
+		return serverNow, true
+	}
+	if ts > serverNow+MaxClockSkew.Milliseconds() {
+		return serverNow, true
+	}
+	return ts, false
+}
+
+func validID(id string) bool {
+	if id == "" || len(id) > maxIDLen {
+		return false
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // isOwnershipViolation riconosce il rifiuto, da parte dei trigger SQLite
@@ -115,11 +177,17 @@ func isOwnershipViolation(err error) bool {
 //     client "storico" che cancellasse solo la cartella radice otterrebbe
 //     comunque una cascata coerente lato server.
 //  3. PULL: il server restituisce tutte le cartelle e note dell'utente con
-//     updated_at maggiore del cursore last_synced_at inviato dal client.
-//     Poiché questa query viene eseguita DOPO aver applicato push e cascata,
-//     include automaticamente sia le modifiche remote di altri dispositivi
-//     sia l'esito (accettato o "server wins") di ciò che il client ha appena
-//     inviato: non serve alcuna lista "accepted/server_wins" separata.
+//     synced_at (stamp SERVER monotono, NON l'updated_at del client) nell'
+//     intervallo (last_synced_at, server_time]. Poiché questa query viene
+//     eseguita DOPO aver applicato push e cascata, include sia le modifiche
+//     remote di altri dispositivi sia l'esito (accettato o "server wins") di
+//     ciò che il client ha appena inviato.
+//  4. TIMESTAMP: updated_at/deleted_at del client oltre "adesso + 5 min"
+//     (MaxClockSkew) vengono riportati all'ora del server. updated_at serve
+//     SOLO alla risoluzione LWW, mai come cursore.
+//  5. RIFIUTI: un record con parent_id/folder_id non valido causa un 422
+//     esplicito con l'elenco dei record rifiutati e il ROLLBACK dell'intero
+//     batch: il client non riceve server_time e non avanza il cursore.
 //
 // L'intero push (incluse le cascate) avviene dentro un'unica transazione
 // esplicita: un solo fsync a fine batch (con synchronous=NORMAL + WAL) e
@@ -146,22 +214,62 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req, maxBody) {
 		return
 	}
+	if len(req.Folders)+len(req.Notes) > maxBatchSize {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "troppi elementi nel batch")
+		return
+	}
 
-	// now è il "tempo server" di questa sync: diventa sia il timestamp usato
-	// per le cancellazioni propagate in cascata, sia il nuovo cursore
-	// last_synced_at che il client salverà per la prossima chiamata (evita
-	// problemi di clock skew tra dispositivi diversi).
-	now := time.Now().UnixMilli()
+	// La sezione critica (lock + stamp + transazione + commit + pull) è
+	// in process(); la scrittura della risposta HTTP avviene FUORI dal lock,
+	// così un client lento a leggere non blocca le altre sync.
+	res := h.process(ctx, userID, &req)
+	switch {
+	case res.aborted:
+		return // client disconnesso
+	case res.rejected != nil:
+		writeJSON(w, http.StatusUnprocessableEntity, models.SyncRejectedResponse{
+			Error:    "alcuni elementi sono stati rifiutati: riferimento a cartella non valido",
+			Rejected: res.rejected,
+		})
+	case res.status != 0:
+		if res.retryAfter {
+			w.Header().Set("Retry-After", "1")
+		}
+		writeJSONError(w, res.status, res.message)
+	default:
+		writeJSON(w, http.StatusOK, res.resp)
+	}
+}
+
+// syncResult è l'esito di process: esattamente uno tra resp (successo),
+// rejected (422), status/message (altro errore) o aborted.
+type syncResult struct {
+	resp       *models.SyncResponse
+	rejected   []models.RejectedItem
+	status     int
+	message    string
+	retryAfter bool
+	aborted    bool
+}
+
+func failure(status int, msg string) syncResult { return syncResult{status: status, message: msg} }
+
+func (h *SyncHandler) process(ctx context.Context, userID string, req *models.SyncRequest) syncResult {
+	// Lock + stamp: lo stamp è assegnato DOPO aver ottenuto il lock, quindi
+	// gli stamp risultano crescenti nell'ordine di commit. È ciò che rende
+	// sicuro usare "server_time" come cursore: ogni riga committata da una
+	// sync successiva ha uno stamp maggiore di quello restituito qui.
+	h.stampMu.Lock()
+	defer h.stampMu.Unlock()
+	now := h.nextStamp()
 
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
 		if isTransientBusyErr(err) {
-			w.Header().Set("Retry-After", "1")
-			writeJSONError(w, http.StatusServiceUnavailable, "database temporaneamente occupato, riprovare")
-			return
+			return syncResult{status: http.StatusServiceUnavailable, message: "database temporaneamente occupato, riprovare", retryAfter: true}
 		}
-		writeJSONError(w, http.StatusInternalServerError, "errore avvio transazione")
-		return
+		log.Printf("sync: errore avvio transazione: %v", err)
+		return failure(http.StatusInternalServerError, "errore avvio transazione")
 	}
 	committed := false
 	defer func() {
@@ -173,37 +281,53 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	foldersTx := db.NewFoldersRepo(tx)
 	notesTx := db.NewNotesRepo(tx)
 
+	var rejected []models.RejectedItem
+
 	for _, fc := range req.Folders {
-		if err := ctx.Err(); err != nil {
-			return // client disconnesso: il defer sopra fa rollback
+		if ctx.Err() != nil {
+			return syncResult{aborted: true}
 		}
-		if fc.ID == "" {
+		if !validID(fc.ID) {
+			rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: truncateForLog(fc.ID), Reason: "invalid_id"})
+			continue
+		}
+		if fc.ParentID != nil && (!validID(*fc.ParentID) || *fc.ParentID == fc.ID) {
+			rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"})
 			continue
 		}
 		name := strings.TrimSpace(fc.Name)
 		if name == "" {
 			name = "Senza nome"
 		}
+		if utf8.RuneCountInString(name) > maxNameLen {
+			name = string([]rune(name)[:maxNameLen])
+		}
+		updatedAt, _ := clampClientTime(fc.UpdatedAt, now)
+		var deletedAt *int64
+		if fc.DeletedAt != nil {
+			d, _ := clampClientTime(*fc.DeletedAt, now)
+			deletedAt = &d
+		}
 		folder := &models.Folder{
 			ID:        fc.ID,
 			UserID:    userID,
 			Name:      name,
 			ParentID:  fc.ParentID,
-			UpdatedAt: fc.UpdatedAt,
-			DeletedAt: fc.DeletedAt,
+			UpdatedAt: updatedAt,
+			SyncedAt:  now,
+			DeletedAt: deletedAt,
 		}
 		if err := foldersTx.UpsertLWW(ctx, folder); err != nil {
 			if isOwnershipViolation(err) {
-				// parent_id inesistente o di un altro utente: si scarta
-				// questa singola cartella (coerente con la filosofia
-				// "server accetta il batch anche se un elemento è
-				// incoerente" già usata per il caso LWW "server wins") e
-				// si prosegue con il resto del batch.
-				log.Printf("sync: cartella %s scartata, parent_id non valido o non dell'utente", fc.ID)
+				// parent_id inesistente o di un altro utente: rifiuto
+				// ESPLICITO (non più scarto silenzioso). Il batch verrà
+				// annullato per intero e il client NON avanzerà il cursore.
+				log.Printf("sync: cartella %s rifiutata, parent_id non valido o non dell'utente", fc.ID)
+				rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"})
 				continue
 			}
-			writeJSONError(w, http.StatusInternalServerError, "errore elaborazione cartella")
-			return
+			log.Printf("sync: errore upsert cartella %s: %v", fc.ID, err)
+			return failure(http.StatusInternalServerError, "errore elaborazione cartella")
 		}
 
 		// Rileggiamo lo stato risultante (non ciò che il client ha inviato):
@@ -212,46 +336,87 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		// messa in cascata solo perché il client la voleva cancellare.
 		current, err := foldersTx.Get(ctx, userID, fc.ID)
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "errore lettura cartella")
-			return
+			log.Printf("sync: errore lettura cartella %s: %v", fc.ID, err)
+			return failure(http.StatusInternalServerError, "errore lettura cartella")
+		}
+		if current != nil && current.UpdatedAt > updatedAt {
+			// Il push ha perso il LWW: ri-consegna la versione vincente.
+			if err := foldersTx.TouchSynced(ctx, userID, fc.ID, now); err != nil {
+				log.Printf("sync: errore touch cartella %s: %v", fc.ID, err)
+				return failure(http.StatusInternalServerError, "errore elaborazione cartella")
+			}
 		}
 		if current != nil && current.DeletedAt != nil {
 			if err := cascadeSoftDeleteFolder(ctx, foldersTx, notesTx, userID, fc.ID, now); err != nil {
-				writeJSONError(w, http.StatusInternalServerError, "errore cascata cancellazione cartella")
-				return
+				log.Printf("sync: errore cascata cartella %s: %v", fc.ID, err)
+				return failure(http.StatusInternalServerError, "errore cascata cancellazione cartella")
 			}
 		}
 	}
 
 	for _, nc := range req.Notes {
-		if err := ctx.Err(); err != nil {
-			return
+		if ctx.Err() != nil {
+			return syncResult{aborted: true}
 		}
-		if nc.ID == "" {
+		if !validID(nc.ID) {
+			rejected = append(rejected, models.RejectedItem{Kind: "note", ID: truncateForLog(nc.ID), Reason: "invalid_id"})
 			continue
+		}
+		if nc.FolderID != nil && !validID(*nc.FolderID) {
+			rejected = append(rejected, models.RejectedItem{Kind: "note", ID: nc.ID, Reason: "invalid_folder_id"})
+			continue
+		}
+		title := nc.Title
+		if utf8.RuneCountInString(title) > maxTitleLen {
+			title = string([]rune(title)[:maxTitleLen])
+		}
+		updatedAt, _ := clampClientTime(nc.UpdatedAt, now)
+		var deletedAt *int64
+		if nc.DeletedAt != nil {
+			d, _ := clampClientTime(*nc.DeletedAt, now)
+			deletedAt = &d
 		}
 		note := &models.Note{
 			ID:         nc.ID,
 			UserID:     userID,
-			Title:      nc.Title,
+			Title:      title,
 			Content:    nc.Content,
 			FolderID:   nc.FolderID,
 			IsFavorite: nc.IsFavorite,
 			IsPinned:   nc.IsPinned,
 			OrderIndex: nc.OrderIndex,
-			UpdatedAt:  nc.UpdatedAt,
-			DeletedAt:  nc.DeletedAt,
+			UpdatedAt:  updatedAt,
+			SyncedAt:   now,
+			DeletedAt:  deletedAt,
 		}
 		if err := notesTx.UpsertLWW(ctx, note); err != nil {
 			if isOwnershipViolation(err) {
-				// folder_id inesistente o di un altro utente: stesso
-				// trattamento del caso analogo sulle cartelle sopra.
-				log.Printf("sync: nota %s scartata, folder_id non valido o non dell'utente", nc.ID)
+				log.Printf("sync: nota %s rifiutata, folder_id non valido o non dell'utente", nc.ID)
+				rejected = append(rejected, models.RejectedItem{Kind: "note", ID: nc.ID, Reason: "invalid_folder_id"})
 				continue
 			}
-			writeJSONError(w, http.StatusInternalServerError, "errore elaborazione nota")
-			return
+			log.Printf("sync: errore upsert nota %s: %v", nc.ID, err)
+			return failure(http.StatusInternalServerError, "errore elaborazione nota")
 		}
+		// Se il server aveva già una versione più recente (LWW perso dal
+		// client), la si ri-consegna nella pull di questa stessa richiesta.
+		if cur, err := notesTx.Get(ctx, userID, nc.ID); err != nil {
+			log.Printf("sync: errore lettura nota %s: %v", nc.ID, err)
+			return failure(http.StatusInternalServerError, "errore lettura nota")
+		} else if cur != nil && cur.UpdatedAt > updatedAt {
+			if err := notesTx.TouchSynced(ctx, userID, nc.ID, now); err != nil {
+				log.Printf("sync: errore touch nota %s: %v", nc.ID, err)
+				return failure(http.StatusInternalServerError, "errore elaborazione nota")
+			}
+		}
+	}
+
+	// Almeno un record rifiutato: errore ESPLICITO 422, nessuna modifica
+	// applicata (il defer fa il rollback dell'intero batch) e nessun
+	// server_time nella risposta: il client non ha modo di avanzare il
+	// cursore e riproverà dopo aver corretto i record indicati.
+	if len(rejected) > 0 {
+		return syncResult{rejected: rejected}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -259,31 +424,45 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 			// NB: qui NON si ritenta tx.Commit() sullo stesso *sql.Tx (una
 			// volta fallito è considerato concluso). Il retry corretto è
 			// l'intero batch da capo, delegato al client: la sync è
-			// idempotente rispetto a un rinvio completo, dato che la
-			// risoluzione LWW per id/updated_at dà lo stesso esito qualunque
-			// sia il numero di volte in cui lo stesso batch viene reinviato.
-			w.Header().Set("Retry-After", "1")
-			writeJSONError(w, http.StatusServiceUnavailable, "database temporaneamente occupato, riprovare")
-			return
+			// idempotente rispetto a un rinvio completo (LWW per
+			// id/updated_at dà lo stesso esito a ogni reinvio).
+			return syncResult{status: http.StatusServiceUnavailable, message: "database temporaneamente occupato, riprovare", retryAfter: true}
 		}
-		writeJSONError(w, http.StatusInternalServerError, "errore salvataggio sync")
-		return
+		log.Printf("sync: errore commit: %v", err)
+		return failure(http.StatusInternalServerError, "errore salvataggio sync")
 	}
 	committed = true
 
-	folders, err := h.Folders.ListUpdatedSince(ctx, userID, req.LastSyncedAt)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore lettura cartelle aggiornate")
-		return
+	// Cursore del client: non plausibile (negativo / nel futuro) oppure più
+	// vecchio della retention dei tombstone => il client potrebbe non aver
+	// mai visto tombstone già purgati. Si risponde con lo stato COMPLETO
+	// (solo righe attive) e FullResync=true: il client elimina i residui
+	// locali che non compaiono nella risposta.
+	since := req.LastSyncedAt
+	fullResync := false
+	if since < 0 || since > now {
+		since, fullResync = 0, true
+	} else if since > 0 && since < now-TombstoneRetention.Milliseconds() {
+		since, fullResync = 0, true
 	}
-	notes, err := h.Notes.ListUpdatedSince(ctx, userID, req.LastSyncedAt)
+	// Tombstone utili solo per una pull incrementale: a una prima sync o a
+	// un full resync basta lo stato attivo.
+	includeTombstones := since > 0
+
+	folders, err := h.Folders.ListSyncedBetween(ctx, userID, since, now, includeTombstones)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore lettura note aggiornate")
-		return
+		log.Printf("sync: errore lettura cartelle: %v", err)
+		return failure(http.StatusInternalServerError, "errore lettura cartelle aggiornate")
+	}
+	notes, err := h.Notes.ListSyncedBetween(ctx, userID, since, now, includeTombstones)
+	if err != nil {
+		log.Printf("sync: errore lettura note: %v", err)
+		return failure(http.StatusInternalServerError, "errore lettura note aggiornate")
 	}
 
-	resp := models.SyncResponse{
+	resp := &models.SyncResponse{
 		ServerTime: now,
+		FullResync: fullResync,
 		Folders:    make([]models.FolderDTO, 0, len(folders)),
 		Notes:      make([]models.NoteDTO, 0, len(notes)),
 	}
@@ -309,8 +488,14 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 			DeletedAt:  n.DeletedAt,
 		})
 	}
+	return syncResult{resp: resp}
+}
 
-	writeJSON(w, http.StatusOK, resp)
+func truncateForLog(s string) string {
+	if len(s) > 32 {
+		return s[:32]
+	}
+	return s
 }
 
 // cascadeSoftDeleteFolder propaga ricorsivamente (in ampiezza, senza
@@ -334,7 +519,7 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 			return err
 		}
 		for _, id := range noteIDs {
-			if err := notesTx.ForceSet(ctx, userID, id, now, &deletedAt); err != nil {
+			if err := notesTx.ForceSet(ctx, userID, id, now, now, &deletedAt); err != nil {
 				return err
 			}
 		}
@@ -344,7 +529,7 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 			return err
 		}
 		for _, id := range childIDs {
-			if err := foldersTx.ForceSet(ctx, userID, id, now, &deletedAt); err != nil {
+			if err := foldersTx.ForceSet(ctx, userID, id, now, now, &deletedAt); err != nil {
 				return err
 			}
 			queue = append(queue, id)

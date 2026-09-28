@@ -5,7 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title data-i18n="pageTitle">Admin · Note Markdown</title>
-  <style>
+  <style nonce="{{.Nonce}}">
     body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; background: #fafafa; }
     h1 { font-size: 22px; }
     h2 { font-size: 16px; margin-top: 40px; color: #444; }
@@ -37,6 +37,10 @@
     .modal-box h3 { margin-top: 0; font-size: 17px; }
     .modal-box p { font-size: 14px; color: #333; line-height: 1.5; }
     .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    .mt8 { margin-top: 8px; }
+    .mt30 { margin-top: 30px; }
+    .info-card { font-size: 13px; line-height: 1.6; }
+    .deps-list { margin: 4px 0 0 16px; padding: 0; }
   </style>
 </head>
 <body>
@@ -80,14 +84,14 @@
           <div class="actions-cell">
             <details>
               <summary data-i18n="resetPwd">Reset password</summary>
-              <form class="inline" method="POST" action="/admin/users/reset-password" style="margin-top:8px;">
+              <form class="inline mt8" method="POST" action="/admin/users/reset-password">
                 <input type="hidden" name="user_id" value="{{.ID}}" />
                 <input type="password" name="new_password" data-i18n-placeholder="newPwdPlaceholder" placeholder="Nuova password" minlength="8" required />
                 <button type="submit" class="secondary" data-i18n="resetBtn">Reset</button>
               </form>
             </details>
             <button type="button" class="danger" data-i18n="deleteBtn"
-              onclick="openDeleteModal('{{.ID}}', '{{.Username}}')">Elimina</button>
+              data-action="open-delete" data-user-id="{{.ID}}" data-username="{{.Username}}">Elimina</button>
           </div>
         </td>
       </tr>
@@ -106,14 +110,14 @@
     </form>
   </div>
 
-  <p class="mono" style="margin-top:30px;" data-i18n="pwdNote">La password viene cifrata con bcrypt prima di essere salvata; non è mai visibile in chiaro né qui né nel database.</p>
+  <p class="mono mt30" data-i18n="pwdNote">La password viene cifrata con bcrypt prima di essere salvata; non è mai visibile in chiaro né qui né nel database.</p>
 
   <h2 data-i18n="infoHeading">ℹ️ Crediti &amp; Info Sistema</h2>
-  <div class="card" style="font-size: 13px; line-height: 1.6;">
+  <div class="card info-card">
     <p><strong>Scripta Notes Server</strong> — v1.2.0 (Go 1.22+)</p>
     <p data-i18n="license">Licenza: <strong>GNU General Public License v3.0 (GPL-3.0)</strong></p>
-    <p style="margin-top:8px;"><strong data-i18n="depsHeading">Librerie e dipendenze Open Source:</strong></p>
-    <ul style="margin: 4px 0 0 16px; padding: 0;">
+    <p class="mt8"><strong data-i18n="depsHeading">Librerie e dipendenze Open Source:</strong></p>
+    <ul class="deps-list">
       <li><code>github.com/tursodatabase/go-libsql</code>: <span data-i18n="depDb">Driver SQLite/libSQL puro Go con supporto WAL e embedded replicas.</span></li>
       <li><code>github.com/golang-jwt/jwt/v5</code>: <span data-i18n="depJwt">Creazione e verifica token JWT con firma HMAC-SHA256.</span></li>
       <li><code>golang.org/x/crypto/bcrypt</code>: <span data-i18n="depBcrypt">Funzione crittografica adattiva per hashing password.</span></li>
@@ -133,14 +137,14 @@
       <form method="POST" action="/admin/users/delete">
         <input type="hidden" id="delete-form-user-id" name="user_id" value="" />
         <div class="modal-actions">
-          <button type="button" class="secondary" data-i18n="deleteConfirmCancel" onclick="closeDeleteModal()">Annulla</button>
+          <button type="button" class="secondary" data-i18n="deleteConfirmCancel" data-action="close-delete">Annulla</button>
           <button type="submit" class="danger" data-i18n="deleteConfirmYes">Elimina definitivamente</button>
         </div>
       </form>
     </div>
   </div>
 
-  <script>
+  <script nonce="{{.Nonce}}">
     // --- Modale di conferma eliminazione ---
     function openDeleteModal(userId, username) {
       document.getElementById('delete-form-user-id').value = userId;
@@ -150,9 +154,18 @@
     function closeDeleteModal() {
       document.getElementById('delete-modal').classList.remove('open');
     }
-    // Chiudi la modale cliccando fuori dal box, o con Esc.
+    // Gestione eventi via delega (la CSP vieta gli handler inline onclick).
+    // Chiude la modale cliccando fuori dal box, o con Esc.
     document.addEventListener('click', function (ev) {
-      if (ev.target && ev.target.id === 'delete-modal') closeDeleteModal();
+      var t = ev.target;
+      if (!t) return;
+      if (t.id === 'delete-modal') { closeDeleteModal(); return; }
+      var action = t.getAttribute && t.getAttribute('data-action');
+      if (action === 'open-delete') {
+        openDeleteModal(t.getAttribute('data-user-id'), t.getAttribute('data-username'));
+      } else if (action === 'close-delete') {
+        closeDeleteModal();
+      }
     });
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape') closeDeleteModal();

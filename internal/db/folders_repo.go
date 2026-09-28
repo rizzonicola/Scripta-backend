@@ -24,10 +24,10 @@ func NewFoldersRepo(d execer) *FoldersRepo {
 func (r *FoldersRepo) Get(ctx context.Context, userID, id string) (*models.Folder, error) {
 	var f models.Folder
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, user_id, name, parent_id, updated_at, deleted_at
+		`SELECT id, user_id, name, parent_id, updated_at, synced_at, deleted_at
 		 FROM folders WHERE id = ? AND user_id = ?`,
 		id, userID,
-	).Scan(&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.UpdatedAt, &f.DeletedAt)
+	).Scan(&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.UpdatedAt, &f.SyncedAt, &f.DeletedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -48,16 +48,17 @@ func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) error {
 		f.ID = uuid.NewString()
 	}
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO folders (id, user_id, name, parent_id, updated_at, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO folders (id, user_id, name, parent_id, updated_at, synced_at, deleted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name       = excluded.name,
 			parent_id  = excluded.parent_id,
 			updated_at = excluded.updated_at,
+			synced_at  = excluded.synced_at,
 			deleted_at = excluded.deleted_at
 		WHERE excluded.updated_at >= folders.updated_at
 		  AND folders.user_id = excluded.user_id
-	`, f.ID, f.UserID, f.Name, f.ParentID, f.UpdatedAt, f.DeletedAt)
+	`, f.ID, f.UserID, f.Name, f.ParentID, f.UpdatedAt, f.SyncedAt, f.DeletedAt)
 	return err
 }
 
@@ -65,23 +66,25 @@ func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) error {
 // cartella, usata dalla cascade quando un antenato viene cancellato (vedi
 // CascadeSoftDelete nel gestore di sync): la cancellazione del padre deve
 // propagarsi ai figli indipendentemente dal loro updated_at precedente.
-func (r *FoldersRepo) ForceSet(ctx context.Context, userID, id string, updatedAt int64, deletedAt *int64) error {
+func (r *FoldersRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt int64, deletedAt *int64) error {
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE folders SET updated_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
-		updatedAt, deletedAt, id, userID,
+		`UPDATE folders SET updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
+		updatedAt, syncedAt, deletedAt, id, userID,
 	)
 	return err
 }
 
-// ListUpdatedSince restituisce tutte le cartelle (incluse le soft-deleted)
-// di un utente con updated_at strettamente maggiore di "since". Query di
-// "pull" della sync, analoga a NotesRepo.ListUpdatedSince.
-func (r *FoldersRepo) ListUpdatedSince(ctx context.Context, userID string, since int64) ([]models.Folder, error) {
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, user_id, name, parent_id, updated_at, deleted_at
-		 FROM folders WHERE user_id = ? AND updated_at > ? ORDER BY updated_at ASC`,
-		userID, since,
-	)
+// ListSyncedBetween restituisce le cartelle di un utente con synced_at
+// nell'intervallo (since, upTo]. Vedi NotesRepo.ListSyncedBetween per la
+// motivazione (cursore basato solo sull'orologio del server).
+func (r *FoldersRepo) ListSyncedBetween(ctx context.Context, userID string, since, upTo int64, includeTombstones bool) ([]models.Folder, error) {
+	query := `SELECT id, user_id, name, parent_id, updated_at, synced_at, deleted_at
+		 FROM folders WHERE user_id = ? AND synced_at > ? AND synced_at <= ?`
+	if !includeTombstones {
+		query += ` AND deleted_at IS NULL`
+	}
+	query += ` ORDER BY synced_at ASC, id ASC`
+	rows, err := r.db.QueryContext(ctx, query, userID, since, upTo)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +93,7 @@ func (r *FoldersRepo) ListUpdatedSince(ctx context.Context, userID string, since
 	var folders []models.Folder
 	for rows.Next() {
 		var f models.Folder
-		if err := rows.Scan(&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.UpdatedAt, &f.DeletedAt); err != nil {
+		if err := rows.Scan(&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.UpdatedAt, &f.SyncedAt, &f.DeletedAt); err != nil {
 			return nil, err
 		}
 		folders = append(folders, f)
@@ -122,16 +125,30 @@ func (r *FoldersRepo) ListActiveChildIDs(ctx context.Context, userID, parentID s
 	return ids, rows.Err()
 }
 
-// PurgeExpiredTombstones rimuove definitivamente le cartelle soft-deleted da
-// più tempo della finestra di retention. Vedi NotesRepo.PurgeExpiredTombstones
-// per la spiegazione completa della strategia di retention.
+// PurgeExpiredTombstones rimuove definitivamente le cartelle soft-deleted il
+// cui synced_at (istante server) è più vecchio della finestra di retention.
+// Vedi NotesRepo.PurgeExpiredTombstones per la strategia completa.
 func (r *FoldersRepo) PurgeExpiredTombstones(ctx context.Context, olderThan int64) (int64, error) {
 	res, err := r.db.ExecContext(ctx,
-		`DELETE FROM folders WHERE deleted_at IS NOT NULL AND deleted_at < ?`,
+		`DELETE FROM folders WHERE deleted_at IS NOT NULL AND synced_at < ?`,
 		olderThan,
 	)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// TouchSynced aggiorna SOLO synced_at di una riga esistente dell'utente. Serve
+// quando un push perde il confronto LWW (il server ha già una versione più
+// recente): la riga vincente non cambia, ma va ri-consegnata al dispositivo
+// "perdente" nella pull della stessa richiesta, altrimenti quel dispositivo
+// resterebbe con una copia divergente (il suo cursore è già oltre il vecchio
+// synced_at della riga vincente).
+func (r *FoldersRepo) TouchSynced(ctx context.Context, userID, id string, syncedAt int64) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE folders SET synced_at = ? WHERE id = ? AND user_id = ?`,
+		syncedAt, id, userID,
+	)
+	return err
 }
