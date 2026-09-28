@@ -5,7 +5,7 @@
 # glibc-based (Debian/Ubuntu). Alpine (musl) causa un mismatch del linker
 # dinamico e il binario non parte ("invalid ELF header" / crash al primo
 # uso del DB). Per questo la migrazione sposta anche l'immagine base.
-FROM golang:1.23-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 
 WORKDIR /src
 
