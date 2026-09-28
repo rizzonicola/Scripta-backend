@@ -19,8 +19,8 @@ import (
 const testSecret = "test-secret-test-secret-test-secret-0123456789"
 
 type testEnv struct {
-	t   *testing.T
-	srv *httptest.Server
+	t     *testing.T
+	srv   *httptest.Server
 	users *db.UsersRepo
 	tm    *auth.TokenManager
 	repo  *db.RevocationRepo

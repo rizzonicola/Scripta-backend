@@ -106,15 +106,40 @@ func bootstrapIncrementalVacuum(conn *sql.DB) error {
 
 	log.Println("database: auto_vacuum non incrementale, abilitazione in corso (richiede un VACUUM completo una-tantum: può richiedere qualche secondo su database di grandi dimensioni, i futuri hard-delete verranno invece recuperati in modo incrementale ed economico)...")
 
-	if err := queryDiscard(conn, `PRAGMA auto_vacuum=INCREMENTAL;`); err != nil {
+	// PRAGMA auto_vacuum è per-connessione finché non viene eseguito un
+	// VACUUM: entrambi gli statement devono quindi girare sulla STESSA
+	// connessione fisica del pool, non su due connessioni diverse.
+	ctx := context.Background()
+	pinned, err := conn.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquisizione connessione dedicata: %w", err)
+	}
+	defer pinned.Close()
+
+	if err := queryDiscard(ctx, pinned, `PRAGMA auto_vacuum=INCREMENTAL;`); err != nil {
 		return fmt.Errorf("impostazione auto_vacuum=incremental: %w", err)
 	}
-	if _, err := conn.Exec(`VACUUM;`); err != nil {
+	if _, err := pinned.ExecContext(ctx, `VACUUM;`); err != nil {
 		return fmt.Errorf("vacuum one-shot di conversione: %w", err)
 	}
 
 	log.Println("database: auto_vacuum incrementale abilitato con successo")
 	return nil
+}
+
+// queryDiscard esegue uno statement (tipicamente un PRAGMA) usando
+// l'interfaccia Query anziché Exec e scarta le righe restituite: i PRAGMA di
+// libSQL possono restituire il valore impostato, e con Exec il driver può
+// lasciare il cursore aperto o rifiutare lo statement.
+func queryDiscard(ctx context.Context, conn *sql.Conn, query string) error {
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+	}
+	return rows.Err()
 }
 
 func incrementalVacuum(ctx context.Context, conn *sql.DB) error {
