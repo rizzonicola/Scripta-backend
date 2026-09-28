@@ -18,7 +18,7 @@ require (
 // NB: le direttive `replace` che fissavano golang.org/x/crypto e
 // golang.org/x/sys a v0.21.0/v0.18.0 (mirror GitHub) sono state rimosse: quelle
 // versioni contengono vulnerabilità note (es. GO-2024-3321 in x/crypto).
-// Dopo questa modifica eseguire UNA VOLTA `go mod tidy` per rigenerare go.sum.
+// go.sum è allineato all'output di `go mod tidy`.
 replace golang.org/x/exp => github.com/golang/exp v0.0.0-20230515195305-f3d0a9c9a5cc
 
 replace golang.org/x/sync => github.com/golang/sync v0.6.0
