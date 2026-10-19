@@ -142,19 +142,73 @@ func queryDiscard(ctx context.Context, conn *sql.Conn, query string) error {
 	return rows.Err()
 }
 
+// vacuumChunkPages è quante pagine libere vengono restituite al filesystem
+// per ogni passo di incrementalVacuum (con pagine da 4 KiB sono ≈ 2 MiB).
+// Un passo è piccolo abbastanza da durare millisecondi, e abbastanza grande
+// da non far diventare i round trip il costo dominante.
+const vacuumChunkPages = 512
+
+// incrementalVacuum restituisce al filesystem le pagine libere a piccoli
+// passi invece che in un colpo solo.
+//
+// Perché a passi: in modalità locale il pool ha UNA sola connessione
+// (OpenWithConfig). Un PRAGMA incremental_vacuum senza argomento libera tutte
+// le pagine in un unico statement e per tutta la sua durata nessun'altra
+// richiesta (login, settings, sync) può usare il database; dopo un purge
+// grande la durata cresce con le pagine da liberare. Eseguendo un passo alla
+// volta la connessione torna al pool tra un passo e l'altro, e le richieste
+// in attesa vengono servite prima del passo successivo.
+//
+// Non cambia cosa viene liberato (solo pagine già libere, mai righe vive) né
+// il risultato finale: cambia soltanto per quanto tempo alla volta la
+// connessione resta occupata. Se ctx scade a metà, i passi già eseguiti
+// restano validi (prima un unico statement interrotto veniva annullato per
+// intero e non liberava nulla).
 func incrementalVacuum(ctx context.Context, conn *sql.DB) error {
-	// PRAGMA incremental_vacuum (senza argomento) restituisce tutte le
-	// pagine attualmente libere, non solo un numero limitato: va bene per un
-	// job periodico in background che non ha fretta e preferisce lasciare il
-	// file il più compatto possibile tra un giro e l'altro.
-	rows, err := conn.QueryContext(ctx, `PRAGMA incremental_vacuum;`)
-	if err != nil {
-		return err
+	return incrementalVacuumChunked(ctx, conn, vacuumChunkPages, nil)
+}
+
+// incrementalVacuumChunked è incrementalVacuum con dimensione del passo e un
+// hook tra i passi, per poter provare nei test che la connessione viene
+// davvero rilasciata (con un pool da 1 un hook che usa il DB si bloccherebbe
+// per sempre se la connessione fosse ancora tenuta).
+func incrementalVacuumChunked(ctx context.Context, conn *sql.DB, chunkPages int, between func()) error {
+	prev := int64(-1)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var free int64
+		if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count;`).Scan(&free); err != nil {
+			return fmt.Errorf("lettura freelist_count: %w", err)
+		}
+		if free == 0 {
+			return nil
+		}
+		// Difesa contro un ciclo infinito: se un passo non ha liberato nulla
+		// il PRAGMA non sta facendo il suo lavoro (es. auto_vacuum non
+		// incrementale) e insistere sarebbe solo occupare la connessione.
+		if prev >= 0 && free >= prev {
+			return fmt.Errorf("incremental_vacuum non libera pagine (freelist_count fermo a %d)", free)
+		}
+		prev = free
+
+		// chunkPages è un int interno, non input esterno: nessuna iniezione.
+		rows, err := conn.QueryContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d);`, chunkPages))
+		if err != nil {
+			return err
+		}
+		for rows.Next() { // nolint:revive // scarico eventuale result set, vedi drainRows in db.go
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return err
+		}
+		if between != nil {
+			between()
+		}
 	}
-	defer rows.Close()
-	for rows.Next() { // nolint:revive // scarico eventuale result set, vedi drainRows in db.go
-	}
-	return rows.Err()
 }
 
 func walCheckpointTruncate(ctx context.Context, conn *sql.DB) error {

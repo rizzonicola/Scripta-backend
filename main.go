@@ -244,7 +244,9 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/health", healthHandler)
 
-	return middleware.SecurityHeaders(middleware.Gzip(mux)), nil
+	// Timing è il più esterno: misura l'intera richiesta (comprese Gzip e
+	// SecurityHeaders) e vede il primo WriteHeader così come lo vede il client.
+	return middleware.Timing(middleware.SecurityHeaders(middleware.Gzip(mux))), nil
 }
 
 func main() {
