@@ -19,6 +19,7 @@ import (
 	"notes-server/internal/db"
 	"notes-server/internal/handlers"
 	"notes-server/internal/middleware"
+	"notes-server/internal/models"
 )
 
 //go:embed web/templates/*.html
@@ -37,7 +38,7 @@ func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
 		case http.MethodPut:
 			h.UpdateSettings(w, r)
 		default:
-			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
 		}
@@ -56,7 +57,7 @@ func adminLoginDispatch(h *handlers.AdminHandler, loginGuards func(http.Handler)
 		case http.MethodPost:
 			post.ServeHTTP(w, r)
 		default:
-			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
 		}
@@ -182,9 +183,13 @@ func loadConfig() (config, error) {
 
 // healthHandler risponde a /health e /healthz.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	// `caps` e X-Scripta-Proto (Y-14) sono additivi: i campi storici restano
+	// identici e nello stesso ordine; chi non li conosce li ignora. Gli header
+	// vanno impostati PRIMA di WriteHeader, dopo vengono ignorati.
+	w.Header().Set(models.ProtoHeader, strconv.Itoa(models.ServerCaps.Proto))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok","name":"Scripta Notes Server","version":"` + serverVersion + `","architecture":"local-first delta-sync (id-based, last-write-wins, server-stamped cursor)","license":"GPL-3.0","credits":{"database":"github.com/tursodatabase/go-libsql","jwt":"github.com/golang-jwt/jwt/v5","security":"golang.org/x/crypto/bcrypt","uuid":"github.com/google/uuid"}}` + "\n"))
+	_, _ = w.Write([]byte(`{"status":"ok","name":"Scripta Notes Server","version":"` + serverVersion + `","architecture":"local-first delta-sync (id-based, last-write-wins, server-stamped cursor)","license":"GPL-3.0","credits":{"database":"github.com/tursodatabase/go-libsql","jwt":"github.com/golang-jwt/jwt/v5","security":"golang.org/x/crypto/bcrypt","uuid":"github.com/google/uuid"},"caps":{"proto":` + strconv.Itoa(models.ServerCaps.Proto) + `}}` + "\n"))
 }
 
 // buildRouter assembla l'intero handler HTTP (rotte + middleware). È separato

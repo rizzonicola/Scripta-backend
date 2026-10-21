@@ -22,7 +22,8 @@ const (
 // di importare "notes-server/internal/handlers" per evitare un import ciclico
 // (handlers già importa middleware per UserIDFromContext).
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
+	// charset esplicito: stessa motivazione di handlers.jsonContentType.
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(struct {
 		Error string `json:"error"`

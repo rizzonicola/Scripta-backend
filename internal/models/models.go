@@ -120,12 +120,37 @@ type SyncRequest struct {
 // client non ha mai visto potrebbero essere già stati eliminati fisicamente,
 // quindi il server risponde con lo stato COMPLETO dell'utente e il client
 // deve eliminare le righe locali "pulite" che non compaiono nella risposta.
+//
+// Caps (Y-14) è additivo: le app 0.9.x leggono per chiave e lo ignorano.
 type SyncResponse struct {
 	ServerTime int64       `json:"server_time"`
 	FullResync bool        `json:"full_resync"`
 	Folders    []FolderDTO `json:"folders"`
 	Notes      []NoteDTO   `json:"notes"`
+	Caps       Caps        `json:"caps"`
 }
+
+// ProtoHeader è l'header di risposta con la versione del contratto
+// (stesso valore di Caps.Proto). Compare su /healthz e sulle risposte 200 di
+// POST /api/v1/sync.
+const ProtoHeader = "X-Scripta-Proto"
+
+// Caps annuncia al client quali funzioni opzionali del protocollo il server
+// supporta (Y-14). Regole (II-E del report): una chiave assente vale false, una
+// chiave sconosciuta si ignora, e un client che non vede una capability si
+// comporta come con il server 2.1.0.
+//
+// Oggi esiste solo Proto. Le altre chiavi previste (req_gzip, page, echo_opt,
+// renew) si aggiungeranno SOLO insieme alla funzione che annunciano: dichiararne
+// una non implementata farebbe usare al client una funzione che non c'è.
+type Caps struct {
+	// Proto è la versione del contratto: 1 = server senza caps (2.1.0 e
+	// precedenti, mai emesso), 2 = server che annuncia le caps.
+	Proto int `json:"proto"`
+}
+
+// ServerCaps sono le capability di questo binario.
+var ServerCaps = Caps{Proto: 2}
 
 // RejectedItem descrive un singolo record del batch di push rifiutato dal
 // server (es. folder_id/parent_id inesistente o di un altro utente).

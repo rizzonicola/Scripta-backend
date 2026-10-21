@@ -22,7 +22,11 @@ jobs:
           # fuori supporto (nessuna patch di sicurezza: govulncheck segnala
           # decine di CVE della stdlib). Si usa un ramo supportato e
           # check-latest per avere sempre l'ultima patch.
-          go-version: '1.25'
+          # 1.26: govulncheck (CI del 2026-10-19) segnala 9 vulnerabilità della
+          # stdlib raggiunte dal codice (net/http, net/textproto, crypto/tls,
+          # html/template) presenti in 1.25.14 e corrette in 1.26.9. check-latest
+          # garantisce l'ultima patch del ramo.
+          go-version: '1.26'
           check-latest: true
           cache: true
       - run: go mod download

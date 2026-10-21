@@ -6,8 +6,14 @@ import (
 	"net/http"
 )
 
+// jsonContentType dichiara esplicitamente UTF-8. RFC 8259 impone già UTF-8 per
+// il JSON, ma alcuni client HTTP (es. package:http di Dart) decodificano un
+// «application/json» senza charset con la codifica di default dello stack:
+// l'header esplicito toglie ogni ambiguità ai testi con accenti ed emoji.
+const jsonContentType = "application/json; charset=utf-8"
+
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", jsonContentType)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }

@@ -40,9 +40,11 @@ notes-server/
 Dati persistenti (montati come volume Docker su `/data`):
 
 ```
-/data/app.db                         # SQLite, modalità WAL
-/data/users/{user_id}/notes/{relative_path}   # file .md dell'utente
+/data/app.db                         # SQLite, modalità WAL: utenti, cartelle, note
 ```
+
+Tutto vive nel database, compreso il contenuto Markdown (colonna `notes.content`):
+non esistono file `.md` su disco né percorsi testuali (`relative_path`).
 
 ## Avvio locale (senza Docker)
 
@@ -69,8 +71,7 @@ Il server parte su `:8080`. Dashboard admin: `http://localhost:8080/admin`
 docker compose up -d --build
 ```
 
-Il volume Docker `notes-data` persiste sia il database SQLite sia i file `.md` di tutti
-gli utenti. `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il server non parte senza, né con valori d'esempio): impostarli nel
+Il volume Docker `notes-data` persiste il database SQLite (utenti, cartelle e note, contenuto compreso). `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il server non parte senza, né con valori d'esempio): impostarli nel
 `docker-compose.yml` prima di andare in produzione.
 
 ## Variabili d'ambiente
@@ -79,7 +80,8 @@ gli utenti. `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il s
 |-------------------|-------------------------|------------------------------------------------|
 | `DB_PATH`         | `data/app.db`           | Percorso file SQLite (contiene TUTTI i dati: utenti, cartelle, note) |
 | `JWT_SECRET`      | **obbligatorio** (≥32 car.) | Chiave HMAC per firma JWT. Nessun default: valori mancanti/d'esempio bloccano l'avvio |
-| `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `30m`) |
+| `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `720h`). Passata al container da `docker-compose.yml`; vuota o non valida = default. Un TTL lungo non indebolisce la revoca: logout e reset password invalidano il token subito |
+| `SYNC_MAX_BODY_BYTES` | `67108864` (64 MiB) | Tetto sul corpo di `POST /api/v1/sync`; oltre risponde `413` |
 | `ADMIN_SESSION_TTL` | `8h`                  | Durata del cookie di sessione admin (`time.Duration`) |
 | `ADMIN_USER`      | **obbligatorio**        | Username login dashboard `/admin`             |
 | `ADMIN_PASS`      | **obbligatorio** (≥12 car.) | Password login dashboard `/admin` (nessun default) |
@@ -92,8 +94,12 @@ gli utenti. `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il s
 
 Base URL: `http://<host>:8080/api/v1`
 
-Tutte le risposte sono in JSON (`Content-Type: application/json`), tranne il download
-delle note (`text/markdown`).
+Tutte le risposte sono in JSON (`Content-Type: application/json; charset=utf-8`), tranne il
+download delle note (`text/markdown; charset=utf-8`). Timestamp di sincronizzazione
+(`updated_at`, `deleted_at`, `last_synced_at`, `server_time`): **millisecondi** Unix.
+
+> **La fonte di verità è il codice** (`internal/handlers/api_sync.go`, `internal/models/models.go`),
+> non questo documento: se divergono, vale il codice.
 
 ### 1. `POST /api/v1/auth/login`
 
@@ -117,6 +123,8 @@ Autentica un utente con username/password e rilascia un JWT.
 }
 ```
 
+`expires_at` è in **secondi** Unix (a differenza dei timestamp di sync, in millisecondi).
+
 **Errori**: `400` (campi mancanti), `401` (credenziali non valide).
 
 Il token va incluso in tutte le chiamate successive come:
@@ -130,57 +138,89 @@ Authorization: Bearer <token>
 
 *(richiede JWT)*
 
-Riceve dall'app mobile un elenco di note modificate localmente e applica la
-risoluzione dei conflitti **Last-Write-Wins** basata sul campo `updated_at`
-(timestamp Unix in millisecondi).
+L'unico endpoint di sincronizzazione. Protocollo **delta sync** local-first, interamente
+**basato su ID** (nessun percorso testuale, nessun file): il client invia le cartelle e le note
+modificate localmente (flag «dirty») e riceve ciò che è cambiato sul server. I conflitti si
+risolvono **riga per riga** con **Last-Write-Wins** su `updated_at`.
 
 **Request body**
 ```json
 {
+  "last_synced_at": 1756900000000,
+  "folders": [
+    { "id": "f-1", "name": "Lavoro", "parent_id": null, "updated_at": 1756900000000, "deleted_at": null }
+  ],
   "notes": [
     {
-      "relative_path": "lavoro/riunione-2026-09-01.md",
-      "content": "# Riunione\n\nContenuto della nota...",
-      "updated_at": 1756900000000,
-      "deleted": false
-    },
-    {
-      "relative_path": "personale/vecchia-nota.md",
-      "content": "",
-      "updated_at": 1700000000000,
-      "deleted": true
+      "id": "n-1", "title": "Riunione", "content": "# Riunione\n\n...",
+      "folder_id": "f-1", "is_favorite": false, "is_pinned": false, "order_index": 0,
+      "updated_at": 1756900000000, "deleted_at": null
     }
   ]
 }
 ```
 
-**Logica di risoluzione conflitti** (per ciascuna nota inviata):
-- Se la nota non esiste ancora sul server, **oppure** `updated_at` del client è
-  **maggiore o uguale** a quello registrato sul server → **vince il client**:
-  il file `.md` viene scritto (o cancellato, se `deleted: true`) in modo **atomico**
-  (`.tmp` + `os.Rename`) nella cartella dell'utente, e i metadati vengono aggiornati.
-- Se il server possiede una versione con `updated_at` **maggiore** → **vince il server**:
-  la nota (con relativo contenuto letto da disco) viene restituita al client nella
-  lista `server_wins`, così il client può allineare la propria copia locale.
+- `last_synced_at`: il cursore del client = il `server_time` dell'ultimo giro riuscito (`0` alla prima sync).
+- `folders` / `notes`: solo le entità **sporche**. `deleted_at` non nullo = cancellazione (tombstone).
+- Limiti: `id` ≤ 64 caratteri senza caratteri di controllo; `name` ≤ 255 caratteri (vuoto → «Senza nome»);
+  `title` ≤ 1024 caratteri; al massimo 100000 elementi per richiesta.
+
+**Cosa fa il server** (in un'unica transazione):
+1. **Push**: per ogni elemento, upsert condizionato: ha effetto solo se `updated_at` del client è
+   **≥** di quello memorizzato. Un `updated_at` oltre «adesso + 5 minuti» viene riportato all'ora del server.
+2. **Cascata**: se una cartella risulta cancellata, la cancellazione si propaga a sottocartelle e note ancora attive.
+3. **Pull**: restituisce le entità dell'utente con `synced_at` in `(last_synced_at, server_time]`,
+   calcolate **dopo** il push. Comprende quindi anche l'**eco** di ciò che il client ha appena inviato e,
+   se il client ha perso il confronto LWW, la versione vincente del server.
+   `synced_at` è lo stamp **del server** (monotono, e non scende nemmeno dopo un riavvio con l'orologio
+   indietro), distinto dall'`updated_at` del client, che serve solo al LWW.
+
+**Ordine delle cartelle**: il genitore deve esistere quando si scrive il figlio. Il server accetta anche
+un batch con il figlio **prima** del genitore, se il genitore è nello stesso batch (lo applica dopo). Un
+genitore che non esiste né nel batch né sul server, o un ciclo fra cartelle nuove, è rifiutato (`422`).
 
 **Response 200**
 ```json
 {
-  "accepted": [
-    { "relative_path": "lavoro/riunione-2026-09-01.md", "updated_at": 1756900000000, "deleted": false }
-  ],
-  "server_wins": [
+  "server_time": 1756900001234,
+  "full_resync": false,
+  "folders": [ { "id": "f-1", "name": "Lavoro", "parent_id": null, "updated_at": 1756900000000, "deleted_at": null } ],
+  "notes": [
     {
-      "relative_path": "personale/vecchia-nota.md",
-      "content": "# Contenuto più recente presente sul server",
-      "updated_at": 1756950000000,
-      "deleted": false
+      "id": "n-1", "title": "Riunione", "content": "# Riunione\n\n...",
+      "folder_id": "f-1", "is_favorite": false, "is_pinned": false, "order_index": 0,
+      "updated_at": 1756900000000, "deleted_at": null
     }
-  ]
+  ],
+  "caps": { "proto": 2 }
 }
 ```
+- `server_time`: il nuovo cursore. Il client lo salva **solo** dopo aver applicato la risposta.
+- `full_resync`: `true` se il cursore è negativo, nel futuro o più vecchio di 30 giorni (retention dei
+  tombstone). La risposta contiene allora lo stato **completo** (solo righe attive) e il client elimina i
+  residui locali «puliti» che non compaiono.
+- `caps` (additivo): capability del server. Oggi solo `proto` (versione del contratto, `2`). Una chiave
+  assente vale «non supportato»; un client che non la conosce la ignora. Lo stesso valore è nell'header
+  `X-Scripta-Proto` (anche su `GET /healthz`).
+- **Non esistono** `accepted`, `server_wins`, `relative_path` né `deleted` (contratto precedente).
+- Le cancellazioni viaggiano come tombstone (`deleted_at` valorizzato) per 30 giorni dall'ultimo `synced_at`.
 
-**Errori**: `400` (body non valido), `401` (token mancante/non valido), `500` (errore I/O o DB).
+**Header opzionale della richiesta**: `X-Scripta-Client: scripta/<versione>`. Serve solo ai log del
+server (compare nel riepilogo dei `422`); non cambia nessun comportamento.
+
+**Errori**
+
+| Codice | Quando | Corpo |
+|---|---|---|
+| `400` | corpo non JSON | `{"error":"body JSON non valido"}` |
+| `401` | token mancante, scaduto o revocato | `{"error":"..."}` |
+| `405` | metodo diverso da `POST` | `{"error":"metodo non consentito"}` |
+| `413` | corpo oltre `SYNC_MAX_BODY_BYTES` o più di 100000 elementi | `{"error":"payload troppo grande"}` |
+| `422` | almeno un elemento rifiutato: **nessuna modifica applicata** (rollback dell'intero batch), nessun `server_time` | `{"error":"...","rejected":[{"kind":"folder\|note","id":"...","reason":"invalid_id\|invalid_parent_id\|invalid_folder_id"}]}` |
+| `500` | errore interno | `{"error":"..."}` |
+| `503` | database occupato; riprovare (header `Retry-After: 1`) | `{"error":"database temporaneamente occupato, riprovare"}` |
+
+La sync è **idempotente**: rinviare lo stesso corpo (per esempio dopo una rete caduta) dà lo stesso stato finale.
 
 ---
 
@@ -229,29 +269,31 @@ tra 8 e 48, `line_spacing` tra 0.8 e 3.0) e valori di fallback ai campi vuoti.
 
 *(richiede JWT)*
 
-Scarica il contenuto grezzo (raw) di un file `.md` dell'utente autenticato.
+Scarica il contenuto Markdown di **una nota** dell'utente autenticato. Non fa parte del protocollo di
+sync (l'app non lo usa per sincronizzare); serve a un download diretto o a un client minimale.
 
 **Query params**
-- `path` (obbligatorio): percorso relativo del file, es. `lavoro/riunione.md`
+- `id` (obbligatorio): l'`id` della nota (lo stesso che compare nella sync).
 
 **Esempio**
 ```
-GET /api/v1/notes/download?path=lavoro/riunione-2026-09-01.md
+GET /api/v1/notes/download?id=n-1
 Authorization: Bearer <token>
 ```
 
-**Response 200**: corpo = contenuto grezzo del file Markdown, header:
+**Response 200**: corpo = il contenuto (`content`) della nota, con gli header
 ```
 Content-Type: text/markdown; charset=utf-8
-Content-Disposition: attachment; filename="riunione-2026-09-01.md"
+Content-Disposition: attachment; filename="Riunione.md"
 ```
+Il nome del file deriva dal titolo, ripulito dai caratteri non validi nei nomi file (`/ \ : * ? " < > |`);
+se resta vuoto vale `nota`.
 
-**Errori**: `400` (path mancante o non valido / tentativo di path traversal),
-`401` (non autenticato), `404` (file non trovato).
+**Errori**: `400` (`id` mancante), `401`, `404` (la nota non esiste, è di un altro utente o è cancellata:
+tombstone), `405` (metodo diverso da `GET`), `500`.
 
-> **Sicurezza**: il parametro `path` viene sempre risolto e validato contro la
-> cartella note dell'utente autenticato (`internal/storage/files.go → ResolvePath`),
-> impedendo l'accesso a file esterni tramite sequenze `../`.
+> Non esiste alcun file su disco da risolvere: il contenuto è una colonna del database, quindi non c'è
+> nessun rischio di *path traversal*.
 
 ---
 
@@ -275,19 +317,17 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
 
 - **SQLite WAL**: aperto con `_pragma=journal_mode(WAL)` e `busy_timeout(5000)`;
   `SetMaxOpenConns(1)` evita "database is locked" con scritture concorrenti.
-- **Scrittura atomica dei file**: `storage.Store.AtomicWrite` scrive su un file
-  temporaneo (`.tmp-*`) nella stessa directory di destinazione, esegue `fsync`,
-  poi `os.Rename` — operazione atomica a livello di filesystem (POSIX).
-- **Path traversal**: ogni `relative_path` fornito da client/API viene ripulito con
-  `filepath.Clean` e verificato con `filepath.Rel` per assicurarsi che resti
-  contenuto nella cartella note dell'utente.
-- **JWT**: firma HMAC-SHA256, scadenza di default 7 giorni (`main.go`), claims con
+- **Atomicità della sync**: l'intero push (cascate comprese) avviene in una sola transazione SQLite;
+  un rifiuto (`422`) o un errore annulla tutto il batch.
+- **Nessun file su disco**: il contenuto delle note è nella colonna `notes.content`; non ci sono
+  percorsi testuali, quindi nemmeno il rischio di path traversal.
+- **JWT**: firma HMAC-SHA256, scadenza di default 24 ore (`JWT_TTL`), claims con
   `user_id` e `username`.
 
 
 ## Note di sicurezza e sincronizzazione (v2.1)
 
-- **Cursore di pull server-side**: ogni riga ha `synced_at`, assegnato dal server con uno stamp monotono. Il pull filtra solo su `synced_at`; `updated_at` (orologio del client) serve unicamente alla risoluzione LWW. Timestamp del client oltre *ora + 5 min* vengono riportati all'ora del server.
+- **Cursore di pull server-side**: ogni riga ha `synced_at`, assegnato dal server con uno stamp monotono. Il massimo stamp emesso è persistito (tabella `sync_state`, con un margine di 60 s, scrittura al massimo una volta al minuto): dopo un riavvio con l'orologio indietro i nuovi stamp restano comunque maggiori di ogni cursore già consegnato. Il pull filtra solo su `synced_at`; `updated_at` (orologio del client) serve unicamente alla risoluzione LWW. Timestamp del client oltre *ora + 5 min* vengono riportati all'ora del server.
 - **Rifiuti espliciti**: un `folder_id`/`parent_id` non valido produce `422` con l'elenco `rejected` e rollback dell'intero batch; il client non riceve `server_time` e non avanza il cursore.
 - **Tombstone**: purge dopo 30 giorni dall'accettazione sul server (`synced_at`). Un client con cursore più vecchio riceve `full_resync: true` (stato completo) e ripulisce i residui locali.
 - **Revoca token persistente** (`user_token_revocations`, `revoked_tokens`) + `POST /api/v1/auth/logout`.

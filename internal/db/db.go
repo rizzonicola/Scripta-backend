@@ -383,6 +383,13 @@ var migrationStatements = []string{
 		expires_at INTEGER NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_revoked_tokens_exp ON revoked_tokens(expires_at)`,
+	// Stato del protocollo di sync che deve sopravvivere al riavvio (oggi solo
+	// l'high-water mark degli stamp, vedi SyncStateRepo). Tabella NUOVA e
+	// additiva: un binario precedente la ignora.
+	`CREATE TABLE IF NOT EXISTS sync_state (
+		key   TEXT PRIMARY KEY,
+		value INTEGER NOT NULL
+	)`,
 }
 
 func migrate(conn *sql.DB) error {

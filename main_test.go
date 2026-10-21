@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -292,7 +293,12 @@ func TestAdminPagesHaveSecurityHeadersAndNonce(t *testing.T) {
 		t.Fatalf("CSP inattesa: %q", csp)
 	}
 	nonce := strings.TrimSpace(strings.SplitN(strings.SplitN(csp, "script-src 'nonce-", 2)[1], "'", 2)[0])
-	if !strings.Contains(string(body), `nonce="`+nonce+`"`) {
+	// html/template scrive il valore dell'attributo con le entità HTML ('+' del
+	// base64 diventa "&#43;"): il browser le decodifica prima di confrontare il
+	// nonce con la CSP, quindi la pagina è corretta. Il confronto va fatto sul
+	// markup decodificato, altrimenti il test fallisce a caso (~29% delle volte,
+	// quando il nonce casuale contiene '+').
+	if !strings.Contains(html.UnescapeString(string(body)), `nonce="`+nonce+`"`) {
 		t.Fatal("il nonce della CSP non compare nel markup")
 	}
 	if h.Get("X-Frame-Options") != "DENY" || h.Get("Strict-Transport-Security") == "" {

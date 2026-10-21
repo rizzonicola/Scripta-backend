@@ -49,6 +49,13 @@ const TombstoneRetention = 30 * 24 * time.Hour
 // riportandolo all'istante corrente del server.
 const MaxClockSkew = 5 * time.Minute
 
+// stampLease è di quanto l'high-water mark persistente supera lo stamp
+// corrente (Y-04). Più è largo, più raramente si scrive su disco (al massimo
+// una volta per lease, non a ogni sync); più è stretto, meno lo stamp «salta
+// avanti» rispetto all'orologio dopo un riavvio. Un minuto è il valore
+// proposto dal report.
+const stampLease = 60 * time.Second
+
 // Limiti di sanità sui campi ricevuti dal client.
 const (
 	maxIDLen     = 64
@@ -76,6 +83,18 @@ type SyncHandler struct {
 	// SQLite, quindi la serializzazione non costa throughput reale.
 	stampMu   sync.Mutex
 	lastStamp int64
+
+	// Y-04: high-water mark persistente degli stamp. Invariante: ogni stamp
+	// consegnato a un client è <= dell'hwm GIÀ scritto su disco. Dopo un
+	// riavvio lastStamp riparte dall'hwm, quindi i nuovi stamp superano ogni
+	// cursore mai consegnato, anche se l'orologio di sistema è tornato
+	// indietro. Tutti e tre i campi sono protetti da stampMu.
+	SyncState   *db.SyncStateRepo // bound a SQLDB (creato al bisogno)
+	stampLoaded bool
+	stampHWM    int64
+
+	// clock è un gancio per i test (orologio finto). Nil = time.Now.
+	clock func() time.Time
 }
 
 func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
@@ -83,6 +102,7 @@ func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
 		SQLDB:        sqlDB,
 		Folders:      db.NewFoldersRepo(sqlDB),
 		Notes:        db.NewNotesRepo(sqlDB),
+		SyncState:    db.NewSyncStateRepo(sqlDB),
 		MaxBodyBytes: defaultMaxSyncBodyBytes,
 	}
 }
@@ -104,12 +124,62 @@ func isTransientBusyErr(err error) bool {
 // di sistema torna indietro). DEVE essere chiamata con stampMu acquisito,
 // DENTRO la sezione critica che comprende anche il commit.
 func (h *SyncHandler) nextStamp() int64 {
-	now := time.Now().UnixMilli()
+	now := h.nowMillis()
 	if now <= h.lastStamp {
 		now = h.lastStamp + 1
 	}
 	h.lastStamp = now
 	return now
+}
+
+// nowMillis è l'orologio di sistema in millisecondi (sostituibile nei test).
+func (h *SyncHandler) nowMillis() int64 {
+	if h.clock != nil {
+		return h.clock().UnixMilli()
+	}
+	return time.Now().UnixMilli()
+}
+
+// reserveStamp assegna lo stamp della sync corrente (Y-04). DEVE essere
+// chiamata con stampMu acquisito e PRIMA di aprire la transazione di sync.
+//
+// Perché serve: lastStamp solo in RAM ripartiva da zero a ogni riavvio. Con
+// l'orologio di sistema tornato indietro (step NTP, snapshot di VM/container)
+// i nuovi stamp risultavano minori dei cursori già consegnati e le righe
+// scritte da quel momento non arrivavano mai ai dispositivi, senza errori.
+// Persistere MAX(synced_at) non basta: lo stamp di una sync a vuoto non è
+// scritto in nessuna riga. Si persiste quindi il massimo stamp EMESSO, con un
+// margine («lease»): si scrive su disco solo quando lo stamp raggiunge l'hwm
+// già scritto, cioè al massimo una volta per stampLease.
+//
+// Se la scrittura dell'hwm fallisce NON si consegna nessuno stamp (si
+// risponde con un errore e il client riprova): consegnare uno stamp oltre
+// l'hwm persistente romperebbe l'invariante. Non cambia il significato del
+// cursore, né LWW, né i tombstone: è solo più restrittivo di prima.
+func (h *SyncHandler) reserveStamp(ctx context.Context) (int64, error) {
+	if h.SyncState == nil {
+		h.SyncState = db.NewSyncStateRepo(h.SQLDB)
+	}
+	if !h.stampLoaded {
+		hwm, err := h.SyncState.GetInt(ctx, db.StampHWMKey)
+		if err != nil {
+			return 0, err
+		}
+		h.stampHWM = hwm
+		if hwm > h.lastStamp {
+			h.lastStamp = hwm
+		}
+		h.stampLoaded = true
+	}
+	stamp := h.nextStamp()
+	if stamp >= h.stampHWM {
+		newHWM := stamp + stampLease.Milliseconds()
+		if err := h.SyncState.SetMaxInt(ctx, db.StampHWMKey, newHWM); err != nil {
+			return 0, err
+		}
+		h.stampHWM = newHWM
+	}
+	return stamp, nil
 }
 
 // clampClientTime corregge un timestamp del client: mai nel futuro oltre
@@ -227,6 +297,9 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	case res.aborted:
 		return // client disconnesso
 	case res.rejected != nil:
+		// Una riga di riepilogo per ogni 422, con la versione dell'app (solo
+		// per capire chi sta inviando cosa; nessun titolo né contenuto).
+		log.Printf("sync: 422, %d elementi rifiutati (client=%s)", len(res.rejected), clientTag(r))
 		writeJSON(w, http.StatusUnprocessableEntity, models.SyncRejectedResponse{
 			Error:    "alcuni elementi sono stati rifiutati: riferimento a cartella non valido",
 			Rejected: res.rejected,
@@ -237,6 +310,7 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONError(w, res.status, res.message)
 	default:
+		setProtoHeader(w)
 		writeJSON(w, http.StatusOK, res.resp)
 	}
 }
@@ -261,7 +335,17 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 	// sync successiva ha uno stamp maggiore di quello restituito qui.
 	h.stampMu.Lock()
 	defer h.stampMu.Unlock()
-	now := h.nextStamp()
+	now, err := h.reserveStamp(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return syncResult{aborted: true} // client disconnesso
+		}
+		if isTransientBusyErr(err) {
+			return syncResult{status: http.StatusServiceUnavailable, message: "database temporaneamente occupato, riprovare", retryAfter: true}
+		}
+		log.Printf("sync: errore stato stamp: %v", err)
+		return failure(http.StatusInternalServerError, "errore stato sync")
+	}
 
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
@@ -281,77 +365,15 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 	foldersTx := db.NewFoldersRepo(tx)
 	notesTx := db.NewNotesRepo(tx)
 
-	var rejected []models.RejectedItem
-
-	for _, fc := range req.Folders {
-		if ctx.Err() != nil {
-			return syncResult{aborted: true}
-		}
-		if !validID(fc.ID) {
-			rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: truncateForLog(fc.ID), Reason: "invalid_id"})
-			continue
-		}
-		if fc.ParentID != nil && (!validID(*fc.ParentID) || *fc.ParentID == fc.ID) {
-			rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"})
-			continue
-		}
-		name := strings.TrimSpace(fc.Name)
-		if name == "" {
-			name = "Senza nome"
-		}
-		if utf8.RuneCountInString(name) > maxNameLen {
-			name = string([]rune(name)[:maxNameLen])
-		}
-		updatedAt, _ := clampClientTime(fc.UpdatedAt, now)
-		var deletedAt *int64
-		if fc.DeletedAt != nil {
-			d, _ := clampClientTime(*fc.DeletedAt, now)
-			deletedAt = &d
-		}
-		folder := &models.Folder{
-			ID:        fc.ID,
-			UserID:    userID,
-			Name:      name,
-			ParentID:  fc.ParentID,
-			UpdatedAt: updatedAt,
-			SyncedAt:  now,
-			DeletedAt: deletedAt,
-		}
-		if err := foldersTx.UpsertLWW(ctx, folder); err != nil {
-			if isOwnershipViolation(err) {
-				// parent_id inesistente o di un altro utente: rifiuto
-				// ESPLICITO (non più scarto silenzioso). Il batch verrà
-				// annullato per intero e il client NON avanzerà il cursore.
-				log.Printf("sync: cartella %s rifiutata, parent_id non valido o non dell'utente", fc.ID)
-				rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"})
-				continue
-			}
-			log.Printf("sync: errore upsert cartella %s: %v", fc.ID, err)
-			return failure(http.StatusInternalServerError, "errore elaborazione cartella")
-		}
-
-		// Rileggiamo lo stato risultante (non ciò che il client ha inviato):
-		// se l'upsert è stato respinto dalla condizione LWW perché il server
-		// aveva già una versione più recente E ATTIVA, la cartella non va
-		// messa in cascata solo perché il client la voleva cancellare.
-		current, err := foldersTx.Get(ctx, userID, fc.ID)
-		if err != nil {
-			log.Printf("sync: errore lettura cartella %s: %v", fc.ID, err)
-			return failure(http.StatusInternalServerError, "errore lettura cartella")
-		}
-		if current != nil && current.UpdatedAt > updatedAt {
-			// Il push ha perso il LWW: ri-consegna la versione vincente.
-			if err := foldersTx.TouchSynced(ctx, userID, fc.ID, now); err != nil {
-				log.Printf("sync: errore touch cartella %s: %v", fc.ID, err)
-				return failure(http.StatusInternalServerError, "errore elaborazione cartella")
-			}
-		}
-		if current != nil && current.DeletedAt != nil {
-			if err := cascadeSoftDeleteFolder(ctx, foldersTx, notesTx, userID, fc.ID, now); err != nil {
-				log.Printf("sync: errore cascata cartella %s: %v", fc.ID, err)
-				return failure(http.StatusInternalServerError, "errore cascata cancellazione cartella")
-			}
-		}
+	// Cartelle (Y-01): vedi applyFolders. Il trigger di ownership richiede che
+	// il genitore esista già quando si scrive il figlio, ma l'ordine in cui il
+	// client elenca le cartelle sporche non è garantito (listDirty non ha ORDER
+	// BY e l'upsert locale cambia rowid): un figlio inviato PRIMA di un
+	// genitore nuovo veniva rifiutato con 422 e il client, per «ripararlo», lo
+	// spostava in radice, appiattendo la gerarchia.
+	rejected, stop := applyFolders(ctx, foldersTx, notesTx, userID, req.Folders, now)
+	if stop != nil {
+		return *stop
 	}
 
 	for _, nc := range req.Notes {
@@ -465,6 +487,7 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		FullResync: fullResync,
 		Folders:    make([]models.FolderDTO, 0, len(folders)),
 		Notes:      make([]models.NoteDTO, 0, len(notes)),
+		Caps:       models.ServerCaps,
 	}
 	for _, f := range folders {
 		resp.Folders = append(resp.Folders, models.FolderDTO{
@@ -489,6 +512,225 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		})
 	}
 	return syncResult{resp: resp}
+}
+
+// folderOutcome è l'esito dell'applicazione di una singola cartella del batch.
+type folderOutcome int
+
+const (
+	folderApplied       folderOutcome = iota // upsert (ed eventuale cascata) eseguiti
+	folderRejected                           // rifiutata: il motivo è nel RejectedItem restituito
+	folderParentMissing                      // il trigger di ownership non trova (ancora) il genitore
+)
+
+// applyFolders applica le cartelle del batch dentro la transazione `foldersTx`
+// e restituisce i rifiuti. Un valore non nil come secondo risultato significa
+// «interrompi e rispondi così» (errore interno o client disconnesso).
+//
+// Strategia (Y-01), pensata per NON cambiare l'esito di nessun batch che oggi
+// riesce:
+//
+//  1. Prima passata nell'ordine ricevuto, identica a prima. Una cartella il cui
+//     genitore non c'è ancora ma È NEL BATCH non viene rifiutata: viene
+//     differita.
+//  2. Le differite sono ordinate con i genitori prima dei figli
+//     (orderDeferredFolders, O(n)) e applicate. Se il genitore, in realtà,
+//     manca (non è nel DB e non è stato accettato), il rifiuto resta
+//     invalid_parent_id: stesso 422 di oggi.
+//  3. Un ciclo fra cartelle nuove (A→B→A) non si può risolvere: le cartelle
+//     coinvolte sono rifiutate con invalid_parent_id e il batch intero va in
+//     rollback (422), come per ogni altro rifiuto.
+//
+// Non si riordina l'intero batch di proposito: la cascata di cancellazione
+// (cascadeSoftDeleteFolder) dipende dall'ordine, e cambiarlo per batch che già
+// funzionano potrebbe cambiare il loro esito (regola 2 del PM: nessuna
+// modifica alla semantica di LWW e tombstone).
+func applyFolders(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.NotesRepo, userID string, folders []models.FolderDTO, now int64) ([]models.RejectedItem, *syncResult) {
+	var rejected []models.RejectedItem
+
+	inBatch := make(map[string]struct{}, len(folders))
+	for _, fc := range folders {
+		inBatch[fc.ID] = struct{}{}
+	}
+
+	var deferred []models.FolderDTO
+	for _, fc := range folders {
+		if ctx.Err() != nil {
+			return nil, &syncResult{aborted: true}
+		}
+		outcome, item, fail := applyFolder(ctx, foldersTx, notesTx, userID, fc, now)
+		if fail != nil {
+			return nil, fail
+		}
+		switch outcome {
+		case folderRejected:
+			rejected = append(rejected, item)
+		case folderParentMissing:
+			if fc.ParentID != nil {
+				if _, ok := inBatch[*fc.ParentID]; ok {
+					deferred = append(deferred, fc)
+					continue
+				}
+			}
+			// parent_id inesistente o di un altro utente: rifiuto ESPLICITO (non
+			// più scarto silenzioso). Il batch verrà annullato per intero e il
+			// client NON avanzerà il cursore.
+			log.Printf("sync: cartella %s rifiutata, parent_id non valido o non dell'utente", fc.ID)
+			rejected = append(rejected, item)
+		}
+	}
+
+	ordered, cyclic := orderDeferredFolders(deferred)
+	for _, fc := range ordered {
+		if ctx.Err() != nil {
+			return nil, &syncResult{aborted: true}
+		}
+		outcome, item, fail := applyFolder(ctx, foldersTx, notesTx, userID, fc, now)
+		if fail != nil {
+			return nil, fail
+		}
+		switch outcome {
+		case folderRejected:
+			rejected = append(rejected, item)
+		case folderParentMissing:
+			log.Printf("sync: cartella %s rifiutata, il genitore indicato nel batch non è valido", fc.ID)
+			rejected = append(rejected, item)
+		}
+	}
+	for _, fc := range cyclic {
+		log.Printf("sync: cartella %s rifiutata, ciclo o dipendenza irrisolvibile fra cartelle del batch", fc.ID)
+		rejected = append(rejected, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"})
+	}
+	return rejected, nil
+}
+
+// applyFolder valida e applica UNA cartella (upsert LWW, eventuale
+// ri-consegna se il push ha perso, eventuale cascata di cancellazione). Il
+// corpo è quello che prima stava inline nel ciclo di process: stesse
+// validazioni, stessi messaggi, stesso ordine delle operazioni.
+//
+// Se il trigger di ownership respinge la riga restituisce folderParentMissing
+// con il RejectedItem già pronto: decide il chiamante se differirla o
+// rifiutarla. Il terzo risultato è non nil solo per errori interni.
+func applyFolder(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.NotesRepo, userID string, fc models.FolderDTO, now int64) (folderOutcome, models.RejectedItem, *syncResult) {
+	if !validID(fc.ID) {
+		return folderRejected, models.RejectedItem{Kind: "folder", ID: truncateForLog(fc.ID), Reason: "invalid_id"}, nil
+	}
+	if fc.ParentID != nil && (!validID(*fc.ParentID) || *fc.ParentID == fc.ID) {
+		return folderRejected, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"}, nil
+	}
+	name := strings.TrimSpace(fc.Name)
+	if name == "" {
+		name = "Senza nome"
+	}
+	if utf8.RuneCountInString(name) > maxNameLen {
+		name = string([]rune(name)[:maxNameLen])
+	}
+	updatedAt, _ := clampClientTime(fc.UpdatedAt, now)
+	var deletedAt *int64
+	if fc.DeletedAt != nil {
+		d, _ := clampClientTime(*fc.DeletedAt, now)
+		deletedAt = &d
+	}
+	folder := &models.Folder{
+		ID:        fc.ID,
+		UserID:    userID,
+		Name:      name,
+		ParentID:  fc.ParentID,
+		UpdatedAt: updatedAt,
+		SyncedAt:  now,
+		DeletedAt: deletedAt,
+	}
+	if err := foldersTx.UpsertLWW(ctx, folder); err != nil {
+		if isOwnershipViolation(err) {
+			return folderParentMissing, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"}, nil
+		}
+		log.Printf("sync: errore upsert cartella %s: %v", fc.ID, err)
+		f := failure(http.StatusInternalServerError, "errore elaborazione cartella")
+		return folderRejected, models.RejectedItem{}, &f
+	}
+
+	// Rileggiamo lo stato risultante (non ciò che il client ha inviato):
+	// se l'upsert è stato respinto dalla condizione LWW perché il server
+	// aveva già una versione più recente E ATTIVA, la cartella non va
+	// messa in cascata solo perché il client la voleva cancellare.
+	current, err := foldersTx.Get(ctx, userID, fc.ID)
+	if err != nil {
+		log.Printf("sync: errore lettura cartella %s: %v", fc.ID, err)
+		f := failure(http.StatusInternalServerError, "errore lettura cartella")
+		return folderRejected, models.RejectedItem{}, &f
+	}
+	if current != nil && current.UpdatedAt > updatedAt {
+		// Il push ha perso il LWW: ri-consegna la versione vincente.
+		if err := foldersTx.TouchSynced(ctx, userID, fc.ID, now); err != nil {
+			log.Printf("sync: errore touch cartella %s: %v", fc.ID, err)
+			f := failure(http.StatusInternalServerError, "errore elaborazione cartella")
+			return folderRejected, models.RejectedItem{}, &f
+		}
+	}
+	if current != nil && current.DeletedAt != nil {
+		if err := cascadeSoftDeleteFolder(ctx, foldersTx, notesTx, userID, fc.ID, now); err != nil {
+			log.Printf("sync: errore cascata cartella %s: %v", fc.ID, err)
+			f := failure(http.StatusInternalServerError, "errore cascata cancellazione cartella")
+			return folderRejected, models.RejectedItem{}, &f
+		}
+	}
+	return folderApplied, models.RejectedItem{}, nil
+}
+
+// orderDeferredFolders ordina le cartelle differite con i genitori prima dei
+// figli (ordinamento topologico di Kahn, O(n), stabile rispetto all'ordine di
+// arrivo). Una cartella dipende da un'altra solo se il suo genitore è fra le
+// differite: se il genitore è stato applicato più tardi nella prima passata,
+// o è già nel DB, non c'è dipendenza e la cartella passa subito.
+//
+// `cyclic` raccoglie ciò che non si può ordinare: i cicli (A→B→A) e chi
+// dipende da un ciclo. Non servono limiti di profondità né ricorsione: lo
+// stack non cresce con la profondità dell'albero.
+func orderDeferredFolders(deferred []models.FolderDTO) (ordered, cyclic []models.FolderDTO) {
+	n := len(deferred)
+	if n == 0 {
+		return nil, nil
+	}
+	byID := make(map[string]int, n)
+	for i, fc := range deferred {
+		byID[fc.ID] = i
+	}
+	indeg := make([]int, n)
+	children := make(map[int][]int, n)
+	for i, fc := range deferred {
+		if fc.ParentID == nil {
+			continue
+		}
+		if pj, ok := byID[*fc.ParentID]; ok && pj != i {
+			indeg[i]++
+			children[pj] = append(children[pj], i)
+		}
+	}
+	queue := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if indeg[i] == 0 {
+			queue = append(queue, i)
+		}
+	}
+	done := make([]bool, n)
+	for head := 0; head < len(queue); head++ {
+		i := queue[head]
+		done[i] = true
+		ordered = append(ordered, deferred[i])
+		for _, c := range children[i] {
+			indeg[c]--
+			if indeg[c] == 0 {
+				queue = append(queue, c)
+			}
+		}
+	}
+	for i := 0; i < n; i++ {
+		if !done[i] {
+			cyclic = append(cyclic, deferred[i])
+		}
+	}
+	return ordered, cyclic
 }
 
 func truncateForLog(s string) string {

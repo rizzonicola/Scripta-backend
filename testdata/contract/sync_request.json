@@ -1,0 +1,19 @@
+{
+  "last_synced_at": 0,
+  "folders": [
+    { "id": "f-radice", "name": "Lavoro è → 😀", "parent_id": null, "updated_at": 1700000000000, "deleted_at": null },
+    { "id": "f-figlia", "name": "Riunioni", "parent_id": "f-radice", "updated_at": 1700000000001, "deleted_at": null }
+  ],
+  "notes": [
+    {
+      "id": "n-1", "title": "Perché → già 😀", "content": "# Titolo\n\nTesto con «accenti» e 😀\n",
+      "folder_id": "f-figlia", "is_favorite": true, "is_pinned": false, "order_index": 3,
+      "updated_at": 1700000000002, "deleted_at": null
+    },
+    {
+      "id": "n-2", "title": "", "content": "",
+      "folder_id": null, "is_favorite": false, "is_pinned": false, "order_index": 0,
+      "updated_at": 1700000000003, "deleted_at": 1700000000004
+    }
+  ]
+}
