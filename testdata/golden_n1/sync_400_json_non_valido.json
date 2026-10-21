@@ -1,0 +1,8 @@
+{
+  "request": "{non json",
+  "status": 400,
+  "content_type": "application/json",
+  "response": {
+    "error": "body JSON non valido"
+  }
+}

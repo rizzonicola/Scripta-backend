@@ -1,0 +1,15 @@
+{
+  "request": {
+    "folders": [],
+    "last_synced_at": 0,
+    "notes": []
+  },
+  "status": 200,
+  "content_type": "application/json",
+  "response": {
+    "folders": [],
+    "full_resync": false,
+    "notes": [],
+    "server_time": "\u003cserver_time\u003e"
+  }
+}

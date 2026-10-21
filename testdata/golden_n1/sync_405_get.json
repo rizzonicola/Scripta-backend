@@ -1,0 +1,8 @@
+{
+  "request": null,
+  "status": 405,
+  "content_type": "application/json",
+  "response": {
+    "error": "metodo non consentito"
+  }
+}

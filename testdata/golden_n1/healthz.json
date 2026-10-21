@@ -1,0 +1,18 @@
+{
+  "request": null,
+  "status": 200,
+  "content_type": "application/json",
+  "response": {
+    "architecture": "local-first delta-sync (id-based, last-write-wins, server-stamped cursor)",
+    "credits": {
+      "database": "github.com/tursodatabase/go-libsql",
+      "jwt": "github.com/golang-jwt/jwt/v5",
+      "security": "golang.org/x/crypto/bcrypt",
+      "uuid": "github.com/google/uuid"
+    },
+    "license": "GPL-3.0",
+    "name": "Scripta Notes Server",
+    "status": "ok",
+    "version": "2.1.0"
+  }
+}

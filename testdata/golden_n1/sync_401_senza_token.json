@@ -1,0 +1,12 @@
+{
+  "request": {
+    "folders": [],
+    "last_synced_at": 0,
+    "notes": []
+  },
+  "status": 401,
+  "content_type": "application/json",
+  "response": {
+    "error": "token mancante"
+  }
+}

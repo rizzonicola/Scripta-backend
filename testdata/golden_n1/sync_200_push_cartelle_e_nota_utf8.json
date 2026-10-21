@@ -1,0 +1,69 @@
+{
+  "request": {
+    "folders": [
+      {
+        "deleted_at": null,
+        "id": "f1",
+        "name": "Cartella f1",
+        "parent_id": null,
+        "updated_at": 1700000000000
+      },
+      {
+        "deleted_at": null,
+        "id": "f2",
+        "name": "Cartella f2",
+        "parent_id": "f1",
+        "updated_at": 1700000000000
+      }
+    ],
+    "last_synced_at": 0,
+    "notes": [
+      {
+        "content": "Perché → già: «ciao» 😀\n",
+        "deleted_at": null,
+        "folder_id": "f2",
+        "id": "n1",
+        "is_favorite": true,
+        "is_pinned": false,
+        "order_index": 3,
+        "title": "è → 😀 \u003c\u003e\u0026",
+        "updated_at": 1700000000000
+      }
+    ]
+  },
+  "status": 200,
+  "content_type": "application/json",
+  "response": {
+    "folders": [
+      {
+        "deleted_at": null,
+        "id": "f1",
+        "name": "Cartella f1",
+        "parent_id": null,
+        "updated_at": 1700000000000
+      },
+      {
+        "deleted_at": null,
+        "id": "f2",
+        "name": "Cartella f2",
+        "parent_id": "f1",
+        "updated_at": 1700000000000
+      }
+    ],
+    "full_resync": false,
+    "notes": [
+      {
+        "content": "Perché → già: «ciao» 😀\n",
+        "deleted_at": null,
+        "folder_id": "f2",
+        "id": "n1",
+        "is_favorite": true,
+        "is_pinned": false,
+        "order_index": 3,
+        "title": "è → 😀 \u003c\u003e\u0026",
+        "updated_at": 1700000000000
+      }
+    ],
+    "server_time": "\u003cserver_time\u003e"
+  }
+}

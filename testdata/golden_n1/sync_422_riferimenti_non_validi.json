@@ -1,0 +1,44 @@
+{
+  "request": {
+    "folders": [
+      {
+        "deleted_at": null,
+        "id": "f-orfana",
+        "name": "Cartella f-orfana",
+        "parent_id": "non-esiste",
+        "updated_at": 1700000000000
+      }
+    ],
+    "last_synced_at": 0,
+    "notes": [
+      {
+        "content": "y",
+        "deleted_at": null,
+        "folder_id": "non-esiste-neanche-questa",
+        "id": "n-orfana",
+        "is_favorite": true,
+        "is_pinned": false,
+        "order_index": 3,
+        "title": "x",
+        "updated_at": 1700000000000
+      }
+    ]
+  },
+  "status": 422,
+  "content_type": "application/json",
+  "response": {
+    "error": "alcuni elementi sono stati rifiutati: riferimento a cartella non valido",
+    "rejected": [
+      {
+        "id": "f-orfana",
+        "kind": "folder",
+        "reason": "invalid_parent_id"
+      },
+      {
+        "id": "n-orfana",
+        "kind": "note",
+        "reason": "invalid_folder_id"
+      }
+    ]
+  }
+}
