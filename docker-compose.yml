@@ -24,6 +24,9 @@ services:
       # del server (24h). Un TTL lungo evita re-login frequenti e non indebolisce
       # la revoca: logout e reset password invalidano i token subito.
       JWT_TTL: "${JWT_TTL:-}"
+      # Tetto del body di POST /api/v1/sync in byte (default 64 MiB). Senza
+      # questa variabile il valore non è configurabile da compose.
+      SYNC_MAX_BODY_BYTES: "${SYNC_MAX_BODY_BYTES:-}"
       # --- Opzionali: modalità "embedded replica" verso Turso/libSQL server ---
       TURSO_SYNC_URL: "${TURSO_SYNC_URL:-}"
       TURSO_AUTH_TOKEN: "${TURSO_AUTH_TOKEN:-}"

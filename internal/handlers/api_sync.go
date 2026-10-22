@@ -1,8 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -40,6 +44,13 @@ var beginTxBackoff = [maxBeginTxRetries]time.Duration{20 * time.Millisecond, 60 
 // usare, così ogni device ha il tempo di ricevere ogni cancellazione prima
 // che il server la dimentichi.
 const TombstoneRetention = 30 * 24 * time.Hour
+
+// TombstonePurgeSafetyMargin è il margine aggiuntivo prima dell'hard-delete:
+// una sync già in volo con un cursore appena dentro la retention deve poter
+// ancora vedere il tombstone. Senza margine, la purge può cancellarlo mentre
+// la richiesta è in coda, e il client non riceverebbe mai la cancellazione
+// (il suo cursore non è abbastanza vecchio per un full_resync).
+const TombstonePurgeSafetyMargin = 5 * time.Minute
 
 // MaxClockSkew è la tolleranza massima accettata tra l'orologio del client e
 // quello del server: un updated_at/deleted_at che supera "adesso + 5 minuti"
@@ -280,8 +291,8 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	if maxBody <= 0 {
 		maxBody = defaultMaxSyncBodyBytes
 	}
-	var req models.SyncRequest
-	if !decodeJSONBody(w, r, &req, maxBody) {
+	req, ok := decodeSyncRequest(w, r, maxBody)
+	if !ok {
 		return
 	}
 	if len(req.Folders)+len(req.Notes) > maxBatchSize {
@@ -292,7 +303,7 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	// La sezione critica (lock + stamp + transazione + commit + pull) è
 	// in process(); la scrittura della risposta HTTP avviene FUORI dal lock,
 	// così un client lento a leggere non blocca le altre sync.
-	res := h.process(ctx, userID, &req)
+	res := h.process(ctx, userID, req)
 	switch {
 	case res.aborted:
 		return // client disconnesso
@@ -313,6 +324,145 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		setProtoHeader(w)
 		writeJSON(w, http.StatusOK, res.resp)
 	}
+}
+
+// decodeSyncRequest legge il body di sync in due fasi: prima conserva gli
+// array come JSON grezzo, ne conta gli elementi e solo se il batch rientra
+// nel limite li decodifica nei DTO. Così un array enorme viene rifiutato con
+// 413 senza allocare prima tutti i modelli (il solo limite di byte non
+// impedisce a un body da 64 MiB di contenere centinaia di migliaia di
+// oggetti con molti campi).
+func decodeSyncRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (*models.SyncRequest, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
+	var env struct {
+		LastSyncedAt int64           `json:"last_synced_at"`
+		Folders      json.RawMessage `json:"folders"`
+		Notes        json.RawMessage `json:"notes"`
+	}
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&env); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
+		} else {
+			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		}
+		return nil, false
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		return nil, false
+	}
+
+	nFolders, err := countJSONArray(env.Folders)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		return nil, false
+	}
+	nNotes, err := countJSONArray(env.Notes)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		return nil, false
+	}
+	if nFolders+nNotes > maxBatchSize {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "troppi elementi nel batch")
+		return nil, false
+	}
+
+	req := &models.SyncRequest{LastSyncedAt: env.LastSyncedAt}
+	if len(env.Folders) > 0 {
+		if err := json.Unmarshal(env.Folders, &req.Folders); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			return nil, false
+		}
+	}
+	if len(env.Notes) > 0 {
+		if err := json.Unmarshal(env.Notes, &req.Notes); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			return nil, false
+		}
+	}
+	return req, true
+}
+
+// countJSONArray conta gli elementi di un array JSON senza costruire i
+// valori intermedi. Si ferma appena supera maxBatchSize: al chiamante basta
+// sapere che il limite è stato superato.
+func countJSONArray(raw json.RawMessage) (int, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok || d != '[' {
+		return 0, errors.New("atteso un array JSON")
+	}
+	count := 0
+	for dec.More() {
+		count++
+		if count > maxBatchSize {
+			return count, nil
+		}
+		if err := skipJSONValue(dec); err != nil {
+			return 0, err
+		}
+	}
+	tok, err = dec.Token()
+	if err != nil {
+		return 0, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != ']' {
+		return 0, errors.New("array JSON non chiuso")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return 0, errors.New("contenuto extra dopo l'array")
+	}
+	return count, nil
+}
+
+// skipJSONValue consuma un valore JSON arbitrario (oggetto, array o
+// scalare) usando solo i token del decoder, senza materializzarlo.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch d {
+	case '{':
+		for dec.More() {
+			if _, err := dec.Token(); err != nil { // chiave
+				return err
+			}
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil { // '}'
+			return err
+		}
+	case '[':
+		for dec.More() {
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil { // ']'
+			return err
+		}
+	default:
+		return errors.New("delimitatore JSON inatteso")
+	}
+	return nil
 }
 
 // syncResult è l'esito di process: esattamente uno tra resp (successo),

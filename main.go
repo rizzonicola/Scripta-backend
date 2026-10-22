@@ -171,6 +171,13 @@ func loadConfig() (config, error) {
 	parseDur("ADMIN_SESSION_TTL", &c.AdminSessionTTL)
 	parseDur("TURSO_SYNC_INTERVAL", &c.TursoInterval)
 
+	// Un token non deve poter sopravvivere alla finestra di retention delle
+	// revoche per utente: dopo quel periodo la revoca viene potata e un JWT
+	// ancora valido tornerebbe accettato (es. dopo un reset password).
+	if c.JWTTTL > auth.UserRevocationRetention {
+		return c, fmt.Errorf("configurazione non valida: JWT_TTL (%s) supera la retention delle revoche (%s)", c.JWTTTL, auth.UserRevocationRetention)
+	}
+
 	if raw := os.Getenv("SYNC_MAX_BODY_BYTES"); raw != "" {
 		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
 			c.SyncMaxBody = n
@@ -344,6 +351,14 @@ const walCheckpointInterval = 1 * time.Hour
 // (incremental_vacuum) + checkpoint del WAL.
 const tombstonePurgeInterval = 24 * time.Hour
 
+// tombstonePurgeCutoff calcola il limite di synced_at sotto il quale un
+// tombstone può essere eliminato fisicamente. Include un margine oltre la
+// retention per non cancellare tombstone che una sync già in volo deve
+// ancora consegnare.
+func tombstonePurgeCutoff(now time.Time) int64 {
+	return now.Add(-handlers.TombstoneRetention - handlers.TombstonePurgeSafetyMargin).UnixMilli()
+}
+
 // startTombstonePurgeLoop avvia una goroutine in background con due cicli
 // indipendenti:
 //
@@ -363,7 +378,7 @@ const tombstonePurgeInterval = 24 * time.Hour
 // successivo riprova.
 func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, sqlDB *sql.DB, isLocalDB bool) {
 	purgeAndReclaim := func() {
-		cutoff := time.Now().Add(-handlers.TombstoneRetention).UnixMilli()
+		cutoff := tombstonePurgeCutoff(time.Now())
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 		var nDeleted, fDeleted int64
@@ -373,14 +388,14 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 		if err != nil {
 			log.Printf("purge tombstone note fallito: %v", err)
 		} else if nDeleted > 0 {
-			log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s", nDeleted, handlers.TombstoneRetention)
+			log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s (+ margine)", nDeleted, handlers.TombstoneRetention)
 		}
 
 		fDeleted, err = foldersRepo.PurgeExpiredTombstones(ctx, cutoff)
 		if err != nil {
 			log.Printf("purge tombstone cartelle fallito: %v", err)
 		} else if fDeleted > 0 {
-			log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s", fDeleted, handlers.TombstoneRetention)
+			log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s (+ margine)", fDeleted, handlers.TombstoneRetention)
 		}
 		cancel()
 

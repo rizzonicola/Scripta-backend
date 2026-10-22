@@ -30,10 +30,14 @@ type RevocationStore interface {
 	PurgeExpired(ctx context.Context, now time.Time, userRevocationRetention time.Duration) error
 }
 
-// userRevocationRetention: per quanto tempo si conserva una revoca "per
+// UserRevocationRetention: per quanto tempo si conserva una revoca "per
 // utente". Volutamente molto più larga di qualunque TTL sensato dei token,
 // anche se JWT_TTL venisse abbassato dopo l'emissione di token più longevi.
-const userRevocationRetention = 30 * 24 * time.Hour
+// Esportata perché loadConfig possa rifiutare un JWT_TTL più lungo: un token
+// emesso prima di una revoca deve restare coperto dalla revoca stessa.
+const UserRevocationRetention = 30 * 24 * time.Hour
+
+const userRevocationRetention = UserRevocationRetention
 
 // TokenManager genera e valida i JWT (HS256) e gestisce la revoca.
 //
@@ -89,7 +93,13 @@ func (tm *TokenManager) AttachStore(ctx context.Context, store RevocationStore) 
 func (tm *TokenManager) RevokeUser(ctx context.Context, userID string) error {
 	now := time.Now()
 	tm.mu.Lock()
-	tm.userRevoked[userID] = now
+	// Non far regredire la revoca in RAM se l'orologio torna indietro o due
+	// richieste arrivano fuori ordine: un token emesso tra le due revoche
+	// deve restare invalidato. La persistenza applica già la stessa regola
+	// con "WHERE excluded.revoked_at > ...".
+	if prev, ok := tm.userRevoked[userID]; !ok || now.After(prev) {
+		tm.userRevoked[userID] = now
+	}
 	store := tm.store
 	tm.mu.Unlock()
 	if store == nil {

@@ -99,6 +99,7 @@ var flashMessages = map[string]flashDef{
 	"user_id_required":            {"ID utente obbligatorio", true},
 	"delete_failed":               {"Errore nell'eliminazione dell'utente", true},
 	"user_deleted":                {"Utente e tutti i suoi dati (cartelle e note) eliminati definitivamente", false},
+	"user_deleted_revoke_err":     {"Utente eliminato, ma la revoca persistente dei token attivi non è stata salvata (vedere i log del server)", true},
 }
 
 // flashFromRequest legge il codice ?f= e lo traduce nel testo whitelisted.
@@ -391,6 +392,8 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	if h.Tokens != nil {
 		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
 			log.Printf("admin: revoca token dopo eliminazione non persistita (utente %s): %v", userID, err)
+			redirectFlash(w, r, "/admin", "user_deleted_revoke_err")
+			return
 		}
 	}
 

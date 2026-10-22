@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	libsql "github.com/tursodatabase/go-libsql"
@@ -75,8 +77,11 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("db: Path non può essere vuoto")
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir data dir: %w", err)
+	}
+	if err := secureDBFile(cfg.Path); err != nil {
+		return nil, err
 	}
 
 	rawConnector, mode, err := newLibsqlConnector(cfg)
@@ -155,6 +160,57 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 	return conn, nil
 }
 
+// secureDBFile crea (se manca) il file del database con permessi 0600 e
+// rifiuta i symlink: in una directory condivisa un link creato da un altro
+// utente potrebbe altrimenti far aprire/scrivere un file arbitrario. La
+// directory viene creata con 0700 se nuova; non cambiamo i permessi di una
+// directory già esistente perché potrebbe essere condivisa (es. /tmp).
+func secureDBFile(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("db: il percorso %s è un symlink, rifiutato", path)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("db: stat %s: %w", path, err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("db: crea %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("db: chiudi %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("db: permessi %s: %w", path, err)
+	}
+	return nil
+}
+
+// validatePrimaryURL accetta solo trasporti che non espongono il token e i
+// dati in chiaro. http/ws sono ammessi solo verso loopback (sqld locale di
+// sviluppo); per un primario remoto il token viaggerebbe in chiaro.
+func validatePrimaryURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("URL primario non valido: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL primario %q non valido: host mancante", raw)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "libsql", "https", "wss":
+		return nil
+	case "http", "ws":
+		host := strings.ToLower(u.Hostname())
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("URL primario %q non sicuro: usare libsql:// o https:// (http è ammesso solo su loopback)", raw)
+	default:
+		return fmt.Errorf("URL primario %q: schema %q non supportato", raw, u.Scheme)
+	}
+}
+
 // newLibsqlConnector costruisce il driver.Connector giusto in base alla
 // configurazione: locale puro oppure embedded replica sincronizzata con un
 // primario remoto (libsql.NewEmbeddedReplicaConnector).
@@ -168,6 +224,9 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 func newLibsqlConnector(cfg Config) (driver.Connector, string, error) {
 	if cfg.PrimaryURL == "" {
 		return nil, "locale", nil // nil = connector locale costruito da newLocalConnector in OpenWithConfig
+	}
+	if err := validatePrimaryURL(cfg.PrimaryURL); err != nil {
+		return nil, "", err
 	}
 
 	opts := []libsql.Option{libsql.WithAuthToken(cfg.AuthToken)}
