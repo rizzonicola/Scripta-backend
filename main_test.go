@@ -146,6 +146,15 @@ func TestLoginIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestLoginSQLInjectionAttemptFails(t *testing.T) {
+	e := newEnv(t)
+	code, body, _ := e.do("POST", "/api/v1/auth/login", "",
+		map[string]string{"username": "' OR 1=1 --", "password": "password-di-prova"}, nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("login injection: %d %s", code, body)
+	}
+}
+
 func TestLoginReturnsStoredUsernameCase(t *testing.T) {
 	e := newEnv(t)
 	hash, err := auth.HashPassword("password-di-prova")

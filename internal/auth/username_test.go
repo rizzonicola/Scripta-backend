@@ -1,27 +1,38 @@
 package auth
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeUsernamePreservesCase(t *testing.T) {
-	got, err := NormalizeUsername("  Mario.Rossi  ")
-	if err != nil {
-		t.Fatalf("NormalizeUsername: %v", err)
-	}
-	if got != "Mario.Rossi" {
-		t.Fatalf("username = %q, atteso %q", got, "Mario.Rossi")
-	}
-
-	got, err = NormalizeUsername("Màrio")
-	if err != nil {
-		t.Fatalf("NormalizeUsername unicode: %v", err)
-	}
-	if got != "Màrio" {
-		t.Fatalf("username unicode = %q, atteso %q", got, "Màrio")
+	for _, raw := range []string{"  Mario.Rossi  ", "mario_2-test", "MARIO"} {
+		got, err := NormalizeUsername(raw)
+		if err != nil {
+			t.Fatalf("NormalizeUsername(%q): %v", raw, err)
+		}
+		want := strings.TrimSpace(raw)
+		if got != want {
+			t.Fatalf("username = %q, atteso %q", got, want)
+		}
 	}
 }
 
 func TestNormalizeUsernameRejectsInvalid(t *testing.T) {
-	for _, raw := range []string{"ab", "mario rossi", "mario\trossi", "mario\nrossi"} {
+	for _, raw := range []string{
+		"ab",
+		"mario rossi",
+		"mario\trossi",
+		"mario\nrossi",
+		"Màrio",
+		"NICCOLÒ",
+		"mario@example",
+		"mario/rossi",
+		"mario+tag",
+		"mario!",
+		"' OR 1=1 --",
+		"mario;DROP TABLE users",
+	} {
 		if _, err := NormalizeUsername(raw); err == nil {
 			t.Fatalf("NormalizeUsername(%q) accettato", raw)
 		}

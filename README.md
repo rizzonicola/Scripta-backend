@@ -310,10 +310,12 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
 
 - **`GET /admin`** — elenco utenti registrati (username, ID, data creazione) + form
   di creazione nuovo utente.
-- **`POST /admin/users/create`** — crea un nuovo utente. La password arriva in chiaro
-  dal form HTML mostrato nel browser dell'amministratore, viene **immediatamente
-  cifrata con bcrypt** (`internal/auth/password.go`) e solo l'hash viene salvato nel
-  DB. La password in chiaro non viene mai loggata né mostrata in nessuna pagina.
+- **`POST /admin/users/create`** — crea un nuovo utente. Lo username deve essere di
+  3-64 caratteri ASCII (lettere, numeri, punto, trattino e underscore). La password
+  arriva in chiaro dal form HTML mostrato nel browser dell'amministratore, viene
+  **immediatamente cifrata con bcrypt** (`internal/auth/password.go`) e solo l'hash
+  viene salvato nel DB. La password in chiaro non viene mai loggata né mostrata in
+  nessuna pagina.
 - **`POST /admin/users/reset-password`** — imposta una nuova password per un utente
   esistente. Non è **mai** possibile visualizzare la password precedente: viene
   semplicemente sovrascritto l'hash bcrypt e vengono revocati i token già emessi.

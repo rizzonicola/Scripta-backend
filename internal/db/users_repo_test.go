@@ -36,4 +36,12 @@ func TestUsersRepoPreservesUsernameCaseAndMatchesCaseInsensitively(t *testing.T)
 	if _, err := repo.Create(ctx, "MARIO", "hash"); !errors.Is(err, ErrUsernameTaken) {
 		t.Fatalf("seconda creazione = %v, atteso ErrUsernameTaken", err)
 	}
+
+	injected, err := repo.GetByUsername(ctx, "' OR 1=1 --")
+	if err != nil {
+		t.Fatalf("GetByUsername injection: %v", err)
+	}
+	if injected != nil {
+		t.Fatalf("la lookup ha restituito un utente per un input di injection: %+v", injected)
+	}
 }

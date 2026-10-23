@@ -85,7 +85,7 @@ var flashMessages = map[string]flashDef{
 	"bad_request":           {"Richiesta non valida", true},
 	"internal":              {"Errore interno, riprovare", true},
 	"fields_required":       {"Username e password sono obbligatori", true},
-	"username_invalid":      {"Username non valido: 3-64 caratteri, senza spazi", true},
+	"username_invalid":      {"Username non valido: 3-64 caratteri tra lettere ASCII, numeri, punto, trattino e underscore", true},
 	"password_short":        {"La password deve avere almeno 8 caratteri", true},
 	"password_long":         {"La password non può superare i 72 byte", true},
 	"user_exists":           {"Impossibile creare l'utente: username già in uso", true},
@@ -247,9 +247,9 @@ func passwordFlashCode(err error) string {
 }
 
 // CreateUser gestisce POST /admin/users/create. L'username viene validato e
-// salvato con il case originale (trim + limiti di lunghezza); unicità e login
-// restano case-insensitive. La password in chiaro viene cifrata subito con
-// bcrypt e mai più mostrata né salvata.
+// salvato con il case originale (trim, limiti di lunghezza e soli caratteri
+// ASCII ammessi); unicità e login restano case-insensitive. La password in
+// chiaro viene cifrata subito con bcrypt e mai più mostrata né salvata.
 func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)

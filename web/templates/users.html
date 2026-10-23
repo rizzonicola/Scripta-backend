@@ -104,7 +104,7 @@
   <h2 data-i18n="createHeading">Crea nuovo utente</h2>
   <div class="card">
     <form method="POST" action="/admin/users/create">
-      <input type="text" name="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Username" required autocomplete="off" />
+      <input type="text" name="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Username" pattern="[A-Za-z0-9._-]{3,64}" minlength="3" maxlength="64" required autocomplete="off" />
       <input type="password" name="password" data-i18n-placeholder="passwordPlaceholder" placeholder="Password (min 8 caratteri)" minlength="8" required autocomplete="new-password" />
       <button type="submit" data-i18n="createBtn">Crea utente</button>
     </form>

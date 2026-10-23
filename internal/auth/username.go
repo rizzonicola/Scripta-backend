@@ -2,8 +2,8 @@ package auth
 
 import (
 	"errors"
+	"regexp"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -12,25 +12,22 @@ const (
 	MaxUsernameLen = 64
 )
 
+var usernameChars = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
 // ErrInvalidUsername è restituito da NormalizeUsername.
-var ErrInvalidUsername = errors.New("username non valido: 3-64 caratteri, senza spazi né caratteri di controllo")
+var ErrInvalidUsername = errors.New("username non valido: 3-64 caratteri tra lettere ASCII, numeri, punto, trattino e underscore")
 
 // NormalizeUsername valida l'username e ne conserva il case originale: trim
 // degli spazi ai bordi, lunghezza tra MinUsernameLen e MaxUsernameLen
-// caratteri, nessuno spazio o carattere di controllo interno. L'unicità e la
-// lookup restano case-insensitive, così "Mario", " mario " e "MARIO" sono lo
-// stesso utente ma il nome mostrato mantiene le maiuscole scelte alla
-// creazione.
+// caratteri e solo lettere ASCII, numeri, punto, trattino e underscore.
+// L'unicità e la lookup restano case-insensitive, così "Mario", " mario " e
+// "MARIO" sono lo stesso utente ma il nome mostrato mantiene le maiuscole
+// scelte alla creazione.
 func NormalizeUsername(raw string) (string, error) {
 	u := strings.TrimSpace(raw)
 	n := utf8.RuneCountInString(u)
-	if n < MinUsernameLen || n > MaxUsernameLen {
+	if n < MinUsernameLen || n > MaxUsernameLen || !usernameChars.MatchString(u) {
 		return "", ErrInvalidUsername
-	}
-	for _, r := range u {
-		if unicode.IsSpace(r) || unicode.IsControl(r) {
-			return "", ErrInvalidUsername
-		}
 	}
 	return u, nil
 }
