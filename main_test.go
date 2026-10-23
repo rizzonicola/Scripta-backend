@@ -146,6 +146,32 @@ func TestLoginIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestLoginReturnsStoredUsernameCase(t *testing.T) {
+	e := newEnv(t)
+	hash, err := auth.HashPassword("password-di-prova")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.users.Create(context.Background(), "Luigi", hash); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body, _ := e.do("POST", "/api/v1/auth/login", "",
+		map[string]string{"username": "luigi", "password": "password-di-prova"}, nil)
+	if code != 200 {
+		t.Fatalf("login: %d %s", code, body)
+	}
+	var r struct {
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Username != "Luigi" {
+		t.Fatalf("username restituito = %q, atteso %q", r.Username, "Luigi")
+	}
+}
+
 func TestSyncRequiresAuth(t *testing.T) {
 	e := newEnv(t)
 	if code, _, _ := e.sync("", 0, nil, nil); code != 401 {
@@ -349,7 +375,7 @@ func TestForeignKeysSurviveConnectionRecycling(t *testing.T) {
 }
 
 func TestUsernameNormalizationAndDuplicates(t *testing.T) {
-	if u, err := auth.NormalizeUsername("  Luigi "); err != nil || u != "luigi" {
+	if u, err := auth.NormalizeUsername("  Luigi "); err != nil || u != "Luigi" {
 		t.Fatalf("normalizzazione: %q %v", u, err)
 	}
 	if _, err := auth.NormalizeUsername("ab"); err == nil {
