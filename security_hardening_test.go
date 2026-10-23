@@ -24,6 +24,20 @@ func TestConfigRejectsJWTTTLBeyondRevocationRetention(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsWhitespaceOnlySecrets(t *testing.T) {
+	validEnv(t)
+	t.Setenv("JWT_SECRET", strings.Repeat(" ", 32))
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("JWT_SECRET composto solo da spazi accettato")
+	}
+
+	validEnv(t)
+	t.Setenv("ADMIN_PASS", strings.Repeat(" ", 12))
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("ADMIN_PASS composta solo da spazi accettata")
+	}
+}
+
 func TestTombstonePurgeCutoffIncludesSafetyMargin(t *testing.T) {
 	now := time.UnixMilli(1_700_000_000_000)
 	want := now.Add(-handlers.TombstoneRetention - handlers.TombstonePurgeSafetyMargin).UnixMilli()

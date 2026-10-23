@@ -1,40 +1,47 @@
 # Notes Server — Backend Go per app di note Markdown
 
-Backend in Go 1.23+, SQLite/libSQL (WAL, driver `go-libsql`, CGO),
+Backend in Go 1.26+, SQLite/libSQL (WAL, driver `go-libsql`, CGO),
 con dashboard di amministrazione web integrata e API REST per app mobile.
 
 ## Struttura del progetto
 
 ```
 notes-server/
-├── main.go                          # entrypoint, routing, wiring
-├── go.mod
-├── Dockerfile                       # multi-stage, Alpine, CGO_ENABLED=0
+├── main.go                          # entrypoint, routing, configurazione, manutenzione
+├── go.mod / go.sum
+├── Dockerfile                       # multi-stage Debian bookworm, CGO_ENABLED=1
 ├── docker-compose.yml
 ├── internal/
 │   ├── auth/
+│   │   ├── admin_session.go         # cookie di sessione firmato per /admin
+│   │   ├── jwt.go                   # JWT utente (HS256) + revoche
 │   │   ├── password.go              # bcrypt hash/verify
-│   │   └── jwt.go                   # generazione/validazione JWT (HS256)
+│   │   └── username.go              # normalizzazione/validazione username
 │   ├── db/
-│   │   ├── db.go                    # apertura SQLite (WAL, synchronous=NORMAL) + migrazioni
+│   │   ├── db.go                    # apertura SQLite (WAL) + migrazioni + trigger
 │   │   ├── users_repo.go            # repository utenti
-│   │   ├── notes_repo.go            # repository metadati note (per LWW, con supporto tx)
-│   │   └── settings_repo.go         # repository preferenze utente
+│   │   ├── folders_repo.go          # repository cartelle
+│   │   ├── notes_repo.go            # repository note (LWW, tombstone)
+│   │   ├── settings_repo.go         # preferenze utente
+│   │   ├── sync_state_repo.go       # cursore/high-water mark della sync
+│   │   ├── revocations_repo.go      # revoche JWT persistenti
+│   │   └── maintenance.go           # incremental vacuum / checkpoint WAL
 │   ├── handlers/
 │   │   ├── admin.go                 # dashboard admin (html/template)
-│   │   ├── api_auth.go              # POST /api/v1/auth/login
+│   │   ├── api_auth.go              # login/logout
 │   │   ├── api_sync.go              # POST /api/v1/sync (batch, transazione esplicita)
 │   │   ├── api_notes.go             # GET  /api/v1/notes/download
 │   │   ├── settings.go              # GET/PUT /api/v1/user/settings
-│   │   └── helpers.go
-│   ├── middleware/
-│   │   └── auth.go                  # middleware JWT + sessione admin (cookie)
-│   ├── models/
-│   │   └── models.go
-│   └── storage/
-│       └── files.go                 # path sanitization, lock per-path, scrittura atomica (.tmp + rename)
+│   │   ├── helpers.go               # encoding/decoding JSON comune
+│   │   └── proto.go                 # versione del contratto
+│   ├── middleware/                  # JWT, rate limit, CSRF, gzip, header, timing, IP
+│   └── models/
+│       └── models.go
+├── scripts/record_golden_n1.sh      # rigenera i fixture golden
+├── testdata/                        # fixture di contratto e golden
 └── web/templates/
-    └── users.html                   # UI admin (elenco utenti, creazione, reset password)
+    ├── admin_login.html             # login dashboard
+    └── users.html                   # UI admin (utenti, reset password, eliminazione)
 ```
 
 Dati persistenti (montati come volume Docker su `/data`):
@@ -49,9 +56,8 @@ non esistono file `.md` su disco né percorsi testuali (`relative_path`).
 ## Avvio locale (senza Docker)
 
 ```bash
-go mod tidy      # scarica le dipendenze e genera go.sum (richiede rete)
 go build -o notes-server .
-JWT_SECRET="una-stringa-segreta-lunga" \
+JWT_SECRET="una-stringa-segreta-lunga-almeno-32-caratteri" \
 ADMIN_USER=admin ADMIN_PASS=supersegreta \
 ./notes-server
 ```
@@ -59,11 +65,10 @@ ADMIN_USER=admin ADMIN_PASS=supersegreta \
 Il server parte su `:8080`. Dashboard admin: `http://localhost:8080/admin`
 (protetta da login form-based con cookie di sessione; credenziali da `ADMIN_USER` / `ADMIN_PASS`).
 
-> Nota: in questo ambiente di generazione del codice non è stato possibile eseguire
-> `go mod tidy` / `go build` perché la rete è disabilitata (impossibile scaricare
-> `modernc.org/sqlite`, `golang-jwt`, `google/uuid`, `golang.org/x/crypto`).
-> Il codice è scritto e revisionato con cura ma va compilato con `go mod tidy && go build`
-> in un ambiente con accesso a internet prima del primo deploy.
+> Il cookie admin è `Secure`: in produzione la dashboard va servita via HTTPS
+> (Cloudflare Tunnel o reverse proxy). I browser considerano `localhost` un
+> contesto sicuro, quindi lo sviluppo locale su `http://localhost` funziona;
+> un accesso via IP/LAN in HTTP semplice invece non conserva il cookie.
 
 ## Avvio con Docker
 
@@ -71,8 +76,7 @@ Il server parte su `:8080`. Dashboard admin: `http://localhost:8080/admin`
 docker compose up -d --build
 ```
 
-Il volume Docker `notes-data` persiste il database SQLite (utenti, cartelle e note, contenuto compreso). `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il server non parte senza, né con valori d'esempio): impostarli nel
-`docker-compose.yml` prima di andare in produzione.
+Il volume Docker `notes-data` persiste il database SQLite (utenti, cartelle e note, contenuto compreso). `JWT_SECRET`, `ADMIN_USER` e `ADMIN_PASS` sono **obbligatori** (il server non parte senza, né con valori d'esempio): impostarli in un file `.env` accanto a `docker-compose.yml` (vedi `.env.example`) prima di andare in produzione.
 
 ## Variabili d'ambiente
 
@@ -80,12 +84,15 @@ Il volume Docker `notes-data` persiste il database SQLite (utenti, cartelle e no
 |-------------------|-------------------------|------------------------------------------------|
 | `DB_PATH`         | `data/app.db`           | Percorso file SQLite (contiene TUTTI i dati: utenti, cartelle, note) |
 | `JWT_SECRET`      | **obbligatorio** (≥32 car.) | Chiave HMAC per firma JWT. Nessun default: valori mancanti/d'esempio bloccano l'avvio |
-| `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `720h`). Passata al container da `docker-compose.yml`; vuota o non valida = default. Un TTL lungo non indebolisce la revoca: logout e reset password invalidano il token subito |
+| `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `720h`). Massimo `720h` (30 giorni): oltre, l'avvio viene rifiutato perché supererebbe la retention delle revoche. Vuota o non valida = default |
 | `SYNC_MAX_BODY_BYTES` | `67108864` (64 MiB) | Tetto sul corpo di `POST /api/v1/sync`; oltre risponde `413` |
 | `ADMIN_SESSION_TTL` | `8h`                  | Durata del cookie di sessione admin (`time.Duration`) |
 | `ADMIN_USER`      | **obbligatorio**        | Username login dashboard `/admin`             |
 | `ADMIN_PASS`      | **obbligatorio** (≥12 car.) | Password login dashboard `/admin` (nessun default) |
 | `TRUSTED_PROXIES` | *(vuoto)*               | IP/CIDR dei reverse proxy fidati, separati da virgola. Solo da questi peer sono creduti `Cf-Connecting-IP` / `X-Forwarded-For` (rate limit per IP reale). Vuoto = si usa sempre l'IP del peer TCP |
+| `TURSO_SYNC_URL`  | *(vuoto)*               | Primario libSQL/Turso per la modalità embedded replica (`libsql://`, `https://`, `wss://`; `http://`/`ws://` solo loopback). Vuoto = database locale puro |
+| `TURSO_AUTH_TOKEN`| *(vuoto)*               | Token di autenticazione per `TURSO_SYNC_URL` |
+| `TURSO_SYNC_INTERVAL` | `0`                 | Intervallo di sync automatica della replica (`time.Duration`); `0` = sync solo all'apertura |
 | `PORT`            | `8080`                  | Porta HTTP                                    |
 
 ---
@@ -309,20 +316,26 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
   DB. La password in chiaro non viene mai loggata né mostrata in nessuna pagina.
 - **`POST /admin/users/reset-password`** — imposta una nuova password per un utente
   esistente. Non è **mai** possibile visualizzare la password precedente: viene
-  semplicemente sovrascritto l'hash bcrypt.
+  semplicemente sovrascritto l'hash bcrypt e vengono revocati i token già emessi.
+- **`POST /admin/users/delete`** — elimina definitivamente l'utente e, tramite
+  `ON DELETE CASCADE`, tutte le sue cartelle, note e impostazioni. I token
+  dell'utente vengono revocati.
 
 ---
 
 ## Note implementative
 
-- **SQLite WAL**: aperto con `_pragma=journal_mode(WAL)` e `busy_timeout(5000)`;
-  `SetMaxOpenConns(1)` evita "database is locked" con scritture concorrenti.
+- **SQLite WAL**: PRAGMA (`journal_mode(WAL)`, `busy_timeout(5000)`,
+  `synchronous(NORMAL)`, `foreign_keys(ON)`) applicati su ogni connessione
+  fisica del pool. In modalità locale pura il pool è limitato a 1 connessione;
+  con embedded replica Turso sono ammesse più connessioni in lettura.
 - **Atomicità della sync**: l'intero push (cascate comprese) avviene in una sola transazione SQLite;
   un rifiuto (`422`) o un errore annulla tutto il batch.
 - **Nessun file su disco**: il contenuto delle note è nella colonna `notes.content`; non ci sono
   percorsi testuali, quindi nemmeno il rischio di path traversal.
 - **JWT**: firma HMAC-SHA256, scadenza di default 24 ore (`JWT_TTL`), claims con
-  `user_id` e `username`.
+  `uid` (ID utente), `username` e `iat_ms` (istante di emissione al millisecondo,
+  usato per il confronto con le revoche).
 
 
 ## Note di sicurezza e sincronizzazione (v2.1)
@@ -333,4 +346,4 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
 - **Revoca token persistente** (`user_token_revocations`, `revoked_tokens`) + `POST /api/v1/auth/logout`.
 - **Rate limit** basato sull'IP del peer; header di inoltro creduti solo da `TRUSTED_PROXIES`.
 - **Header di sicurezza** (CSP con nonce sulle pagine admin, HSTS, X-Frame-Options, ecc.); i messaggi della dashboard viaggiano come codici whitelisted, non come testo in query string.
-- **Migrazione**: al primo avvio viene aggiunta `synced_at` (backfill = ora). Dopo l'aggiornamento di `go.mod` eseguire una volta `go mod tidy` per rigenerare `go.sum`.
+- **Migrazione**: al primo avvio vengono aggiunte le colonne mancanti (es. `synced_at`, con backfill = ora) e creati gli indici; le DDL sono idempotenti. `go.sum` è versionato: eseguire `go mod tidy` solo dopo aver modificato le dipendenze.

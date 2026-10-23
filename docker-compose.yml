@@ -24,6 +24,8 @@ services:
       # del server (24h). Un TTL lungo evita re-login frequenti e non indebolisce
       # la revoca: logout e reset password invalidano i token subito.
       JWT_TTL: "${JWT_TTL:-}"
+      # Durata del cookie della dashboard admin (default 8h). Vuoto = default.
+      ADMIN_SESSION_TTL: "${ADMIN_SESSION_TTL:-}"
       # Tetto del body di POST /api/v1/sync in byte (default 64 MiB). Senza
       # questa variabile il valore non è configurabile da compose.
       SYNC_MAX_BODY_BYTES: "${SYNC_MAX_BODY_BYTES:-}"

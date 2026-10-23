@@ -17,6 +17,11 @@ import (
 type Claims struct {
 	UserID   string `json:"uid"`
 	Username string `json:"username"`
+	// IssuedAtMillis conserva la precisione al millisecondo dell'emissione.
+	// Il claim standard iat è troncato al secondo da jwt/v5: usarlo per il
+	// confronto con una revoca rendeva "revocato" anche un token emesso
+	// subito DOPO il reset password, nello stesso secondo della revoca.
+	IssuedAtMillis int64 `json:"iat_ms,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -36,8 +41,6 @@ type RevocationStore interface {
 // Esportata perché loadConfig possa rifiutare un JWT_TTL più lungo: un token
 // emesso prima di una revoca deve restare coperto dalla revoca stessa.
 const UserRevocationRetention = 30 * 24 * time.Hour
-
-const userRevocationRetention = UserRevocationRetention
 
 // TokenManager genera e valida i JWT (HS256) e gestisce la revoca.
 //
@@ -139,7 +142,15 @@ func (tm *TokenManager) IsRevoked(c *Claims) bool {
 		}
 	}
 	if t, ok := tm.userRevoked[c.UserID]; ok {
-		if c.IssuedAt == nil || !c.IssuedAt.Time.After(t) {
+		if c.IssuedAtMillis > 0 {
+			// Token nuovi: confronto al millisecondo (l'istante della revoca
+			// viene troncato allo stesso modo). Un token emesso dopo la
+			// revoca resta valido anche nello stesso secondo.
+			if c.IssuedAtMillis <= t.UnixMilli() {
+				return true
+			}
+		} else if c.IssuedAt == nil || !c.IssuedAt.Time.After(t) {
+			// Token emessi prima di iat_ms: fallback prudente al secondo.
 			return true
 		}
 	}
@@ -156,14 +167,14 @@ func (tm *TokenManager) PurgeExpired(ctx context.Context) {
 		}
 	}
 	for uid, at := range tm.userRevoked {
-		if at.Before(now.Add(-userRevocationRetention)) {
+		if at.Before(now.Add(-UserRevocationRetention)) {
 			delete(tm.userRevoked, uid)
 		}
 	}
 	store := tm.store
 	tm.mu.Unlock()
 	if store != nil {
-		if err := store.PurgeExpired(ctx, now, userRevocationRetention); err != nil {
+		if err := store.PurgeExpired(ctx, now, UserRevocationRetention); err != nil {
 			log.Printf("purge revoche token fallito: %v", err)
 		}
 	}
@@ -174,8 +185,9 @@ func (tm *TokenManager) GenerateToken(userID, username string) (string, int64, e
 	now := time.Now()
 	expiresAt := now.Add(tm.ttl)
 	claims := Claims{
-		UserID:   userID,
-		Username: username,
+		UserID:         userID,
+		Username:       username,
+		IssuedAtMillis: now.UnixMilli(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        uuid.NewString(),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),

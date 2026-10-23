@@ -18,10 +18,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          # NON usare go-version-file: go.mod dichiara `go 1.23`, ramo Go ormai
-          # fuori supporto (nessuna patch di sicurezza: govulncheck segnala
-          # decine di CVE della stdlib). Si usa un ramo supportato e
-          # check-latest per avere sempre l'ultima patch.
+          # go.mod dichiara `go 1.26`, lo stesso ramo usato qui. Si tiene la
+          # versione esplicita con check-latest per avere sempre l'ultima patch
+          # (go-version-file non seleziona la patch più recente).
           # 1.26: govulncheck (CI del 2026-10-19) segnala 9 vulnerabilità della
           # stdlib raggiunte dal codice (net/http, net/textproto, crypto/tls,
           # html/template) presenti in 1.25.14 e corrette in 1.26.9. check-latest

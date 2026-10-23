@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	libsql "github.com/tursodatabase/go-libsql"
@@ -165,23 +166,33 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 // utente potrebbe altrimenti far aprire/scrivere un file arbitrario. La
 // directory viene creata con 0700 se nuova; non cambiamo i permessi di una
 // directory già esistente perché potrebbe essere condivisa (es. /tmp).
+//
+// O_NOFOLLOW elimina il TOCTOU del vecchio Lstat+OpenFile: il controllo e
+// l'apertura sono la stessa operazione atomica nel kernel. fchmod agisce
+// sullo stesso file descriptor appena aperto, non sul path (che potrebbe
+// essere stato sostituito nel frattempo). O_NONBLOCK evita che un FIFO
+// piantato al posto del DB blocchi l'avvio prima ancora del controllo
+// fstat sul tipo di file.
 func secureDBFile(path string) error {
-	info, err := os.Lstat(path)
-	if err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("db: il percorso %s è un symlink, rifiutato", path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return fmt.Errorf("db: apri %s (symlink rifiutato): %w", path, err)
 	}
-	if err != nil && !os.IsNotExist(err) {
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
 		return fmt.Errorf("db: stat %s: %w", path, err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return fmt.Errorf("db: crea %s: %w", path, err)
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return fmt.Errorf("db: %s non è un file regolare", path)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("db: permessi %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("db: chiudi %s: %w", path, err)
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("db: permessi %s: %w", path, err)
 	}
 	return nil
 }
@@ -390,9 +401,7 @@ var migrationStatements = []string{
 		synced_at  INTEGER NOT NULL DEFAULT 0,
 		deleted_at INTEGER
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`,
-	`CREATE INDEX IF NOT EXISTS idx_folders_updated ON folders(user_id, updated_at)`,
 	// Indice parziale: PurgeExpiredTombstones (folders_repo.go) filtra
 	// "WHERE deleted_at IS NOT NULL AND deleted_at < ?" senza user_id (è un
 	// job di manutenzione globale, non per-utente). Senza questo indice
@@ -414,9 +423,7 @@ var migrationStatements = []string{
 		synced_at   INTEGER NOT NULL DEFAULT 0,
 		deleted_at  INTEGER
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
-	`CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(user_id, updated_at)`,
 	// Stessa motivazione di idx_folders_deleted_at, per NotesRepo.PurgeExpiredTombstones.
 	`CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
 	`CREATE TABLE IF NOT EXISTS user_settings (
@@ -494,6 +501,22 @@ func migrate(conn *sql.DB) error {
 	if err := addOwnershipTriggers(conn); err != nil {
 		return fmt.Errorf("migrazione trigger di ownership: %w", err)
 	}
+
+	// Impedisce i cicli creati da spostamenti di cartelle già esistenti
+	// (quelli interni a un singolo batch sono già rifiutati da
+	// orderDeferredFolders in api_sync.go).
+	if err := addFolderCycleTriggers(conn); err != nil {
+		return fmt.Errorf("migrazione trigger anti-ciclo: %w", err)
+	}
+	// Ripara eventuali cicli storici: senza questo, le cartelle coinvolte
+	// resterebbero invisibili nell'albero del client (nessuna radice le
+	// raggiunge).
+	if err := repairFolderCycles(conn); err != nil {
+		return fmt.Errorf("riparazione cicli cartelle: %w", err)
+	}
+	if err := dropRedundantIndexes(conn); err != nil {
+		return fmt.Errorf("rimozione indici ridondanti: %w", err)
+	}
 	return nil
 }
 
@@ -503,6 +526,17 @@ func migrate(conn *sql.DB) error {
 // la riconosce per scartare il singolo elemento del batch invece di far
 // fallire l'intera sync (vedi isOwnershipViolation).
 const OwnershipViolationMarker = "OWNERSHIP_VIOLATION"
+
+// FolderCycleViolationMarker è il prefisso del messaggio sollevato dal
+// trigger che impedisce di spostare una cartella sotto un proprio
+// discendente. Un ciclo rende l'albero non più costruibile e fa sparire le
+// cartelle coinvolte dalla UI (nessuna radice le raggiunge).
+const FolderCycleViolationMarker = "FOLDER_CYCLE"
+
+// IsFolderCycleViolation riconosce il rifiuto del trigger sui cicli.
+func IsFolderCycleViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), FolderCycleViolationMarker)
+}
 
 // addOwnershipTriggers impone, con quattro trigger SQLite, che
 // folders.parent_id e notes.folder_id possano riferire SOLO una cartella
@@ -583,6 +617,195 @@ func addOwnershipTriggers(conn *sql.DB) error {
 	for _, stmt := range statements {
 		if _, err := conn.Exec(stmt); err != nil {
 			return fmt.Errorf("statement %q: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
+// addFolderCycleTriggers impedisce che una cartella esistente venga spostata
+// sotto un proprio discendente. Il controllo vive DENTRO la scrittura (come
+// i trigger di ownership): un solo round-trip, nessuna SELECT applicativa
+// separata e, soprattutto, nessuna finestra tra controllo e UPDATE in cui
+// due sync concorrenti possano introdurre il ciclo.
+//
+// Il ramo INSERT si attiva solo quando l'id esiste già: un inserimento
+// normale non può creare un ciclo (la riga non esiste ancora e un suo
+// discendente non può referenziarla), quindi non paga il costo della CTE.
+// Il ramo UPDATE scatta solo se parent_id cambia davvero.
+func addFolderCycleTriggers(conn *sql.DB) error {
+	statements := []string{
+		`CREATE TRIGGER IF NOT EXISTS trg_folders_cycle_ins
+		 BEFORE INSERT ON folders
+		 WHEN NEW.parent_id IS NOT NULL
+		  AND EXISTS (
+		    SELECT 1 FROM folders
+		     WHERE id = NEW.id AND parent_id IS NOT NEW.parent_id
+		  )
+		 BEGIN
+		   SELECT CASE WHEN EXISTS (
+		     WITH RECURSIVE ancestors(id, parent_id) AS (
+		       SELECT id, parent_id FROM folders
+		        WHERE id = NEW.parent_id AND user_id = NEW.user_id
+		       UNION
+		       SELECT f.id, f.parent_id FROM folders f
+		        JOIN ancestors a ON f.id = a.parent_id
+		        WHERE f.user_id = NEW.user_id
+		     )
+		     SELECT 1 FROM ancestors WHERE id = NEW.id
+		   ) THEN RAISE(ABORT, 'FOLDER_CYCLE: parent_id è un discendente della cartella') END;
+		 END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_folders_cycle_upd
+		 BEFORE UPDATE OF parent_id ON folders
+		 WHEN NEW.parent_id IS NOT NULL
+		  AND OLD.parent_id IS NOT NEW.parent_id
+		 BEGIN
+		   SELECT CASE WHEN EXISTS (
+		     WITH RECURSIVE ancestors(id, parent_id) AS (
+		       SELECT id, parent_id FROM folders
+		        WHERE id = NEW.parent_id AND user_id = NEW.user_id
+		       UNION
+		       SELECT f.id, f.parent_id FROM folders f
+		        JOIN ancestors a ON f.id = a.parent_id
+		        WHERE f.user_id = NEW.user_id
+		     )
+		     SELECT 1 FROM ancestors WHERE id = NEW.id
+		   ) THEN RAISE(ABORT, 'FOLDER_CYCLE: parent_id è un discendente della cartella') END;
+		 END`,
+	}
+	for _, stmt := range statements {
+		if _, err := conn.Exec(stmt); err != nil {
+			return fmt.Errorf("statement %q: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
+// repairFolderCycles rileva i cicli già presenti (creati prima dei trigger)
+// e li spezza azzerando un solo parent_id per ciclo. Non cancella né note né
+// cartelle: le righe restano tutte visibili, una per ciclo torna radice.
+//
+// L'edge spezzato riceve un synced_at nuovo, così i client lo riscaricano;
+// l'high-water mark viene alzato di conseguenza, altrimenti un client con un
+// cursore già avanzato potrebbe non vedere la riparazione. updated_at resta
+// invariato: non è una modifica dell'utente e non deve vincere un LWW contro
+// una modifica legittima concorrente.
+func repairFolderCycles(conn *sql.DB) error {
+	rows, err := conn.Query(`SELECT id, user_id, parent_id FROM folders WHERE parent_id IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("lettura cartelle per controllo cicli: %w", err)
+	}
+	type folderRef struct {
+		id, userID, parentID string
+	}
+	refs := make(map[string]folderRef)
+	for rows.Next() {
+		var r folderRef
+		if err := rows.Scan(&r.id, &r.userID, &r.parentID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan cartella: %w", err)
+		}
+		refs[r.id] = r
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterazione cartelle: %w", err)
+	}
+	rows.Close()
+	if len(refs) == 0 {
+		return nil
+	}
+
+	parents := make(map[string]string, len(refs))
+	for id, r := range refs {
+		parents[id] = r.parentID
+	}
+
+	done := make(map[string]bool, len(parents))
+	var detach []string
+	for start := range parents {
+		if done[start] {
+			continue
+		}
+		path := make([]string, 0, 8)
+		index := make(map[string]int, 8)
+		cur := start
+		for {
+			if done[cur] {
+				break
+			}
+			if _, seen := index[cur]; seen {
+				detach = append(detach, cur)
+				delete(parents, cur)
+				break
+			}
+			parent, ok := parents[cur]
+			if !ok {
+				break
+			}
+			index[cur] = len(path)
+			path = append(path, cur)
+			cur = parent
+		}
+		for _, id := range path {
+			done[id] = true
+		}
+	}
+	if len(detach) == 0 {
+		return nil
+	}
+
+	var maxSynced int64
+	if err := conn.QueryRow(`SELECT COALESCE(MAX(synced_at), 0) FROM folders`).Scan(&maxSynced); err != nil {
+		return fmt.Errorf("lettura massimo synced_at: %w", err)
+	}
+	stamp := time.Now().UnixMilli()
+	if maxSynced >= stamp {
+		stamp = maxSynced + 1
+	}
+
+	tx, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin riparazione cicli: %w", err)
+	}
+	for _, id := range detach {
+		ref := refs[id]
+		if _, err := tx.Exec(
+			`UPDATE folders SET parent_id = NULL, synced_at = ? WHERE id = ? AND user_id = ?`,
+			stamp, id, ref.userID,
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("distacco cartella %s: %w", id, err)
+		}
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO sync_state(key, value) VALUES(?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		 WHERE excluded.value > sync_state.value`,
+		StampHWMKey, stamp,
+	); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("aggiornamento high-water mark: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit riparazione cicli: %w", err)
+	}
+	log.Printf("riparazione: spezzati %d cicli di cartelle (synced_at=%d)", len(detach), stamp)
+	return nil
+}
+
+// dropRedundantIndexes rimuove gli indici sostituiti da un indice composito
+// con lo stesso prefisso (idx_*_user) o non usati da nessuna query corrente
+// (idx_*_updated). Idempotente: DROP INDEX IF EXISTS è sicuro ad ogni avvio,
+// anche su un database che non li ha mai avuti.
+func dropRedundantIndexes(conn *sql.DB) error {
+	for _, index := range []string{
+		"idx_folders_user",
+		"idx_folders_updated",
+		"idx_notes_user",
+		"idx_notes_updated",
+	} {
+		if _, err := conn.Exec(`DROP INDEX IF EXISTS ` + index); err != nil {
+			return fmt.Errorf("drop index %s: %w", index, err)
 		}
 	}
 	return nil

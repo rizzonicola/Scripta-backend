@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -55,6 +56,49 @@ func (g *gzipResponseWriter) Flush() {
 	}
 }
 
+// acceptsGzip interpreta Accept-Encoding secondo la semantica q-value:
+// gzip esplicito prevale su "*", e q=0 (o un q malformato) disabilita la
+// codifica. Il vecchio strings.Contains accettava anche "gzip;q=0" e
+// "xgzip", comprimendo una risposta che il client aveva dichiarato di non
+// volere.
+func acceptsGzip(values []string) bool {
+	gzipQ := -1.0
+	wildcardQ := -1.0
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			fields := strings.Split(part, ";")
+			coding := strings.ToLower(strings.TrimSpace(fields[0]))
+			if coding != "gzip" && coding != "*" {
+				continue
+			}
+			q := 1.0
+			for _, param := range fields[1:] {
+				key, val, ok := strings.Cut(strings.TrimSpace(param), "=")
+				if !ok || !strings.EqualFold(strings.TrimSpace(key), "q") {
+					continue
+				}
+				parsed, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+				if err != nil || parsed < 0 || parsed > 1 {
+					parsed = 0
+				}
+				q = parsed
+				break
+			}
+			if coding == "gzip" {
+				if q > gzipQ {
+					gzipQ = q
+				}
+			} else if q > wildcardQ {
+				wildcardQ = q
+			}
+		}
+	}
+	if gzipQ >= 0 {
+		return gzipQ > 0
+	}
+	return wildcardQ > 0
+}
+
 // Gzip comprime il corpo delle risposte quando il client dichiara supporto
 // per gzip (header Accept-Encoding), senza alcun impatto sui contratti API:
 // stessi status code, stesso JSON/HTML/Markdown nel body, semplicemente
@@ -66,7 +110,7 @@ func (g *gzipResponseWriter) Flush() {
 // invariata in quel caso.
 func Gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		if !acceptsGzip(r.Header.Values("Accept-Encoding")) {
 			next.ServeHTTP(w, r)
 			return
 		}

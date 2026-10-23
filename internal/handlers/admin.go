@@ -81,25 +81,25 @@ type flashDef struct {
 }
 
 var flashMessages = map[string]flashDef{
-	"login_invalid":               {"Credenziali non valide", true},
-	"bad_request":                 {"Richiesta non valida", true},
-	"internal":                    {"Errore interno, riprovare", true},
-	"fields_required":             {"Username e password sono obbligatori", true},
-	"username_invalid":            {"Username non valido: 3-64 caratteri, senza spazi", true},
-	"password_short":              {"La password deve avere almeno 8 caratteri", true},
-	"password_long":               {"La password non può superare i 72 byte", true},
-	"user_exists":                 {"Impossibile creare l'utente: username già in uso", true},
-	"user_create_failed":          {"Impossibile creare l'utente", true},
-	"user_created":                {"Utente creato con successo", false},
-	"reset_fields_required":       {"Utente e nuova password sono obbligatori", true},
-	"user_not_found":              {"Utente non trovato", true},
-	"reset_failed":                {"Errore nel reset della password", true},
-	"password_updated":            {"Password aggiornata con successo", false},
-	"password_updated_revoke_err": {"Password aggiornata, ma la revoca persistente dei token attivi non è stata salvata (vedere i log del server)", true},
-	"user_id_required":            {"ID utente obbligatorio", true},
-	"delete_failed":               {"Errore nell'eliminazione dell'utente", true},
-	"user_deleted":                {"Utente e tutti i suoi dati (cartelle e note) eliminati definitivamente", false},
-	"user_deleted_revoke_err":     {"Utente eliminato, ma la revoca persistente dei token attivi non è stata salvata (vedere i log del server)", true},
+	"login_invalid":         {"Credenziali non valide", true},
+	"bad_request":           {"Richiesta non valida", true},
+	"internal":              {"Errore interno, riprovare", true},
+	"fields_required":       {"Username e password sono obbligatori", true},
+	"username_invalid":      {"Username non valido: 3-64 caratteri, senza spazi", true},
+	"password_short":        {"La password deve avere almeno 8 caratteri", true},
+	"password_long":         {"La password non può superare i 72 byte", true},
+	"user_exists":           {"Impossibile creare l'utente: username già in uso", true},
+	"user_create_failed":    {"Impossibile creare l'utente", true},
+	"user_created":          {"Utente creato con successo", false},
+	"reset_fields_required": {"Utente e nuova password sono obbligatori", true},
+	"user_not_found":        {"Utente non trovato", true},
+	"reset_failed":          {"Errore nel reset della password", true},
+	"reset_revoke_failed":   {"Revoca dei token non riuscita: password non modificata", true},
+	"password_updated":      {"Password aggiornata con successo", false},
+	"user_id_required":      {"ID utente obbligatorio", true},
+	"delete_failed":         {"Errore nell'eliminazione dell'utente", true},
+	"delete_revoke_failed":  {"Revoca dei token non riuscita: utente non eliminato", true},
+	"user_deleted":          {"Utente e tutti i suoi dati (cartelle e note) eliminati definitivamente", false},
 }
 
 // flashFromRequest legge il codice ?f= e lo traduce nel testo whitelisted.
@@ -320,11 +320,34 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	user, err := h.Users.GetByID(r.Context(), userID)
+	if err != nil {
+		log.Printf("admin: errore lettura utente %s: %v", userID, err)
+		redirectFlash(w, r, "/admin", "internal")
+		return
+	}
+	if user == nil {
+		redirectFlash(w, r, "/admin", "user_not_found")
+		return
+	}
+
 	hash, err := auth.HashPassword(newPassword)
 	if err != nil {
 		log.Printf("admin: errore hashing password: %v", err)
 		redirectFlash(w, r, "/admin", "internal")
 		return
+	}
+
+	// La revoca viene PRIMA del cambio password: se il salvataggio
+	// persistente fallisce, l'operazione pericolosa non avviene e i vecchi
+	// token restano validi (come prima del reset), invece di restare
+	// validi nella sola RAM fino al prossimo riavvio.
+	if h.Tokens != nil {
+		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
+			log.Printf("admin: revoca token prima del reset non riuscita (utente %s): %v", userID, err)
+			redirectFlash(w, r, "/admin", "reset_revoke_failed")
+			return
+		}
 	}
 
 	if err := h.Users.UpdatePassword(r.Context(), userID, hash); err != nil {
@@ -335,17 +358,6 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		log.Printf("admin: errore reset password: %v", err)
 		redirectFlash(w, r, "/admin", "reset_failed")
 		return
-	}
-
-	// Un JWT emesso prima del reset non deve restare valido fino alla sua
-	// scadenza naturale. La revoca è persistita su DB (sopravvive al
-	// riavvio): se il salvataggio fallisce lo si segnala all'amministratore.
-	if h.Tokens != nil {
-		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
-			log.Printf("admin: revoca token dopo reset password non persistita (utente %s): %v", userID, err)
-			redirectFlash(w, r, "/admin", "password_updated_revoke_err")
-			return
-		}
 	}
 
 	redirectFlash(w, r, "/admin", "password_updated")
@@ -382,19 +394,22 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Revoca PRIMA della DELETE: se non viene persistita, l'utente resta e
+	// l'amministratore può ritentare. Dopo la DELETE non ci sarebbe più una
+	// riga utente a cui riferirsi e un fallimento lascerebbe token validi
+	// senza un percorso di recupero.
+	if h.Tokens != nil {
+		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
+			log.Printf("admin: revoca token prima dell'eliminazione non riuscita (utente %s): %v", userID, err)
+			redirectFlash(w, r, "/admin", "delete_revoke_failed")
+			return
+		}
+	}
+
 	if err := h.Users.Delete(r.Context(), userID); err != nil {
 		log.Printf("admin: errore eliminazione utente %s: %v", userID, err)
 		redirectFlash(w, r, "/admin", "delete_failed")
 		return
-	}
-
-	// Un JWT già emesso per l'utente cancellato non deve restare accettato.
-	if h.Tokens != nil {
-		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
-			log.Printf("admin: revoca token dopo eliminazione non persistita (utente %s): %v", userID, err)
-			redirectFlash(w, r, "/admin", "user_deleted_revoke_err")
-			return
-		}
 	}
 
 	redirectFlash(w, r, "/admin", "user_deleted")

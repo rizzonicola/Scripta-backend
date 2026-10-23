@@ -45,14 +45,24 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 		u.ID, u.Username, u.PasswordHash, u.CreatedAt,
 	)
 	if err != nil {
+		// Il pre-check sopra non è atomico: due richieste concorrenti possono
+		// superarlo entrambe e una sola INSERT vince l'indice univoco. In quel
+		// caso restituiamo lo stesso ErrUsernameTaken del percorso normale,
+		// invece dell'errore grezzo del driver (che la dashboard mostrerebbe
+		// come "creazione fallita" senza spiegare il motivo).
+		if existing, getErr := r.GetByUsername(ctx, username); getErr == nil && existing != nil {
+			return nil, ErrUsernameTaken
+		}
 		return nil, err
 	}
 	return u, nil
 }
 
-// List restituisce tutti gli utenti (senza esporre l'hash della password nella UI, se non necessario).
+// List restituisce tutti gli utenti per la dashboard admin. Non legge
+// password_hash: l'hash serve solo al login (GetByUsername), non alla UI,
+// quindi evitare di caricarlo in memoria riduce l'esposizione accidentale.
 func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, password_hash, created_at FROM users ORDER BY created_at DESC`)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, username, created_at FROM users ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +71,7 @@ func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
 	var users []models.User
 	for rows.Next() {
 		var u models.User
-		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)

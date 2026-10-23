@@ -91,6 +91,16 @@ var filenameReplacer = strings.NewReplacer(
 // dopo la pulizia, risultasse vuoto.
 func sanitizeFilename(title string) string {
 	title = strings.TrimSpace(title)
+	// I caratteri di controllo (CR/LF inclusi) non possono finire in un
+	// header HTTP: senza questa rimozione un titolo come "x\r\nSet-Cookie:"
+	// verrebbe interpolato in Content-Disposition e potrebbe iniettare
+	// header aggiuntivi (response splitting) se il server non li rifiuta.
+	title = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, title)
 	title = filenameReplacer.Replace(title)
 	if title == "" {
 		title = "nota"

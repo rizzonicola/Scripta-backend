@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 )
 
@@ -44,13 +45,22 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // del body.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
 		} else {
 			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
 		}
+		return false
+	}
+	// Un solo valore JSON per richiesta: senza questo controllo un body come
+	// {"username":"a"}{"password":"b"} verrebbe accettato leggendo solo il
+	// primo oggetto, lasciando al client l'illusione di aver inviato altro.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
 		return false
 	}
 	return true

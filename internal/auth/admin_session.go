@@ -58,7 +58,9 @@ func (m *AdminSessionManager) GenerateSession() (token string, expiresAt time.Ti
 func (m *AdminSessionManager) Validate(token string) error {
 	claims := &adminSessionClaims{}
 	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+		// Solo HS256, lo stesso usato da GenerateSession: accettare qualunque
+		// HMAC (HS384/HS512) amplierebbe inutilmente la superficie d'attacco.
+		if t.Method != jwt.SigningMethodHS256 {
 			return nil, errors.New("metodo di firma inatteso")
 		}
 		return m.secret, nil

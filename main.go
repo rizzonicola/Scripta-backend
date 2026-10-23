@@ -140,17 +140,17 @@ func loadConfig() (config, error) {
 	}
 
 	var problems []string
-	if c.JWTSecret == "" {
+	if c.JWTSecret == "" || strings.TrimSpace(c.JWTSecret) == "" {
 		problems = append(problems, "JWT_SECRET non impostato")
-	} else if looksInsecure(c.JWTSecret) || len(c.JWTSecret) < minJWTSecretLen {
+	} else if looksInsecure(c.JWTSecret) || len(strings.TrimSpace(c.JWTSecret)) < minJWTSecretLen {
 		problems = append(problems, fmt.Sprintf("JWT_SECRET troppo corto (<%d caratteri) o di esempio", minJWTSecretLen))
 	}
 	if c.AdminUser == "" {
 		problems = append(problems, "ADMIN_USER non impostato")
 	}
-	if c.AdminPass == "" {
+	if c.AdminPass == "" || strings.TrimSpace(c.AdminPass) == "" {
 		problems = append(problems, "ADMIN_PASS non impostato")
-	} else if looksInsecure(c.AdminPass) || len(c.AdminPass) < minAdminPassLen {
+	} else if looksInsecure(c.AdminPass) || len(strings.TrimSpace(c.AdminPass)) < minAdminPassLen {
 		problems = append(problems, fmt.Sprintf("ADMIN_PASS troppo corta (<%d caratteri) o di esempio", minAdminPassLen))
 	}
 	if len(problems) > 0 {
@@ -295,7 +295,11 @@ func main() {
 	}
 
 	isLocalDB := cfg.TursoURL == ""
-	startTombstonePurgeLoop(rootCtx, tokenManager, db.NewNotesRepo(sqlDB), db.NewFoldersRepo(sqlDB), sqlDB, isLocalDB)
+	stopMaintenance := startTombstonePurgeLoop(rootCtx, tokenManager, db.NewNotesRepo(sqlDB), db.NewFoldersRepo(sqlDB), sqlDB, isLocalDB)
+	// Ferma e attende la manutenzione PRIMA del defer sqlDB.Close() (i defer
+	// sono LIFO): senza questa attesa il checkpoint/purge potrebbe usare il
+	// pool mentre viene chiuso.
+	defer stopMaintenance()
 
 	// Timeout espliciti: senza di essi un client lento (slowloris) può
 	// tenere aperte connessioni all'infinito. ReadTimeout/WriteTimeout sono
@@ -373,33 +377,36 @@ func tombstonePurgeCutoff(now time.Time) int64 {
 //   - ogni walCheckpointInterval: solo wal_checkpoint(TRUNCATE), per non
 //     lasciare che il WAL cresca troppo tra un ciclo di purge e l'altro.
 //
-// Si ferma quando ctx viene annullato (graceful shutdown). Non blocca mai
-// l'avvio del server: eventuali errori vengono solo loggati, il giro
-// successivo riprova.
-func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, sqlDB *sql.DB, isLocalDB bool) {
+// Si ferma quando ctx viene annullato (graceful shutdown). Restituisce una
+// funzione che annulla il ciclo e ne attende la fine: va chiamata prima di
+// chiudere il pool SQL, altrimenti un checkpoint in corso può usare una
+// connessione già chiusa. Non blocca mai l'avvio del server: eventuali errori
+// vengono solo loggati, il giro successivo riprova.
+func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, sqlDB *sql.DB, isLocalDB bool) func() {
+	ctx, cancel := context.WithCancel(ctx)
 	purgeAndReclaim := func() {
 		cutoff := tombstonePurgeCutoff(time.Now())
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		purgeCtx, purgeCancel := context.WithTimeout(ctx, 30*time.Second)
 
 		var nDeleted, fDeleted int64
 		var err error
 
-		nDeleted, err = notesRepo.PurgeExpiredTombstones(ctx, cutoff)
+		nDeleted, err = notesRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
 		if err != nil {
 			log.Printf("purge tombstone note fallito: %v", err)
 		} else if nDeleted > 0 {
 			log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s (+ margine)", nDeleted, handlers.TombstoneRetention)
 		}
 
-		fDeleted, err = foldersRepo.PurgeExpiredTombstones(ctx, cutoff)
+		fDeleted, err = foldersRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
 		if err != nil {
 			log.Printf("purge tombstone cartelle fallito: %v", err)
 		} else if fDeleted > 0 {
 			log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s (+ margine)", fDeleted, handlers.TombstoneRetention)
 		}
-		cancel()
+		purgeCancel()
 
-		maintCtx, maintCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		maintCtx, maintCancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer maintCancel()
 		if err := db.RunMaintenance(maintCtx, sqlDB, isLocalDB, nDeleted+fDeleted > 0); err != nil {
 			log.Printf("manutenzione DB (incremental_vacuum/wal_checkpoint) fallita, verrà ritentata al prossimo giro: %v", err)
@@ -407,14 +414,16 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 	}
 
 	checkpointOnly := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := db.RunMaintenance(ctx, sqlDB, isLocalDB, false); err != nil {
+		checkpointCtx, checkpointCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer checkpointCancel()
+		if err := db.RunMaintenance(checkpointCtx, sqlDB, isLocalDB, false); err != nil {
 			log.Printf("wal_checkpoint periodico fallito, verrà ritentato al prossimo giro: %v", err)
 		}
 	}
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		purgeAndReclaim()
 		tm.PurgeExpired(ctx)
 
@@ -435,4 +444,9 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 			}
 		}
 	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
 }

@@ -792,7 +792,7 @@ func applyFolder(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.Not
 		DeletedAt: deletedAt,
 	}
 	if err := foldersTx.UpsertLWW(ctx, folder); err != nil {
-		if isOwnershipViolation(err) {
+		if isOwnershipViolation(err) || db.IsFolderCycleViolation(err) {
 			return folderParentMissing, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"}, nil
 		}
 		log.Printf("sync: errore upsert cartella %s: %v", fc.ID, err)
