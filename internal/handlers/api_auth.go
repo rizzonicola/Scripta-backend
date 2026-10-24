@@ -58,10 +58,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
-	// Username: trim + minuscolo (lookup case-insensitive). Un username
-	// vuoto o più lungo del massimo non può esistere: stessa risposta e
-	// stessa latenza di "credenziali errate", senza toccare il DB.
-	username := auth.CanonicalUsername(req.Username)
+	// Username: solo trim, il case è significativo. Un username vuoto o più
+	// lungo del massimo non può esistere: stessa risposta e stessa latenza di
+	// "credenziali errate", senza toccare il DB.
+	username := auth.LoginUsername(req.Username)
 	if username == "" || req.Password == "" {
 		writeJSONError(w, http.StatusBadRequest, "username e password sono obbligatori")
 		return

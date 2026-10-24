@@ -248,8 +248,9 @@ func passwordFlashCode(err error) string {
 
 // CreateUser gestisce POST /admin/users/create. L'username viene validato e
 // salvato con il case originale (trim, limiti di lunghezza e soli caratteri
-// ASCII ammessi); unicità e login restano case-insensitive. La password in
-// chiaro viene cifrata subito con bcrypt e mai più mostrata né salvata.
+// ASCII ammessi); unicità e login sono case-sensitive, quindi "Mario" e
+// "mario" sono due account distinti. La password in chiaro viene cifrata
+// subito con bcrypt e mai più mostrata né salvata.
 func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"html"
 	"io"
 	"net/http"
@@ -139,10 +140,17 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-func TestLoginIsCaseInsensitive(t *testing.T) {
+func TestLoginRequiresExactUsernameCase(t *testing.T) {
 	e := newEnv(t)
-	if e.login("  MaRiO ") == "" {
+
+	if e.login("  mario ") == "" {
 		t.Fatal("token vuoto")
+	}
+
+	code, body, _ := e.do("POST", "/api/v1/auth/login", "",
+		map[string]string{"username": "Mario", "password": "password-di-prova"}, nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("login con case errato: %d %s, atteso 401", code, body)
 	}
 }
 
@@ -166,7 +174,7 @@ func TestLoginReturnsStoredUsernameCase(t *testing.T) {
 	}
 
 	code, body, _ := e.do("POST", "/api/v1/auth/login", "",
-		map[string]string{"username": "luigi", "password": "password-di-prova"}, nil)
+		map[string]string{"username": "Luigi", "password": "password-di-prova"}, nil)
 	if code != 200 {
 		t.Fatalf("login: %d %s", code, body)
 	}
@@ -178,6 +186,63 @@ func TestLoginReturnsStoredUsernameCase(t *testing.T) {
 	}
 	if r.Username != "Luigi" {
 		t.Fatalf("username restituito = %q, atteso %q", r.Username, "Luigi")
+	}
+}
+
+func TestCaseVariantAccountsAreDistinct(t *testing.T) {
+	e := newEnv(t)
+	hash, err := auth.HashPassword("password-di-prova")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upper, err := e.users.Create(context.Background(), "Nicola", hash)
+	if err != nil {
+		t.Fatalf("Create(Nicola): %v", err)
+	}
+	lower, err := e.users.Create(context.Background(), "nicola", hash)
+	if err != nil {
+		t.Fatalf("Create(nicola): %v", err)
+	}
+	if upper.ID == lower.ID {
+		t.Fatal("le varianti di case hanno lo stesso user id")
+	}
+
+	login := func(username string) (string, string) {
+		t.Helper()
+		code, body, _ := e.do("POST", "/api/v1/auth/login", "",
+			map[string]string{"username": username, "password": "password-di-prova"}, nil)
+		if code != 200 {
+			t.Fatalf("login %q: %d %s", username, code, body)
+		}
+		var r struct {
+			Token  string `json:"token"`
+			UserID string `json:"user_id"`
+		}
+		if err := json.Unmarshal(body, &r); err != nil {
+			t.Fatal(err)
+		}
+		return r.Token, r.UserID
+	}
+
+	upperToken, upperID := login("Nicola")
+	lowerToken, lowerID := login("nicola")
+	if upperID != upper.ID || lowerID != lower.ID || upperID == lowerID {
+		t.Fatalf("id login: %q/%q, attesi %q/%q", upperID, lowerID, upper.ID, lower.ID)
+	}
+
+	code, _, syncBody := e.sync(upperToken, 0, nil, []map[string]any{
+		note("nota-di-nicola-maiuscola", "Solo Nicola", 1, nil),
+	})
+	if code != 200 {
+		t.Fatalf("sync Nicola: %d %s", code, syncBody)
+	}
+	code, resp, _ := e.sync(lowerToken, 0, nil, nil)
+	if code != 200 {
+		t.Fatalf("sync nicola: %d", code)
+	}
+	if len(resp.Notes) != 0 {
+		t.Fatalf("l'account minuscolo vede %d note dell'altro account", len(resp.Notes))
 	}
 }
 
@@ -394,7 +459,10 @@ func TestUsernameNormalizationAndDuplicates(t *testing.T) {
 		t.Fatal("username troppo lungo accettato")
 	}
 	e := newEnv(t)
-	if _, err := e.users.Create(context.Background(), "MARIO", "hash"); err == nil {
-		t.Fatal("duplicato case-insensitive accettato")
+	if _, err := e.users.Create(context.Background(), "MARIO", "hash"); err != nil {
+		t.Fatalf("variante di case rifiutata: %v", err)
+	}
+	if _, err := e.users.Create(context.Background(), "mario", "hash"); !errors.Is(err, db.ErrUsernameTaken) {
+		t.Fatalf("duplicato esatto = %v, atteso ErrUsernameTaken", err)
 	}
 }

@@ -112,6 +112,11 @@ download delle note (`text/markdown; charset=utf-8`). Timestamp di sincronizzazi
 
 Autentica un utente con username/password e rilascia un JWT.
 
+Lo username è **case-sensitive**: `Mario` e `mario` sono due account distinti.
+Il login applica solo il trim degli spazi ai bordi e richiede il case esatto
+scelto alla creazione; un case diverso restituisce `401` come credenziali non
+valide.
+
 **Request body**
 ```json
 {
@@ -311,7 +316,8 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
 - **`GET /admin`** — elenco utenti registrati (username, ID, data creazione) + form
   di creazione nuovo utente.
 - **`POST /admin/users/create`** — crea un nuovo utente. Lo username deve essere di
-  3-64 caratteri ASCII (lettere, numeri, punto, trattino e underscore). La password
+  3-64 caratteri ASCII (lettere, numeri, punto, trattino e underscore). Il case è
+  significativo: `Mario` e `mario` sono due account distinti. La password
   arriva in chiaro dal form HTML mostrato nel browser dell'amministratore, viene
   **immediatamente cifrata con bcrypt** (`internal/auth/password.go`) e solo l'hash
   viene salvato nel DB. La password in chiaro non viene mai loggata né mostrata in

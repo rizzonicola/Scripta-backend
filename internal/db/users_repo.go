@@ -12,7 +12,7 @@ import (
 )
 
 // ErrUsernameTaken: esiste già un utente con lo stesso username (confronto
-// case-insensitive).
+// case-sensitive: "Mario" e "mario" sono account distinti).
 var ErrUsernameTaken = errors.New("username già in uso")
 
 type UsersRepo struct {
@@ -25,7 +25,7 @@ func NewUsersRepo(db *sql.DB) *UsersRepo {
 
 // Create inserisce un nuovo utente con la password già cifrata (bcrypt hash).
 // L'username va già normalizzato dal chiamante (auth.NormalizeUsername); qui
-// si verifica comunque l'assenza di duplicati ignorando le maiuscole.
+// si verifica comunque l'assenza di duplicati con confronto esatto.
 func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (*models.User, error) {
 	existing, err := r.GetByUsername(ctx, username)
 	if err != nil {
@@ -79,12 +79,13 @@ func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
 	return users, rows.Err()
 }
 
-// GetByUsername recupera un utente per username, ignorando maiuscole/minuscole
-// (usato dal login e dal controllo duplicati).
+// GetByUsername recupera un utente per username con confronto esatto
+// (usato dal login e dal controllo duplicati). "Mario" e "mario" sono due
+// account distinti: il case è parte dell'identità.
 func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models.User, error) {
 	var u models.User
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE username = ? COLLATE NOCASE`, username,
+		`SELECT id, username, password_hash, created_at FROM users WHERE username = ? COLLATE BINARY`, username,
 	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil

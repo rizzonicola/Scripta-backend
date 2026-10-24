@@ -39,10 +39,17 @@ func TestNormalizeUsernameRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestCanonicalUsernameIsCaseInsensitive(t *testing.T) {
-	for _, raw := range []string{"  MARIO  ", "mario", "Mario"} {
-		if got := CanonicalUsername(raw); got != "mario" {
-			t.Fatalf("CanonicalUsername(%q) = %q, atteso %q", raw, got, "mario")
+func TestLoginUsernamePreservesCase(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{"  MARIO  ", "MARIO"},
+		{"mario", "mario"},
+		{"Mario", "Mario"},
+	} {
+		if got := LoginUsername(tc.raw); got != tc.want {
+			t.Fatalf("LoginUsername(%q) = %q, atteso %q", tc.raw, got, tc.want)
 		}
 	}
 }

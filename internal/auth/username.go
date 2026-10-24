@@ -20,9 +20,8 @@ var ErrInvalidUsername = errors.New("username non valido: 3-64 caratteri tra let
 // NormalizeUsername valida l'username e ne conserva il case originale: trim
 // degli spazi ai bordi, lunghezza tra MinUsernameLen e MaxUsernameLen
 // caratteri e solo lettere ASCII, numeri, punto, trattino e underscore.
-// L'unicità e la lookup restano case-insensitive, così "Mario", " mario " e
-// "MARIO" sono lo stesso utente ma il nome mostrato mantiene le maiuscole
-// scelte alla creazione.
+// L'unicità e la lookup sono case-sensitive: "Mario" e "mario" sono due
+// utenti distinti, con il case scelto alla creazione conservato e mostrato.
 func NormalizeUsername(raw string) (string, error) {
 	u := strings.TrimSpace(raw)
 	n := utf8.RuneCountInString(u)
@@ -32,10 +31,10 @@ func NormalizeUsername(raw string) (string, error) {
 	return u, nil
 }
 
-// CanonicalUsername è la versione "tollerante" usata dal LOGIN: applica solo
-// trim + minuscolo, senza rifiutare nulla, così gli utenti creati prima
-// dell'introduzione delle regole di normalizzazione continuano a poter
-// accedere (la lookup nel DB è comunque case-insensitive).
-func CanonicalUsername(raw string) string {
-	return strings.ToLower(strings.TrimSpace(raw))
+// LoginUsername prepara lo username ricevuto dal LOGIN: applica solo il trim
+// degli spazi ai bordi, senza cambiare il case e senza rifiutare nulla. Il
+// case è significativo, quindi "Mario" e "mario" sono account diversi; il
+// trim resta tollerante per gli utenti creati prima delle regole attuali.
+func LoginUsername(raw string) string {
+	return strings.TrimSpace(raw)
 }

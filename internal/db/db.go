@@ -475,6 +475,14 @@ func migrate(conn *sql.DB) error {
 		}
 	}
 
+	// Le versioni precedenti imponevano l'unicità case-insensitive degli
+	// username con un indice dedicato. Ora "Mario" e "mario" sono account
+	// distinti: l'indice va rimosso. L'UNIQUE dichiarato sulla colonna
+	// username resta e impone già l'unicità esatta (collation BINARY).
+	if _, err := conn.Exec(`DROP INDEX IF EXISTS idx_users_username_nocase`); err != nil {
+		return fmt.Errorf("rimozione indice username case-insensitive: %w", err)
+	}
+
 	// CREATE TABLE IF NOT EXISTS sopra non altera una tabella "notes" già
 	// esistente nel nuovo schema ID-based ma creata PRIMA dell'introduzione
 	// di is_favorite/is_pinned/order_index: su un'installazione del genere
@@ -490,9 +498,6 @@ func migrate(conn *sql.DB) error {
 	if err := addSyncedAtColumns(conn); err != nil {
 		return fmt.Errorf("migrazione colonne synced_at: %w", err)
 	}
-
-	// Unicità username case-insensitive (best effort, vedi funzione).
-	ensureUsernameUniqueNoCase(conn)
 
 	// Vincola a livello di schema che folders.parent_id e notes.folder_id
 	// possano riferire SOLO una cartella dello stesso user_id (mai di un
@@ -915,18 +920,6 @@ func tableColumns(conn *sql.DB, table string) (map[string]bool, error) {
 		cols[name] = true
 	}
 	return cols, rows.Err()
-}
-
-// ensureUsernameUniqueNoCase impone l'unicità degli username ignorando
-// maiuscole/minuscole ("Mario" e "mario" sono lo stesso utente). Best
-// effort: se nel DB esistono già username che collidono case-insensitive
-// l'indice non può essere creato; il server NON si blocca (i login
-// continuano a funzionare, la creazione applicativa controlla comunque i
-// duplicati) ma viene loggato un avviso per la correzione manuale.
-func ensureUsernameUniqueNoCase(conn *sql.DB) {
-	if _, err := conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)`); err != nil {
-		log.Printf("ATTENZIONE: impossibile creare l'indice univoco case-insensitive sugli username (%v). Esistono probabilmente utenti con username uguali a meno delle maiuscole: risolverli manualmente.", err)
-	}
 }
 
 // quarantineLegacyNotesTable rileva lo schema "notes" della generazione
