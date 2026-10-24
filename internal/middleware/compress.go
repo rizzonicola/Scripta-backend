@@ -44,6 +44,13 @@ func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 	return g.gz.Write(b)
 }
 
+// Unwrap permette a http.ResponseController (e alle API che lo usano, come
+// Flush) di raggiungere il writer HTTP sottostante invece di fermarsi al
+// wrapper gzip.
+func (g *gzipResponseWriter) Unwrap() http.ResponseWriter {
+	return g.ResponseWriter
+}
+
 // Flush inoltra il flush sia al gzip.Writer (svuota i byte già compressi nel
 // buffer) sia, se supportato, al ResponseWriter sottostante. Non
 // strettamente necessario per gli handler attuali (nessuno di essi fa
@@ -110,7 +117,10 @@ func acceptsGzip(values []string) bool {
 // invariata in quel caso.
 func Gzip(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !acceptsGzip(r.Header.Values("Accept-Encoding")) {
+		// HEAD non ha un body: comprimerlo aggiungerebbe solo header e un
+		// flusso gzip vuoto che il server scarterebbe comunque.
+		if r.Method == http.MethodHead ||
+			!acceptsGzip(r.Header.Values("Accept-Encoding")) {
 			next.ServeHTTP(w, r)
 			return
 		}

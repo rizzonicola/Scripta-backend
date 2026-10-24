@@ -66,6 +66,49 @@ func TestGzipCompressesWhenAccepted(t *testing.T) {
 	}
 }
 
+func TestGzipSkipsHead(t *testing.T) {
+	handler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "5")
+	}))
+	req := httptest.NewRequest(http.MethodHead, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("HEAD: Content-Encoding = %q, want empty", got)
+	}
+	if got := rec.Header().Get("Content-Length"); got != "5" {
+		t.Fatalf("HEAD: Content-Length = %q, want 5", got)
+	}
+}
+
+func TestGzipResponseControllerFlush(t *testing.T) {
+	handler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello")
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			t.Errorf("ResponseController.Flush: %v", err)
+		}
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	zr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer zr.Close()
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("body = %q, want hello", body)
+	}
+}
+
 func TestGzipSkipsWhenQZeroOrNotAccepted(t *testing.T) {
 	for _, header := range []string{"gzip;q=0", "xgzip", "br", ""} {
 		handler := Gzip(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
