@@ -387,10 +387,12 @@ func newLocalConnector(dsn string) (driver.Connector, error) {
 // questo lo schema è diviso in statement singoli, eseguiti in sequenza.
 var migrationStatements = []string{
 	`CREATE TABLE IF NOT EXISTS users (
-		id            TEXT PRIMARY KEY,
-		username      TEXT NOT NULL UNIQUE,
-		password_hash TEXT NOT NULL,
-		created_at    INTEGER NOT NULL
+		id                TEXT PRIMARY KEY,
+		username          TEXT NOT NULL UNIQUE,
+		password_hash     TEXT NOT NULL,
+		created_at        INTEGER NOT NULL,
+		blocked_at        INTEGER,
+		rate_limit_exempt INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE TABLE IF NOT EXISTS folders (
 		id         TEXT PRIMARY KEY,
@@ -449,6 +451,15 @@ var migrationStatements = []string{
 		expires_at INTEGER NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_revoked_tokens_exp ON revoked_tokens(expires_at)`,
+	// Impostazioni globali del server gestite dalla dashboard admin. Riga
+	// unica (id = 1): oggi contiene solo l'interruttore del rate limit
+	// per-utente della sync, che parte ATTIVO anche sulle installazioni
+	// esistenti (INSERT OR IGNORE sotto).
+	`CREATE TABLE IF NOT EXISTS server_settings (
+		id                     INTEGER PRIMARY KEY CHECK (id = 1),
+		user_rate_limit_enabled INTEGER NOT NULL DEFAULT 1,
+		updated_at             INTEGER NOT NULL
+	)`,
 	// Stato del protocollo di sync che deve sopravvivere al riavvio (oggi solo
 	// l'high-water mark degli stamp, vedi SyncStateRepo). Tabella NUOVA e
 	// additiva: un binario precedente la ignora.
@@ -473,6 +484,21 @@ func migrate(conn *sql.DB) error {
 		if _, err := conn.Exec(stmt); err != nil {
 			return fmt.Errorf("statement %q: %w", stmt, err)
 		}
+	}
+
+	// La riga singleton delle impostazioni server deve esistere anche sui
+	// database creati prima dell'introduzione della tabella. INSERT OR IGNORE
+	// non è una DDL: resta fuori da migrationStatements, che il test di
+	// compatibilità vincola alle sole CREATE ... IF NOT EXISTS.
+	if _, err := conn.Exec(`INSERT OR IGNORE INTO server_settings (id, user_rate_limit_enabled, updated_at) VALUES (1, 1, 0)`); err != nil {
+		return fmt.Errorf("default server_settings: %w", err)
+	}
+
+	// Colonne di sicurezza per-utente aggiunte dopo la prima release:
+	// blocked_at (blocco account) e rate_limit_exempt (esenzione dal limite
+	// per-utente della sync). Sono additive e idempotenti.
+	if err := addUserSecurityColumns(conn); err != nil {
+		return fmt.Errorf("migrazione colonne sicurezza utente: %w", err)
 	}
 
 	// Le versioni precedenti imponevano l'unicità case-insensitive degli
@@ -812,6 +838,33 @@ func dropRedundantIndexes(conn *sql.DB) error {
 		if _, err := conn.Exec(`DROP INDEX IF EXISTS ` + index); err != nil {
 			return fmt.Errorf("drop index %s: %w", index, err)
 		}
+	}
+	return nil
+}
+
+// addUserSecurityColumns aggiunge blocked_at e rate_limit_exempt alla tabella
+// users se non sono già presenti. Idempotente come le altre migrazioni
+// additive: PRAGMA table_info prima di ogni ALTER TABLE.
+func addUserSecurityColumns(conn *sql.DB) error {
+	cols, err := tableColumns(conn, "users")
+	if err != nil {
+		return err
+	}
+	wanted := []struct {
+		column string
+		ddl    string
+	}{
+		{"blocked_at", `ALTER TABLE users ADD COLUMN blocked_at INTEGER`},
+		{"rate_limit_exempt", `ALTER TABLE users ADD COLUMN rate_limit_exempt INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, w := range wanted {
+		if cols[w.column] {
+			continue
+		}
+		if _, err := conn.Exec(w.ddl); err != nil {
+			return fmt.Errorf("alter table users.%s: %w", w.column, err)
+		}
+		log.Printf("migrazione: aggiunta colonna users.%s mancante", w.column)
 	}
 	return nil
 }

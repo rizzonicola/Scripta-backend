@@ -76,12 +76,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// lo impedisce, ma il login non passa da NormalizeUsername.
 	if strings.IndexByte(username, 0) >= 0 {
 		sleepUntilMinResponseTime(start)
-		writeJSONError(w, http.StatusUnauthorized, "credenziali non valide")
+		writeJSONErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
 		return
 	}
 	if utf8.RuneCountInString(username) > auth.MaxUsernameLen || len(req.Password) > auth.MaxPasswordBytes {
 		sleepUntilMinResponseTime(start)
-		writeJSONError(w, http.StatusUnauthorized, "credenziali non valide")
+		writeJSONErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
 		return
 	}
 
@@ -93,7 +93,16 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	if user == nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
 		sleepUntilMinResponseTime(start)
-		writeJSONError(w, http.StatusUnauthorized, "credenziali non valide")
+		writeJSONErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
+		return
+	}
+
+	// Il blocco viene rivelato SOLO dopo password corretta: un tentativo con
+	// password sbagliata resta indistinguibile da un account inesistente e
+	// non permette di scoprire quali username sono bloccati.
+	if user.BlockedAt != nil {
+		writeJSONErrorCode(w, http.StatusForbidden,
+			"account bloccato dall'amministratore", "account_blocked")
 		return
 	}
 

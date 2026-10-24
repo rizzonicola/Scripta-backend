@@ -206,10 +206,11 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	usersRepo := db.NewUsersRepo(sqlDB)
 	notesRepo := db.NewNotesRepo(sqlDB)
 	settingsRepo := db.NewSettingsRepo(sqlDB)
+	serverSettingsRepo := db.NewServerSettingsRepo(sqlDB)
 
 	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminSessionTTL)
 
-	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, adminSessions, cfg.AdminUser, cfg.AdminPass, templatesFS)
+	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, adminSessions, serverSettingsRepo, cfg.AdminUser, cfg.AdminPass, templatesFS)
 	if err != nil {
 		return nil, fmt.Errorf("caricamento template admin: %w", err)
 	}
@@ -218,6 +219,11 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	if cfg.SyncMaxBody > 0 {
 		syncHandler.MaxBodyBytes = cfg.SyncMaxBody
 	}
+	// Burst relativamente alto (60) per non penalizzare un primo sync o un
+	// resume con molte richieste ravvicinate; il refill continuo (2 req/s)
+	// riporta rapidamente il client sotto il limite. Il toggle globale e le
+	// esenzioni per-utente sono valutati nel handler.
+	syncHandler.UserLimiter = middleware.NewUserRateLimiter(2, 60)
 	notesHandler := handlers.NewNotesHandler(notesRepo)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo)
 
@@ -245,12 +251,15 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	mux.Handle("/admin/users/create", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.CreateUser))))
 	mux.Handle("/admin/users/reset-password", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.ResetPassword))))
 	mux.Handle("/admin/users/delete", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.DeleteUser))))
+	mux.Handle("/admin/settings/rate-limit", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.UpdateRateLimitSetting))))
+	mux.Handle("/admin/users/rate-limit", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.UpdateUserRateLimit))))
+	mux.Handle("/admin/users/block", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.SetUserBlocked))))
 
 	// --- API pubbliche ---
 	mux.Handle("/api/v1/auth/login", apiLoginRateLimit(http.HandlerFunc(authHandler.Login)))
 
 	// --- API protette da JWT ---
-	requireJWT := middleware.RequireJWT(tm)
+	requireJWT := middleware.RequireJWT(tm, usersRepo)
 	mux.Handle("/api/v1/auth/logout", requireJWT(http.HandlerFunc(authHandler.Logout)))
 	mux.Handle("/api/v1/sync", requireJWT(http.HandlerFunc(syncHandler.Sync)))
 	mux.Handle("/api/v1/notes/download", requireJWT(http.HandlerFunc(notesHandler.DownloadMarkdown)))

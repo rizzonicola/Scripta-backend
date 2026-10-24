@@ -7,14 +7,16 @@ import (
 	"strings"
 
 	"notes-server/internal/auth"
+	"notes-server/internal/db"
 )
 
 type ctxKey string
 
 const (
-	CtxUserID   ctxKey = "user_id"
-	CtxUsername ctxKey = "username"
-	CtxClaims   ctxKey = "claims"
+	CtxUserID        ctxKey = "user_id"
+	CtxUsername      ctxKey = "username"
+	CtxClaims        ctxKey = "claims"
+	CtxAccountStatus ctxKey = "account_status"
 )
 
 // writeJSONError scrive una risposta di errore JSON coerente con quella usata
@@ -22,50 +24,88 @@ const (
 // di importare "notes-server/internal/handlers" per evitare un import ciclico
 // (handlers già importa middleware per UserIDFromContext).
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeJSONErrorCode(w, status, msg, "")
+}
+
+// writeJSONErrorCode aggiunge un codice stabile che i client possono usare
+// per distinguere casi diversi con lo stesso status HTTP (es. account
+// bloccato vs token scaduto, oppure rate limit vs errore transitorio).
+func writeJSONErrorCode(w http.ResponseWriter, status int, msg, code string) {
 	// charset esplicito: stessa motivazione di handlers.jsonContentType.
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(struct {
+	body := struct {
 		Error string `json:"error"`
-	}{Error: msg})
+		Code  string `json:"code,omitempty"`
+	}{Error: msg, Code: code}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // RequireJWT protegge gli endpoint API verificando l'header Authorization: Bearer <token>.
 // Non avvia goroutine né mantiene stato tra le richieste: ParseToken è
 // sincrono e a costo costante, quindi non c'è rischio di leak o di goroutine
 // bloccate sotto carico concorrente.
-func RequireJWT(tm *auth.TokenManager) func(http.Handler) http.Handler {
+func RequireJWT(tm *auth.TokenManager, users *db.UsersRepo) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			header := r.Header.Get("Authorization")
 			if header == "" || !strings.HasPrefix(header, "Bearer ") {
-				writeJSONError(w, http.StatusUnauthorized, "token mancante")
+				writeJSONErrorCode(w, http.StatusUnauthorized, "token mancante", "missing_token")
 				return
 			}
 			tokenStr := strings.TrimPrefix(header, "Bearer ")
 
 			claims, err := tm.ParseToken(tokenStr)
 			if err != nil {
-				writeJSONError(w, http.StatusUnauthorized, "token non valido o scaduto")
+				writeJSONErrorCode(w, http.StatusUnauthorized, "token non valido o scaduto", "invalid_token")
+				return
+			}
+
+			// Blocco account: il controllo è a DB (PK lookup) perché deve
+			// avere effetto immediato anche sui token già emessi. Un account
+			// eliminato non deve più poter usare un JWT ancora non scaduto.
+			// Va PRIMA della revoca: così un client bloccato riceve il 403
+			// "account_blocked" (e mostra il messaggio giusto) anche se
+			// l'admin ha revocato i suoi token; dopo lo sblocco quegli stessi
+			// token restano revocati e il client ottiene 401.
+			status, found, err := users.GetAccountStatus(r.Context(), claims.UserID)
+			if err != nil {
+				writeJSONErrorCode(w, http.StatusInternalServerError, "errore interno", "internal_error")
+				return
+			}
+			if !found {
+				writeJSONErrorCode(w, http.StatusUnauthorized, "account non valido", "invalid_account")
+				return
+			}
+			if status.Blocked {
+				writeJSONErrorCode(w, http.StatusForbidden,
+					"account bloccato dall'amministratore", "account_blocked")
 				return
 			}
 
 			// Revoca (logout / reset password / cancellazione utente):
-			// lookup O(1) in RAM, NESSUNA query a DB su questo percorso
-			// caldo. La cache è popolata all'avvio dalla tabella persistente
-			// delle revoche (vedi TokenManager.AttachStore), quindi la
-			// revoca resta valida anche dopo un riavvio del server.
+			// lookup O(1) in RAM, senza query aggiuntiva. La cache è popolata
+			// all'avvio dalla tabella persistente delle revoche (vedi
+			// TokenManager.AttachStore), quindi la revoca resta valida anche
+			// dopo un riavvio del server.
 			if tm.IsRevoked(claims) {
-				writeJSONError(w, http.StatusUnauthorized, "token revocato")
+				writeJSONErrorCode(w, http.StatusUnauthorized, "token revocato", "revoked_token")
 				return
 			}
 
 			ctx := context.WithValue(r.Context(), CtxUserID, claims.UserID)
 			ctx = context.WithValue(ctx, CtxUsername, claims.Username)
 			ctx = context.WithValue(ctx, CtxClaims, claims)
+			ctx = context.WithValue(ctx, CtxAccountStatus, status)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// AccountStatusFromContext restituisce lo stato account caricato da RequireJWT.
+func AccountStatusFromContext(ctx context.Context) (db.AccountStatus, bool) {
+	s, ok := ctx.Value(CtxAccountStatus).(db.AccountStatus)
+	return s, ok
 }
 
 // ClaimsFromContext restituisce le claims del token già validato da RequireJWT.

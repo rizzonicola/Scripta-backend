@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,12 +22,13 @@ import (
 const testSecret = "test-secret-test-secret-test-secret-0123456789"
 
 type testEnv struct {
-	t     *testing.T
-	srv   *httptest.Server
-	users *db.UsersRepo
-	tm    *auth.TokenManager
-	repo  *db.RevocationRepo
-	path  string
+	t        *testing.T
+	srv      *httptest.Server
+	users    *db.UsersRepo
+	tm       *auth.TokenManager
+	repo     *db.RevocationRepo
+	path     string
+	settings *db.ServerSettingsRepo
 }
 
 func newEnv(t *testing.T, trustedProxies ...string) *testEnv {
@@ -55,11 +57,12 @@ func newEnv(t *testing.T, trustedProxies ...string) *testEnv {
 	t.Cleanup(srv.Close)
 
 	users := db.NewUsersRepo(sqlDB)
+	settings := db.NewServerSettingsRepo(sqlDB)
 	hash, _ := auth.HashPassword("password-di-prova")
 	if _, err := users.Create(context.Background(), "mario", hash); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	return &testEnv{t: t, srv: srv, users: users, tm: tm, repo: repo, path: path}
+	return &testEnv{t: t, srv: srv, users: users, tm: tm, repo: repo, path: path, settings: settings}
 }
 
 func (e *testEnv) do(method, path, token string, body any, hdr map[string]string) (int, []byte, http.Header) {
@@ -473,5 +476,162 @@ func TestUsernameNormalizationAndDuplicates(t *testing.T) {
 	}
 	if _, err := e.users.Create(context.Background(), "mario", "hash"); !errors.Is(err, db.ErrUsernameTaken) {
 		t.Fatalf("duplicato esatto = %v, atteso ErrUsernameTaken", err)
+	}
+}
+
+func TestBlockedAccountGetsDistinctLoginAndSyncErrors(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	user, err := e.users.GetByUsername(ctx, "mario")
+	if err != nil || user == nil {
+		t.Fatalf("utente: %+v, %v", user, err)
+	}
+	tok := e.login("mario")
+
+	if err := e.users.SetBlocked(ctx, user.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	code, body, _ := e.do("POST", "/api/v1/auth/login", "",
+		map[string]string{"username": "mario", "password": "password-di-prova"}, nil)
+	if code != http.StatusForbidden || !strings.Contains(string(body), `"code":"account_blocked"`) {
+		t.Fatalf("login bloccato: %d %s", code, body)
+	}
+
+	// Il blocco vince sulla revoca: il client deve ricevere il messaggio
+	// specifico, non un generico 401.
+	if err := e.tm.RevokeUser(ctx, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	code, body, _ = e.do("POST", "/api/v1/sync", tok,
+		map[string]any{"last_synced_at": 0, "folders": []any{}, "notes": []any{}}, nil)
+	if code != http.StatusForbidden || !strings.Contains(string(body), `"code":"account_blocked"`) {
+		t.Fatalf("sync bloccato: %d %s", code, body)
+	}
+
+	if err := e.users.SetBlocked(ctx, user.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	code, body, _ = e.do("POST", "/api/v1/sync", tok,
+		map[string]any{"last_synced_at": 0, "folders": []any{}, "notes": []any{}}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"revoked_token"`) {
+		t.Fatalf("token dopo sblocco: %d %s", code, body)
+	}
+}
+
+func (e *testEnv) adminCookie() *http.Cookie {
+	e.t.Helper()
+	form := url.Values{"username": {"root"}, "password": {"a-very-long-admin-pass"}}
+	req, _ := http.NewRequest("POST", e.srv.URL+"/admin/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		e.t.Fatalf("admin login: %d", resp.StatusCode)
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == "admin_session" {
+			return c
+		}
+	}
+	e.t.Fatal("cookie admin_session mancante")
+	return nil
+}
+
+func (e *testEnv) doAdmin(method, path string, cookie *http.Cookie, form url.Values) (int, []byte) {
+	e.t.Helper()
+	var body *strings.Reader
+	if form != nil {
+		body = strings.NewReader(form.Encode())
+	} else {
+		body = strings.NewReader("")
+	}
+	req, _ := http.NewRequest(method, e.srv.URL+path, body)
+	if form != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.AddCookie(cookie)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, out
+}
+
+func TestAdminUserSearchRateLimitAndBlocking(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	cookie := e.adminCookie()
+
+	if code, body := e.doAdmin("GET", "/admin?q=mario", cookie, nil); code != http.StatusOK || !strings.Contains(string(body), "mario") {
+		t.Fatalf("ricerca admin: %d %s", code, body)
+	}
+
+	if code, _ := e.doAdmin("POST", "/admin/settings/rate-limit", cookie, url.Values{}); code != http.StatusSeeOther {
+		t.Fatalf("toggle globale: %d", code)
+	}
+	settings, err := e.settings.Get(ctx)
+	if err != nil || settings.UserRateLimitEnabled {
+		t.Fatalf("impostazioni dopo toggle: %+v, %v", settings, err)
+	}
+
+	mario, _ := e.users.GetByUsername(ctx, "mario")
+	code, _ := e.doAdmin("POST", "/admin/users/rate-limit", cookie, url.Values{"user_id": {mario.ID}, "exempt": {"1"}})
+	if code != http.StatusSeeOther {
+		t.Fatalf("toggle per-utente: %d", code)
+	}
+	mario, _ = e.users.GetByID(ctx, mario.ID)
+	if mario == nil || !mario.RateLimitExempt {
+		t.Fatalf("esenzione non salvata: %+v", mario)
+	}
+
+	tok := e.login("mario")
+	claims, _ := e.tm.ParseToken(tok)
+	code, _ = e.doAdmin("POST", "/admin/users/block", cookie, url.Values{"user_id": {mario.ID}, "blocked": {"1"}})
+	if code != http.StatusSeeOther {
+		t.Fatalf("blocco: %d", code)
+	}
+	mario, _ = e.users.GetByID(ctx, mario.ID)
+	if mario == nil || mario.BlockedAt == nil {
+		t.Fatal("utente non bloccato")
+	}
+	if !e.tm.IsRevoked(claims) {
+		t.Fatal("i token dell'utente bloccato non sono stati revocati")
+	}
+
+	// CSRF: la stessa azione da un'origine cross-site non deve passare.
+	req, _ := http.NewRequest("POST", e.srv.URL+"/admin/users/block", strings.NewReader("user_id="+mario.ID+"&blocked=0"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.AddCookie(cookie)
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("CSRF cross-site: %d, atteso 403", resp.StatusCode)
+	}
+
+	code, _ = e.doAdmin("POST", "/admin/users/block", cookie, url.Values{"user_id": {mario.ID}, "blocked": {"0"}})
+	if code != http.StatusSeeOther {
+		t.Fatalf("sblocco: %d", code)
+	}
+	mario, _ = e.users.GetByID(ctx, mario.ID)
+	if mario == nil || mario.BlockedAt != nil {
+		t.Fatal("utente ancora bloccato")
 	}
 }

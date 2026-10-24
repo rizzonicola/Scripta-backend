@@ -5,7 +5,11 @@ type User struct {
 	ID           string
 	Username     string
 	PasswordHash string
-	CreatedAt    int64 // unix millis
+	CreatedAt    int64  // unix millis
+	BlockedAt    *int64 // nil = account attivo; non-nil = bloccato dall'admin
+	// RateLimitExempt disattiva il rate limit per-utente della sync. Ha
+	// effetto solo quando il limite globale è attivo.
+	RateLimitExempt bool
 }
 
 // Folder rappresenta una cartella nell'albero gerarchico dell'utente.

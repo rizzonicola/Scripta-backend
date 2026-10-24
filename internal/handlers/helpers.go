@@ -21,10 +21,17 @@ func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
 
 type errorBody struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorBody{Error: msg})
+}
+
+// writeJSONErrorCode accompagna l'errore con un codice stabile, pensato per
+// i client che devono distinguere casi diversi con lo stesso status HTTP.
+func writeJSONErrorCode(w http.ResponseWriter, status int, msg, code string) {
+	writeJSON(w, status, errorBody{Error: msg, Code: code})
 }
 
 // decodeJSONBody decodifica il body JSON di una richiesta in dst, applicando

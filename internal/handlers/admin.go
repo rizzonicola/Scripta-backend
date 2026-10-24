@@ -9,7 +9,10 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
@@ -20,6 +23,7 @@ type AdminHandler struct {
 	Users    *db.UsersRepo
 	Tokens   *auth.TokenManager        // per revocare i JWT utente su reset password / cancellazione
 	Sessions *auth.AdminSessionManager // firma/valida il cookie di sessione della dashboard
+	Settings *db.ServerSettingsRepo    // toggle globale del rate limit
 
 	adminUser string
 	adminPass string
@@ -36,7 +40,7 @@ const adminSessionCookiePath = "/admin"
 // Cartelle e note vivono interamente nel database: cancellare un utente è
 // una singola operazione a DB, propagata dalle foreign key ON DELETE CASCADE
 // (che restano attive su ogni connessione: vedi internal/db/db.go).
-func NewAdminHandler(users *db.UsersRepo, tokens *auth.TokenManager, sessions *auth.AdminSessionManager, adminUser, adminPass string, templatesFS embed.FS) (*AdminHandler, error) {
+func NewAdminHandler(users *db.UsersRepo, tokens *auth.TokenManager, sessions *auth.AdminSessionManager, settings *db.ServerSettingsRepo, adminUser, adminPass string, templatesFS embed.FS) (*AdminHandler, error) {
 	tmpl, err := template.ParseFS(templatesFS, "web/templates/*.html")
 	if err != nil {
 		return nil, err
@@ -45,6 +49,7 @@ func NewAdminHandler(users *db.UsersRepo, tokens *auth.TokenManager, sessions *a
 		Users:     users,
 		Tokens:    tokens,
 		Sessions:  sessions,
+		Settings:  settings,
 		adminUser: adminUser,
 		adminPass: adminPass,
 		tmpl:      tmpl,
@@ -100,6 +105,15 @@ var flashMessages = map[string]flashDef{
 	"delete_failed":         {"Errore nell'eliminazione dell'utente", true},
 	"delete_revoke_failed":  {"Revoca dei token non riuscita: utente non eliminato", true},
 	"user_deleted":          {"Utente e tutti i suoi dati (cartelle e note) eliminati definitivamente", false},
+	"rate_limit_enabled":    {"Rate limit per-utente attivato per tutti gli account", false},
+	"rate_limit_disabled":   {"Rate limit per-utente disattivato per tutti gli account", false},
+	"settings_failed":       {"Impossibile aggiornare le impostazioni del server", true},
+	"user_limit_exempt":     {"Rate limit disattivato per questo utente", false},
+	"user_limit_restored":   {"Rate limit riattivato per questo utente", false},
+	"user_update_failed":    {"Impossibile aggiornare l'utente", true},
+	"user_blocked":          {"Account bloccato: le sessioni attive verranno rifiutate", false},
+	"user_unblocked":        {"Account sbloccato", false},
+	"block_revoke_warning":  {"Account bloccato, ma la revoca delle sessioni non è riuscita", true},
 }
 
 // flashFromRequest legge il codice ?f= e lo traduce nel testo whitelisted.
@@ -113,7 +127,35 @@ func flashFromRequest(r *http.Request) (msg string, isErr bool) {
 
 // redirectFlash reindirizza a path con un CODICE flash (mai testo libero).
 func redirectFlash(w http.ResponseWriter, r *http.Request, path, code string) {
-	http.Redirect(w, r, path+"?f="+template.URLQueryEscaper(code), http.StatusSeeOther)
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	http.Redirect(w, r, path+sep+"f="+template.URLQueryEscaper(code), http.StatusSeeOther)
+}
+
+// adminSearchQuery estrae il filtro di ricerca dalla richiesta, con un limite
+// difensivo: la query finisce in un LIKE e non deve poter essere arbitrariamente
+// grande. Il testo resta visibile nel form e viene riescapato dal template.
+func adminSearchQuery(r *http.Request) string {
+	q := strings.TrimSpace(r.FormValue("q"))
+	if utf8.RuneCountInString(q) > 64 {
+		q = string([]rune(q)[:64])
+	}
+	return q
+}
+
+// adminPathWithSearch preserva il filtro dopo un'azione POST.
+func adminPathWithSearch(q string) string {
+	if q == "" {
+		return "/admin"
+	}
+	return "/admin?q=" + url.QueryEscape(q)
+}
+
+// redirectAdminFlash reindirizza alla dashboard mantenendo la ricerca.
+func redirectAdminFlash(w http.ResponseWriter, r *http.Request, code string) {
+	redirectFlash(w, r, adminPathWithSearch(adminSearchQuery(r)), code)
 }
 
 type loginPageData struct {
@@ -197,23 +239,33 @@ func (h *AdminHandler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 type userView struct {
-	ID        string
-	Username  string
-	CreatedAt string
+	ID              string
+	Username        string
+	CreatedAt       string
+	Blocked         bool
+	RateLimitExempt bool
 }
 
 type usersPageData struct {
-	Nonce        string
-	Users        []userView
-	Flash        string
-	FlashIsError bool
+	Nonce            string
+	Users            []userView
+	Flash            string
+	FlashIsError     bool
+	SearchQuery      string
+	HasSearch        bool
+	RateLimitEnabled bool
+	UserCount        int
+	ActiveCount      int
+	BlockedCount     int
+	ExemptCount      int
 }
 
 // UsersPage gestisce GET /admin -> elenco utenti + form nuovo utente.
 func (h *AdminHandler) UsersPage(w http.ResponseWriter, r *http.Request) {
 	msg, isErr := flashFromRequest(r)
+	search := adminSearchQuery(r)
 
-	users, err := h.Users.List(r.Context())
+	users, err := h.Users.List(r.Context(), search)
 	if err != nil {
 		// Il dettaglio dell'errore DB resta nei log: mai mostrato nella UI.
 		log.Printf("admin: errore caricamento utenti: %v", err)
@@ -221,21 +273,175 @@ func (h *AdminHandler) UsersPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	settings, err := h.Settings.Get(r.Context())
+	if err != nil {
+		log.Printf("admin: errore lettura impostazioni: %v", err)
+		http.Error(w, "errore interno", http.StatusInternalServerError)
+		return
+	}
+
 	views := make([]userView, 0, len(users))
+	active, blocked, exempt := 0, 0, 0
 	for _, u := range users {
+		isBlocked := u.BlockedAt != nil
+		if isBlocked {
+			blocked++
+		} else {
+			active++
+		}
+		if u.RateLimitExempt {
+			exempt++
+		}
 		views = append(views, userView{
-			ID:        u.ID,
-			Username:  u.Username,
-			CreatedAt: time.UnixMilli(u.CreatedAt).Format("2006-01-02 15:04"),
+			ID:              u.ID,
+			Username:        u.Username,
+			CreatedAt:       time.UnixMilli(u.CreatedAt).Format("2006-01-02 15:04"),
+			Blocked:         isBlocked,
+			RateLimitExempt: u.RateLimitExempt,
 		})
 	}
 
-	data := usersPageData{Nonce: middleware.NonceFromContext(r.Context()), Users: views, Flash: msg, FlashIsError: isErr}
+	data := usersPageData{
+		Nonce:            middleware.NonceFromContext(r.Context()),
+		Users:            views,
+		Flash:            msg,
+		FlashIsError:     isErr,
+		SearchQuery:      search,
+		HasSearch:        search != "",
+		RateLimitEnabled: settings.UserRateLimitEnabled,
+		UserCount:        len(views),
+		ActiveCount:      active,
+		BlockedCount:     blocked,
+		ExemptCount:      exempt,
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := h.tmpl.ExecuteTemplate(w, "users.html", data); err != nil {
 		log.Printf("admin: errore rendering dashboard: %v", err)
 		http.Error(w, "errore interno", http.StatusInternalServerError)
 	}
+}
+
+// UpdateRateLimitSetting gestisce il toggle globale del rate limit sync.
+// Default ON: la casella arriva valorizzata solo quando l'admin la lascia
+// selezionata, quindi l'assenza del campo significa "disattiva".
+func (h *AdminHandler) UpdateRateLimitSetting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		redirectAdminFlash(w, r, "bad_request")
+		return
+	}
+	enabled := r.FormValue("enabled") == "on"
+	if err := h.Settings.SetUserRateLimitEnabled(r.Context(), enabled); err != nil {
+		log.Printf("admin: aggiornamento rate limit globale: %v", err)
+		redirectAdminFlash(w, r, "settings_failed")
+		return
+	}
+	if enabled {
+		redirectAdminFlash(w, r, "rate_limit_enabled")
+	} else {
+		redirectAdminFlash(w, r, "rate_limit_disabled")
+	}
+}
+
+// UpdateUserRateLimit gestisce l'esenzione per-utente. Il campo "exempt"
+// contiene lo stato NUOVO desiderato (1 = esente), non quello corrente.
+func (h *AdminHandler) UpdateUserRateLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		redirectAdminFlash(w, r, "bad_request")
+		return
+	}
+	userID := strings.TrimSpace(r.FormValue("user_id"))
+	if userID == "" {
+		redirectAdminFlash(w, r, "user_id_required")
+		return
+	}
+	exempt := r.FormValue("exempt") == "1"
+	if err := h.Users.SetRateLimitExempt(r.Context(), userID, exempt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			redirectAdminFlash(w, r, "user_not_found")
+			return
+		}
+		log.Printf("admin: aggiornamento esenzione rate limit utente %s: %v", userID, err)
+		redirectAdminFlash(w, r, "user_update_failed")
+		return
+	}
+	if exempt {
+		redirectAdminFlash(w, r, "user_limit_exempt")
+	} else {
+		redirectAdminFlash(w, r, "user_limit_restored")
+	}
+}
+
+// SetUserBlocked blocca/sblocca un account.
+//
+// Blocco: blocked_at viene scritto PRIMA della revoca, così il middleware
+// rifiuta immediatamente ogni richiesta anche se la revoca dei token dovesse
+// fallire. Sblocco: si revocano prima i token emessi durante il blocco e solo
+// dopo si azzera blocked_at; in caso di errore l'account resta bloccato.
+func (h *AdminHandler) SetUserBlocked(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		redirectAdminFlash(w, r, "bad_request")
+		return
+	}
+	userID := strings.TrimSpace(r.FormValue("user_id"))
+	if userID == "" {
+		redirectAdminFlash(w, r, "user_id_required")
+		return
+	}
+	block := r.FormValue("blocked") == "1"
+
+	if block {
+		if err := h.Users.SetBlocked(r.Context(), userID, true); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				redirectAdminFlash(w, r, "user_not_found")
+				return
+			}
+			log.Printf("admin: blocco utente %s: %v", userID, err)
+			redirectAdminFlash(w, r, "user_update_failed")
+			return
+		}
+		if h.Tokens != nil {
+			if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
+				log.Printf("admin: revoca token dopo il blocco di %s: %v", userID, err)
+				redirectAdminFlash(w, r, "block_revoke_warning")
+				return
+			}
+		}
+		redirectAdminFlash(w, r, "user_blocked")
+		return
+	}
+
+	if h.Tokens != nil {
+		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
+			log.Printf("admin: revoca token prima dello sblocco di %s: %v", userID, err)
+			redirectAdminFlash(w, r, "block_revoke_warning")
+			return
+		}
+	}
+	if err := h.Users.SetBlocked(r.Context(), userID, false); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			redirectAdminFlash(w, r, "user_not_found")
+			return
+		}
+		log.Printf("admin: sblocco utente %s: %v", userID, err)
+		redirectAdminFlash(w, r, "user_update_failed")
+		return
+	}
+	redirectAdminFlash(w, r, "user_unblocked")
 }
 
 // passwordFlashCode traduce un errore di validazione password nel codice flash.
@@ -258,44 +464,44 @@ func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
-		redirectFlash(w, r, "/admin", "bad_request")
+		redirectAdminFlash(w, r, "bad_request")
 		return
 	}
 
 	rawUsername := r.FormValue("username")
 	password := r.FormValue("password")
 	if rawUsername == "" || password == "" {
-		redirectFlash(w, r, "/admin", "fields_required")
+		redirectAdminFlash(w, r, "fields_required")
 		return
 	}
 	username, err := auth.NormalizeUsername(rawUsername)
 	if err != nil {
-		redirectFlash(w, r, "/admin", "username_invalid")
+		redirectAdminFlash(w, r, "username_invalid")
 		return
 	}
 	if err := auth.ValidatePassword(password); err != nil {
-		redirectFlash(w, r, "/admin", passwordFlashCode(err))
+		redirectAdminFlash(w, r, passwordFlashCode(err))
 		return
 	}
 
 	hash, err := auth.HashPassword(password)
 	if err != nil {
 		log.Printf("admin: errore hashing password: %v", err)
-		redirectFlash(w, r, "/admin", "internal")
+		redirectAdminFlash(w, r, "internal")
 		return
 	}
 
 	if _, err := h.Users.Create(r.Context(), username, hash); err != nil {
 		if errors.Is(err, db.ErrUsernameTaken) {
-			redirectFlash(w, r, "/admin", "user_exists")
+			redirectAdminFlash(w, r, "user_exists")
 			return
 		}
 		log.Printf("admin: errore creazione utente: %v", err)
-		redirectFlash(w, r, "/admin", "user_create_failed")
+		redirectAdminFlash(w, r, "user_create_failed")
 		return
 	}
 
-	redirectFlash(w, r, "/admin", "user_created")
+	redirectAdminFlash(w, r, "user_created")
 }
 
 // ResetPassword gestisce POST /admin/users/reset-password.
@@ -307,36 +513,36 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
-		redirectFlash(w, r, "/admin", "bad_request")
+		redirectAdminFlash(w, r, "bad_request")
 		return
 	}
 
 	userID := r.FormValue("user_id")
 	newPassword := r.FormValue("new_password")
 	if userID == "" || newPassword == "" {
-		redirectFlash(w, r, "/admin", "reset_fields_required")
+		redirectAdminFlash(w, r, "reset_fields_required")
 		return
 	}
 	if err := auth.ValidatePassword(newPassword); err != nil {
-		redirectFlash(w, r, "/admin", passwordFlashCode(err))
+		redirectAdminFlash(w, r, passwordFlashCode(err))
 		return
 	}
 
 	user, err := h.Users.GetByID(r.Context(), userID)
 	if err != nil {
 		log.Printf("admin: errore lettura utente %s: %v", userID, err)
-		redirectFlash(w, r, "/admin", "internal")
+		redirectAdminFlash(w, r, "internal")
 		return
 	}
 	if user == nil {
-		redirectFlash(w, r, "/admin", "user_not_found")
+		redirectAdminFlash(w, r, "user_not_found")
 		return
 	}
 
 	hash, err := auth.HashPassword(newPassword)
 	if err != nil {
 		log.Printf("admin: errore hashing password: %v", err)
-		redirectFlash(w, r, "/admin", "internal")
+		redirectAdminFlash(w, r, "internal")
 		return
 	}
 
@@ -347,22 +553,22 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	if h.Tokens != nil {
 		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
 			log.Printf("admin: revoca token prima del reset non riuscita (utente %s): %v", userID, err)
-			redirectFlash(w, r, "/admin", "reset_revoke_failed")
+			redirectAdminFlash(w, r, "reset_revoke_failed")
 			return
 		}
 	}
 
 	if err := h.Users.UpdatePassword(r.Context(), userID, hash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			redirectFlash(w, r, "/admin", "user_not_found")
+			redirectAdminFlash(w, r, "user_not_found")
 			return
 		}
 		log.Printf("admin: errore reset password: %v", err)
-		redirectFlash(w, r, "/admin", "reset_failed")
+		redirectAdminFlash(w, r, "reset_failed")
 		return
 	}
 
-	redirectFlash(w, r, "/admin", "password_updated")
+	redirectAdminFlash(w, r, "password_updated")
 }
 
 // DeleteUser gestisce POST /admin/users/delete: eliminazione irreversibile di
@@ -375,24 +581,24 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
-		redirectFlash(w, r, "/admin", "bad_request")
+		redirectAdminFlash(w, r, "bad_request")
 		return
 	}
 
 	userID := r.FormValue("user_id")
 	if userID == "" {
-		redirectFlash(w, r, "/admin", "user_id_required")
+		redirectAdminFlash(w, r, "user_id_required")
 		return
 	}
 
 	user, err := h.Users.GetByID(r.Context(), userID)
 	if err != nil {
 		log.Printf("admin: errore lettura utente %s: %v", userID, err)
-		redirectFlash(w, r, "/admin", "internal")
+		redirectAdminFlash(w, r, "internal")
 		return
 	}
 	if user == nil {
-		redirectFlash(w, r, "/admin", "user_not_found")
+		redirectAdminFlash(w, r, "user_not_found")
 		return
 	}
 
@@ -403,16 +609,16 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	if h.Tokens != nil {
 		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
 			log.Printf("admin: revoca token prima dell'eliminazione non riuscita (utente %s): %v", userID, err)
-			redirectFlash(w, r, "/admin", "delete_revoke_failed")
+			redirectAdminFlash(w, r, "delete_revoke_failed")
 			return
 		}
 	}
 
 	if err := h.Users.Delete(r.Context(), userID); err != nil {
 		log.Printf("admin: errore eliminazione utente %s: %v", userID, err)
-		redirectFlash(w, r, "/admin", "delete_failed")
+		redirectAdminFlash(w, r, "delete_failed")
 		return
 	}
 
-	redirectFlash(w, r, "/admin", "user_deleted")
+	redirectAdminFlash(w, r, "user_deleted")
 }

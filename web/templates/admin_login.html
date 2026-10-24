@@ -4,67 +4,100 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#f6f7fb" />
   <title data-i18n="pageTitle">Accesso Admin · Note Markdown</title>
+  <script nonce="{{.Nonce}}">
+    (function () {
+      try {
+        var stored = localStorage.getItem('scripta_admin_theme') || 'auto';
+        var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        var theme = stored === 'auto' ? (dark ? 'dark' : 'light') : stored;
+        document.documentElement.setAttribute('data-theme', theme);
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'light');
+      }
+    })();
+  </script>
   <style nonce="{{.Nonce}}">
-    /* Stessa identità visiva di users.html: stesso font stack, stessa
-       palette, stessi raggi/ombre delle card, per rendere il login
-       indistinguibile in stile dal resto della dashboard. */
+    :root {
+      color-scheme: light;
+      --bg: #f6f7fb;
+      --surface: #ffffff;
+      --surface-2: #f1f5f9;
+      --text: #111827;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --danger-soft: #fee2e2;
+      --success: #15803d;
+      --success-soft: #dcfce7;
+      --shadow: 0 1px 2px rgba(15, 23, 42, .05), 0 24px 60px rgba(15, 23, 42, .08);
+      --radius: 14px;
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0b1120;
+      --surface: #111827;
+      --surface-2: #172033;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --border: #263349;
+      --accent: #60a5fa;
+      --accent-hover: #93c5fd;
+      --danger: #f87171;
+      --danger-soft: #3f1d1d;
+      --success: #4ade80;
+      --success-soft: #14351f;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .25), 0 24px 60px rgba(0, 0, 0, .35);
+    }
+    * { box-sizing: border-box; }
     body {
-      font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-      color: #1a1a1a;
-      background: #fafafa;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(900px 500px at 50% -10%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 70%),
+        var(--bg);
       margin: 0;
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 20px;
-      box-sizing: border-box;
+      padding: 24px 16px;
     }
-    .login-wrap {
-      width: 100%;
-      max-width: 360px;
-    }
-    .login-header {
-      text-align: center;
-      margin-bottom: 20px;
-    }
-    .login-header h1 {
-      font-size: 20px;
-      margin: 0 0 4px;
-    }
-    .login-header p {
-      font-size: 13px;
-      color: #666;
-      margin: 0;
-    }
+    .login-wrap { width: 100%; max-width: 380px; }
+    .login-header { text-align: center; margin-bottom: 20px; }
+    .login-header h1 { font-size: 21px; margin: 0 0 5px; letter-spacing: -0.02em; }
+    .login-header p { font-size: 13px; color: var(--muted); margin: 0; }
     .card {
-      background: #fff;
-      border: 1px solid #eee;
-      border-radius: 8px;
-      padding: 24px;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, .04);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 26px;
+      box-shadow: var(--shadow);
     }
-    label {
+    label.field-label {
       display: block;
       font-size: 13px;
-      color: #444;
+      color: var(--muted);
       margin-bottom: 6px;
       font-weight: 600;
     }
-    .field {
-      margin-bottom: 16px;
-    }
+    .field { margin-bottom: 16px; }
     input {
       width: 100%;
-      padding: 10px 12px;
-      border: 1px solid #ccc;
-      border-radius: 6px;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
       font-size: 15px;
-      box-sizing: border-box;
-      /* 16px minimo evita lo zoom automatico su iOS Safari quando si
-         mette a fuoco un input: qui usiamo 15px + questa regola per gli
-         schermi realmente piccoli, dove l'ingrandimento sarebbe fastidioso. */
+      background: var(--surface);
+      color: var(--text);
+    }
+    input:focus, button:focus-visible, select:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
     @media (max-width: 480px) {
       input { font-size: 16px; }
@@ -72,38 +105,49 @@
     button {
       width: 100%;
       padding: 11px 14px;
-      border: none;
-      border-radius: 6px;
-      background: #2563eb;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: var(--accent);
       color: #fff;
       font-size: 15px;
       font-weight: 600;
       cursor: pointer;
     }
-    button:hover { background: #1d4ed8; }
+    button:hover { background: var(--accent-hover); }
     .flash {
       padding: 10px 14px;
-      border-radius: 6px;
+      border-radius: 9px;
       margin-bottom: 16px;
       font-size: 13px;
+      border: 1px solid transparent;
     }
-    .flash.ok { background: #dcfce7; color: #166534; }
-    .flash.error { background: #fee2e2; color: #991b1b; }
-    .lang-picker {
+    .flash.ok { background: var(--success-soft); color: var(--success); }
+    .flash.error { background: var(--danger-soft); color: var(--danger); }
+    .controls {
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
-      font-size: 12px;
-      color: #666;
+      gap: 14px;
+      flex-wrap: wrap;
       margin-top: 18px;
     }
-    .lang-picker select {
-      padding: 4px 6px;
-      border: 1px solid #ccc;
-      border-radius: 6px;
+    .control {
+      display: flex;
+      align-items: center;
+      gap: 6px;
       font-size: 12px;
-      background: #fff;
+      color: var(--muted);
+    }
+    .control select {
+      padding: 5px 7px;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      font-size: 12px;
+      background: var(--surface);
+      color: var(--text);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; }
     }
   </style>
 </head>
@@ -116,17 +160,12 @@
 
     <div class="card">
       {{if .Flash}}
-        <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}">{{.Flash}}</div>
+        <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}" role="status">{{.Flash}}</div>
       {{end}}
 
-      <!-- Form HTML standard (niente popup nativo del browser tipo Basic
-           Auth): i campi con name/type/autocomplete corretti sono
-           riconosciuti da qualunque gestore di password (nativo del
-           browser, 1Password, Bitwarden, ecc.), che può offrire di
-           salvare le credenziali qui come per qualsiasi altro sito. -->
       <form method="POST" action="/admin/login">
         <div class="field">
-          <label for="username" data-i18n="usernameLabel">Username</label>
+          <label class="field-label" for="username" data-i18n="usernameLabel">Username</label>
           <input
             type="text"
             id="username"
@@ -140,7 +179,7 @@
           />
         </div>
         <div class="field">
-          <label for="password" data-i18n="passwordLabel">Password</label>
+          <label class="field-label" for="password" data-i18n="passwordLabel">Password</label>
           <input
             type="password"
             id="password"
@@ -153,21 +192,28 @@
       </form>
     </div>
 
-    <div class="lang-picker">
-      <label for="lang-select" data-i18n="langLabel">Lingua</label>
-      <select id="lang-select">
-        <option value="auto" data-i18n="langAuto">Sistema / Auto</option>
-        <option value="it" data-i18n="langIt">Italiano</option>
-        <option value="en" data-i18n="langEn">English</option>
-        <option value="fr" data-i18n="langFr">Français</option>
-      </select>
+    <div class="controls">
+      <div class="control">
+        <label for="lang-select" data-i18n="langLabel">Lingua</label>
+        <select id="lang-select">
+          <option value="auto" data-i18n="langAuto">Sistema / Auto</option>
+          <option value="it" data-i18n="langIt">Italiano</option>
+          <option value="en" data-i18n="langEn">English</option>
+          <option value="fr" data-i18n="langFr">Français</option>
+        </select>
+      </div>
+      <div class="control">
+        <label for="theme-select" data-i18n="themeLabel">Tema</label>
+        <select id="theme-select">
+          <option value="auto" data-i18n="themeAuto">Sistema / Auto</option>
+          <option value="light" data-i18n="themeLight">Chiaro</option>
+          <option value="dark" data-i18n="themeDark">Scuro</option>
+        </select>
+      </div>
     </div>
   </div>
 
   <script nonce="{{.Nonce}}">
-    // Stesso meccanismo di traduzione/persistenza lingua di users.html
-    // (stessa chiave di localStorage, così la preferenza resta coerente
-    // passando da una pagina all'altra della dashboard).
     var translations = {
       it: {
         pageTitle: 'Accesso Admin · Note Markdown',
@@ -180,7 +226,11 @@
         langAuto: 'Sistema / Auto',
         langIt: 'Italiano',
         langEn: 'English',
-        langFr: 'Français'
+        langFr: 'Français',
+        themeLabel: 'Tema',
+        themeAuto: 'Sistema / Auto',
+        themeLight: 'Chiaro',
+        themeDark: 'Scuro'
       },
       en: {
         pageTitle: 'Admin Login · Markdown Notes',
@@ -193,7 +243,11 @@
         langAuto: 'System / Auto',
         langIt: 'Italiano',
         langEn: 'English',
-        langFr: 'Français'
+        langFr: 'Français',
+        themeLabel: 'Theme',
+        themeAuto: 'System / Auto',
+        themeLight: 'Light',
+        themeDark: 'Dark'
       },
       fr: {
         pageTitle: 'Connexion Admin · Notes Markdown',
@@ -206,7 +260,11 @@
         langAuto: 'Système / Auto',
         langIt: 'Italiano',
         langEn: 'English',
-        langFr: 'Français'
+        langFr: 'Français',
+        themeLabel: 'Thème',
+        themeAuto: 'Système / Auto',
+        themeLight: 'Clair',
+        themeDark: 'Sombre'
       }
     };
 
@@ -219,8 +277,7 @@
 
     function resolveLang(pref) {
       if (!pref || pref === 'auto') return detectSystemLang();
-      if (translations[pref]) return pref;
-      return detectSystemLang();
+      return translations[pref] ? pref : detectSystemLang();
     }
 
     function applyTranslations(lang) {
@@ -233,16 +290,47 @@
       });
     }
 
+    function resolveTheme(pref) {
+      if (pref === 'light' || pref === 'dark') return pref;
+      var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      return dark ? 'dark' : 'light';
+    }
+
+    function applyTheme(pref) {
+      var theme = resolveTheme(pref);
+      document.documentElement.setAttribute('data-theme', theme);
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b1120' : '#f6f7fb');
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
-      var STORAGE_KEY = 'scripta_admin_lang';
-      var select = document.getElementById('lang-select');
-      var stored = localStorage.getItem(STORAGE_KEY) || 'auto';
-      select.value = stored;
-      applyTranslations(resolveLang(stored));
-      select.addEventListener('change', function () {
-        localStorage.setItem(STORAGE_KEY, select.value);
-        applyTranslations(resolveLang(select.value));
+      var LANG_KEY = 'scripta_admin_lang';
+      var THEME_KEY = 'scripta_admin_theme';
+
+      var langSelect = document.getElementById('lang-select');
+      var storedLang = localStorage.getItem(LANG_KEY) || 'auto';
+      langSelect.value = storedLang;
+      applyTranslations(resolveLang(storedLang));
+      langSelect.addEventListener('change', function () {
+        localStorage.setItem(LANG_KEY, langSelect.value);
+        applyTranslations(resolveLang(langSelect.value));
       });
+
+      var themeSelect = document.getElementById('theme-select');
+      var storedTheme = localStorage.getItem(THEME_KEY) || 'auto';
+      themeSelect.value = storedTheme;
+      applyTheme(storedTheme);
+      themeSelect.addEventListener('change', function () {
+        localStorage.setItem(THEME_KEY, themeSelect.value);
+        applyTheme(themeSelect.value);
+      });
+      if (window.matchMedia) {
+        var query = window.matchMedia('(prefers-color-scheme: dark)');
+        var onChange = function () {
+          if ((localStorage.getItem(THEME_KEY) || 'auto') === 'auto') applyTheme('auto');
+        };
+        if (query.addEventListener) query.addEventListener('change', onChange);
+      }
     });
   </script>
 </body>

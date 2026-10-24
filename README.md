@@ -23,6 +23,7 @@ notes-server/
 │   │   ├── folders_repo.go          # repository cartelle
 │   │   ├── notes_repo.go            # repository note (LWW, tombstone)
 │   │   ├── settings_repo.go         # preferenze utente
+│   │   ├── server_settings_repo.go  # toggle globali (rate limit sync)
 │   │   ├── sync_state_repo.go       # cursore/high-water mark della sync
 │   │   ├── revocations_repo.go      # revoche JWT persistenti
 │   │   └── maintenance.go           # incremental vacuum / checkpoint WAL
@@ -41,7 +42,7 @@ notes-server/
 ├── testdata/                        # fixture di contratto e golden
 └── web/templates/
     ├── admin_login.html             # login dashboard
-    └── users.html                   # UI admin (utenti, reset password, eliminazione)
+    └── users.html                   # UI admin (ricerca, blocco, rate limit, reset, eliminazione)
 ```
 
 Dati persistenti (montati come volume Docker su `/data`):
@@ -137,7 +138,9 @@ valide.
 
 `expires_at` è in **secondi** Unix (a differenza dei timestamp di sync, in millisecondi).
 
-**Errori**: `400` (campi mancanti), `401` (credenziali non valide).
+**Errori**: `400` (campi mancanti), `401` (`invalid_credentials`),
+`403` (`account_blocked`, solo dopo password corretta), `429` (`rate_limited`,
+con `Retry-After`). Il corpo include un campo stabile `code`.
 
 Il token va incluso in tutte le chiamate successive come:
 ```
@@ -237,11 +240,13 @@ server (compare nel riepilogo dei `422`); non cambia nessun comportamento.
 | Codice | Quando | Corpo |
 |---|---|---|
 | `400` | corpo non JSON | `{"error":"body JSON non valido"}` |
-| `401` | token mancante, scaduto o revocato | `{"error":"..."}` |
+| `401` | token mancante, scaduto o revocato | `{"error":"...","code":"missing_token\|invalid_token\|revoked_token\|invalid_account"}` |
+| `403` | account bloccato dall'amministratore | `{"error":"...","code":"account_blocked"}` |
 | `405` | metodo diverso da `POST` | `{"error":"metodo non consentito"}` |
 | `413` | corpo oltre `SYNC_MAX_BODY_BYTES` o più di 100000 elementi | `{"error":"payload troppo grande"}` |
 | `422` | almeno un elemento rifiutato: **nessuna modifica applicata** (rollback dell'intero batch), nessun `server_time` | `{"error":"...","rejected":[{"kind":"folder\|note","id":"...","reason":"invalid_id\|invalid_parent_id\|invalid_folder_id"}]}` |
-| `500` | errore interno | `{"error":"..."}` |
+| `429` | rate limit per-utente superato (se attivo e non esente); riprovare dopo `Retry-After` | `{"error":"...","code":"rate_limited"}` |
+| `500` | errore interno | `{"error":"...","code":"internal_error"}` |
 | `503` | database occupato; riprovare (header `Retry-After: 1`) | `{"error":"database temporaneamente occupato, riprovare"}` |
 
 La sync è **idempotente**: rinviare lo stesso corpo (per esempio dopo una rete caduta) dà lo stesso stato finale.
@@ -325,8 +330,18 @@ tombstone), `405` (metodo diverso da `GET`), `500`.
 
 Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sessione HttpOnly/Secure/SameSite=Strict, invece del popup nativo Basic Auth: i campi sono riconosciuti dai password manager e il logout (`/admin/logout`) è esplicito.
 
-- **`GET /admin`** — elenco utenti registrati (username, ID, data creazione) + form
-  di creazione nuovo utente.
+- **`GET /admin`** — elenco utenti registrati (username, ID, data creazione, stato
+  account e rate limit) con ricerca per username/ID, conteggi rapidi e form di
+  creazione nuovo utente. Il filtro è `?q=` e resta attivo dopo le azioni.
+- **`POST /admin/settings/rate-limit`** — attiva/disattiva il rate limit
+  per-utente della sync (`POST /api/v1/sync`). Default **attivo**; il toggle
+  vale per tutti gli account salvo esenzione individuale.
+- **`POST /admin/users/rate-limit`** — esenta un singolo utente dal rate limit o
+  ripristina il limite standard. L'esenzione ha precedenza sul toggle globale.
+- **`POST /admin/users/block`** — blocca o sblocca un account. Il blocco ha
+  effetto immediato anche sui JWT già emessi: il middleware risponde `403` con
+  codice `account_blocked`. Il blocco revoca anche i token attivi; lo sblocco
+  lascia quei token revocati, quindi il client deve rifare il login.
 - **`POST /admin/users/create`** — crea un nuovo utente. Lo username deve essere di
   3-64 caratteri ASCII (lettere, numeri, punto, trattino e underscore). Il case è
   significativo: `Mario` e `mario` sono due account distinti. La password
@@ -364,6 +379,11 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
 - **Rifiuti espliciti**: un `folder_id`/`parent_id` non valido produce `422` con l'elenco `rejected` e rollback dell'intero batch; il client non riceve `server_time` e non avanza il cursore.
 - **Tombstone**: purge dopo 30 giorni dall'accettazione sul server (`synced_at`). Un client con cursore più vecchio riceve `full_resync: true` (stato completo) e ripulisce i residui locali.
 - **Revoca token persistente** (`user_token_revocations`, `revoked_tokens`) + `POST /api/v1/auth/logout`.
-- **Rate limit** basato sull'IP del peer; header di inoltro creduti solo da `TRUSTED_PROXIES`.
+- **Rate limit**: login basato sull'IP del peer; sync basata sull'utente autenticato
+  (2 req/s, burst 60), con toggle globale ed esenzioni per-utente gestiti da
+  `/admin`. Header di inoltro creduti solo da `TRUSTED_PROXIES`.
+- **Blocco account**: `blocked_at` viene controllato a ogni richiesta autenticata
+  insieme a revoca ed esistenza dell'utente; un account bloccato riceve `403`
+  anche con token non ancora scaduti.
 - **Header di sicurezza** (CSP con nonce sulle pagine admin, HSTS, X-Frame-Options, ecc.); i messaggi della dashboard viaggiano come codici whitelisted, non come testo in query string.
 - **Migrazione**: al primo avvio vengono aggiunte le colonne mancanti (es. `synced_at`, con backfill = ora) e creati gli indici; le DDL sono idempotenti. `go.sum` è versionato: eseguire `go mod tidy` solo dopo aver modificato le dipendenze.

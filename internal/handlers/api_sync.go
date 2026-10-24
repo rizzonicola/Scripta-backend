@@ -88,6 +88,16 @@ type SyncHandler struct {
 	// http.MaxBytesReader. Se zero, NewSyncHandler applica il default.
 	MaxBodyBytes int64
 
+	// Settings espone l'interruttore globale del rate limit per-utente.
+	Settings *db.ServerSettingsRepo
+
+	// UserLimiter è nil nei test/unità che non vogliono il limite; in
+	// produzione buildRouter lo imposta sul limiter per-utente. Il tipo è
+	// un'interfaccia per poterlo sostituire nei test senza timer reali.
+	UserLimiter interface {
+		Allow(userID string) bool
+	}
+
 	// stampMu serializza le sync e garantisce che gli stamp (synced_at)
 	// assegnati siano strettamente crescenti nell'ordine di commit: vedi
 	// nextStamp. Il server è un singolo processo con un singolo writer
@@ -114,6 +124,7 @@ func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
 		Folders:      db.NewFoldersRepo(sqlDB),
 		Notes:        db.NewNotesRepo(sqlDB),
 		SyncState:    db.NewSyncStateRepo(sqlDB),
+		Settings:     db.NewServerSettingsRepo(sqlDB),
 		MaxBodyBytes: defaultMaxSyncBodyBytes,
 	}
 }
@@ -242,6 +253,27 @@ func isOwnershipViolation(err error) bool {
 	return strings.Contains(err.Error(), db.OwnershipViolationMarker)
 }
 
+// rateLimitApplies decide se la richiesta deve consumare il budget del limiter
+// per-utente. L'esenzione per-utente ha precedenza sul toggle globale, così
+// un amministratore può disattivare il limite per un singolo client senza
+// spegnerlo per tutti. Se la lettura del toggle fallisce si assume ATTIVO:
+// il rate limit è una difesa aggiuntiva e un errore DB non deve trasformarsi
+// in un bypass silenzioso.
+func (h *SyncHandler) rateLimitApplies(ctx context.Context) bool {
+	if status, ok := middleware.AccountStatusFromContext(ctx); ok && status.RateLimitExempt {
+		return false
+	}
+	if h.Settings == nil {
+		return true
+	}
+	settings, err := h.Settings.Get(ctx)
+	if err != nil {
+		log.Printf("lettura impostazioni rate limit: %v", err)
+		return true
+	}
+	return settings.UserRateLimitEnabled
+}
+
 // Sync gestisce POST /api/v1/sync applicando il protocollo Delta Sync
 // Push/Pull con risoluzione dei conflitti Last-Write-Wins:
 //
@@ -284,6 +316,13 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	userID, ok := middleware.UserIDFromContext(ctx)
 	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		return
+	}
+
+	if h.UserLimiter != nil && h.rateLimitApplies(ctx) && !h.UserLimiter.Allow(userID) {
+		w.Header().Set("Retry-After", "1")
+		writeJSONErrorCode(w, http.StatusTooManyRequests,
+			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
 		return
 	}
 

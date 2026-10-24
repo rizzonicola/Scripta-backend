@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,11 +59,22 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 	return u, nil
 }
 
-// List restituisce tutti gli utenti per la dashboard admin. Non legge
-// password_hash: l'hash serve solo al login (GetByUsername), non alla UI,
-// quindi evitare di caricarlo in memoria riduce l'esposizione accidentale.
-func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, created_at FROM users ORDER BY created_at DESC`)
+// List restituisce gli utenti per la dashboard admin, eventualmente filtrati
+// per username o ID. Non legge password_hash: l'hash serve solo al login
+// (GetByUsername), non alla UI, quindi evitare di caricarlo in memoria riduce
+// l'esposizione accidentale.
+func (r *UsersRepo) List(ctx context.Context, search string) ([]models.User, error) {
+	query := `SELECT id, username, created_at, blocked_at, rate_limit_exempt FROM users`
+	args := make([]any, 0, 2)
+	search = strings.TrimSpace(search)
+	if search != "" {
+		pattern := "%" + escapeLike(search) + "%"
+		query += ` WHERE username LIKE ? ESCAPE '\' OR id LIKE ? ESCAPE '\'`
+		args = append(args, pattern, pattern)
+	}
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -71,43 +83,143 @@ func (r *UsersRepo) List(ctx context.Context) ([]models.User, error) {
 	var users []models.User
 	for rows.Next() {
 		var u models.User
-		if err := rows.Scan(&u.ID, &u.Username, &u.CreatedAt); err != nil {
+		var blockedAt sql.NullInt64
+		var exempt int
+		if err := rows.Scan(&u.ID, &u.Username, &u.CreatedAt, &blockedAt, &exempt); err != nil {
 			return nil, err
 		}
+		if blockedAt.Valid {
+			u.BlockedAt = &blockedAt.Int64
+		}
+		u.RateLimitExempt = exempt != 0
 		users = append(users, u)
 	}
 	return users, rows.Err()
+}
+
+// escapeLike neutralizza i metacaratteri di LIKE, così la ricerca admin cerca
+// il testo letterale anche quando contiene % o _.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
 }
 
 // GetByUsername recupera un utente per username con confronto esatto
 // (usato dal login e dal controllo duplicati). "Mario" e "mario" sono due
 // account distinti: il case è parte dell'identità.
 func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models.User, error) {
-	var u models.User
-	err := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE username = ? COLLATE BINARY`, username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
+	row := r.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, created_at, blocked_at, rate_limit_exempt
+		 FROM users WHERE username = ? COLLATE BINARY`, username,
+	)
+	u, err := scanUserRow(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	return &u, nil
+	return u, err
 }
 
 // GetByID recupera un utente per ID.
 func (r *UsersRepo) GetByID(ctx context.Context, id string) (*models.User, error) {
-	var u models.User
-	err := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at FROM users WHERE id = ?`, id,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
+	row := r.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, created_at, blocked_at, rate_limit_exempt
+		 FROM users WHERE id = ?`, id,
+	)
+	u, err := scanUserRow(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
+	return u, err
+}
+
+// AccountStatus è il sottoinsieme di users necessario a ogni richiesta
+// autenticata. È separato da GetByID perché il middleware non deve leggere
+// l'hash della password per ogni sync.
+type AccountStatus struct {
+	Blocked         bool
+	RateLimitExempt bool
+}
+
+// GetAccountStatus legge lo stato di sicurezza dell'utente. found=false
+// significa che l'account è stato eliminato.
+func (r *UsersRepo) GetAccountStatus(ctx context.Context, id string) (status AccountStatus, found bool, err error) {
+	var blockedAt sql.NullInt64
+	var exempt int
+	err = r.db.QueryRowContext(ctx,
+		`SELECT blocked_at, rate_limit_exempt FROM users WHERE id = ?`, id,
+	).Scan(&blockedAt, &exempt)
+	if err == sql.ErrNoRows {
+		return AccountStatus{}, false, nil
+	}
 	if err != nil {
+		return AccountStatus{}, false, err
+	}
+	return AccountStatus{Blocked: blockedAt.Valid, RateLimitExempt: exempt != 0}, true, nil
+}
+
+// SetBlocked blocca o sblocca un account. Il timestamp di blocco viene
+// conservato solo come informazione operativa: il middleware controlla la
+// sola presenza (blocked_at IS NOT NULL).
+func (r *UsersRepo) SetBlocked(ctx context.Context, userID string, blocked bool) error {
+	var res sql.Result
+	var err error
+	if blocked {
+		res, err = r.db.ExecContext(ctx,
+			`UPDATE users SET blocked_at = ? WHERE id = ?`, time.Now().UnixMilli(), userID)
+	} else {
+		res, err = r.db.ExecContext(ctx,
+			`UPDATE users SET blocked_at = NULL WHERE id = ?`, userID)
+	}
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SetRateLimitExempt attiva/disattiva l'esenzione dal rate limit per-utente.
+func (r *UsersRepo) SetRateLimitExempt(ctx context.Context, userID string, exempt bool) error {
+	value := 0
+	if exempt {
+		value = 1
+	}
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE users SET rate_limit_exempt = ? WHERE id = ?`, value, userID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// scanUserRow legge le colonne comuni a List/GetByUsername/GetByID.
+func scanUserRow(row interface {
+	Scan(dest ...any) error
+}) (*models.User, error) {
+	var u models.User
+	var blockedAt sql.NullInt64
+	var exempt int
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt, &blockedAt, &exempt); err != nil {
 		return nil, err
 	}
+	if blockedAt.Valid {
+		u.BlockedAt = &blockedAt.Int64
+	}
+	u.RateLimitExempt = exempt != 0
 	return &u, nil
 }
 

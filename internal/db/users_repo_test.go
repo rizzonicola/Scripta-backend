@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -113,5 +114,78 @@ func TestMigrateDropsCaseInsensitiveUsernameIndex(t *testing.T) {
 	}
 	if _, err := repo.Create(ctx, "nicola", "hash"); err != nil {
 		t.Fatalf("creazione variante di case: %v", err)
+	}
+}
+
+func TestUsersRepoSearchAndSecurityFlags(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "users_search.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx := context.Background()
+	repo := NewUsersRepo(conn)
+	mario, err := repo.Create(ctx, "Mario", "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Create(ctx, "Luigi_%", "hash"); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := repo.List(ctx, "")
+	if err != nil || len(all) != 2 {
+		t.Fatalf("List vuota = %d, %v; attesi 2", len(all), err)
+	}
+
+	byName, err := repo.List(ctx, "ari")
+	if err != nil || len(byName) != 1 || byName[0].Username != "Mario" {
+		t.Fatalf("ricerca case-insensitive = %+v, %v", byName, err)
+	}
+	byID, err := repo.List(ctx, mario.ID)
+	if err != nil || len(byID) != 1 || byID[0].ID != mario.ID {
+		t.Fatalf("ricerca per ID = %+v, %v", byID, err)
+	}
+	// % e _ devono essere letterali, non metacaratteri LIKE.
+	literalPct, err := repo.List(ctx, "%")
+	if err != nil || len(literalPct) != 1 || literalPct[0].Username != "Luigi_%" {
+		t.Fatalf("ricerca %% letterale = %+v, %v", literalPct, err)
+	}
+
+	if err := repo.SetRateLimitExempt(ctx, mario.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err := repo.GetAccountStatus(ctx, mario.ID)
+	if err != nil || !found || !status.RateLimitExempt || status.Blocked {
+		t.Fatalf("status dopo esenzione = %+v, found=%v, err=%v", status, found, err)
+	}
+	got, err := repo.GetByID(ctx, mario.ID)
+	if err != nil || got == nil || !got.RateLimitExempt || got.BlockedAt != nil {
+		t.Fatalf("GetByID dopo esenzione = %+v, %v", got, err)
+	}
+
+	if err := repo.SetBlocked(ctx, mario.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	status, found, err = repo.GetAccountStatus(ctx, mario.ID)
+	if err != nil || !found || !status.Blocked {
+		t.Fatalf("status dopo blocco = %+v, found=%v, err=%v", status, found, err)
+	}
+	got, err = repo.GetByUsername(ctx, "Mario")
+	if err != nil || got == nil || got.BlockedAt == nil {
+		t.Fatalf("GetByUsername dopo blocco = %+v, %v", got, err)
+	}
+
+	if err := repo.SetBlocked(ctx, mario.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	status, _, _ = repo.GetAccountStatus(ctx, mario.ID)
+	if status.Blocked {
+		t.Fatal("account ancora bloccato dopo lo sblocco")
+	}
+
+	if err := repo.SetBlocked(ctx, "inesistente", true); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("blocco utente inesistente = %v, atteso sql.ErrNoRows", err)
 	}
 }
