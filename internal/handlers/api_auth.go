@@ -3,6 +3,7 @@ package handlers
 import (
 	"log"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -52,18 +53,30 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	start := time.Now()
-
 	var req models.LoginRequest
 	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
+
+	// Il floor parte DOPO la lettura del body: un client lento non deve poter
+	// consumare il tempo minimo e rendere osservabile la differenza tra un
+	// utente esistente (bcrypt) e uno inesistente (solo query).
+	start := time.Now()
+
 	// Username: solo trim, il case è significativo. Un username vuoto o più
 	// lungo del massimo non può esistere: stessa risposta e stessa latenza di
 	// "credenziali errate", senza toccare il DB.
 	username := auth.LoginUsername(req.Username)
 	if username == "" || req.Password == "" {
 		writeJSONError(w, http.StatusBadRequest, "username e password sono obbligatori")
+		return
+	}
+	// Il driver libSQL converte le stringhe in C string: un NUL verrebbe
+	// troncato e "mario\x00x" autenticherebbe "mario". Il regex di creazione
+	// lo impedisce, ma il login non passa da NormalizeUsername.
+	if strings.IndexByte(username, 0) >= 0 {
+		sleepUntilMinResponseTime(start)
+		writeJSONError(w, http.StatusUnauthorized, "credenziali non valide")
 		return
 	}
 	if utf8.RuneCountInString(username) > auth.MaxUsernameLen || len(req.Password) > auth.MaxPasswordBytes {

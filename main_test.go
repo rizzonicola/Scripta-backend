@@ -154,6 +154,15 @@ func TestLoginRequiresExactUsernameCase(t *testing.T) {
 	}
 }
 
+func TestLoginRejectsEmbeddedNUL(t *testing.T) {
+	e := newEnv(t)
+	code, body, _ := e.do("POST", "/api/v1/auth/login", "",
+		map[string]string{"username": "mario\x00ignored", "password": "password-di-prova"}, nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("login con NUL: %d %s, atteso 401", code, body)
+	}
+}
+
 func TestLoginSQLInjectionAttemptFails(t *testing.T) {
 	e := newEnv(t)
 	code, body, _ := e.do("POST", "/api/v1/auth/login", "",

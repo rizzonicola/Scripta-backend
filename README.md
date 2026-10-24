@@ -144,6 +144,18 @@ Il token va incluso in tutte le chiamate successive come:
 Authorization: Bearer <token>
 ```
 
+> **Upgrade e rollback.** Il passaggio al login case-sensitive rimuove l'indice
+> `idx_users_username_nocase`. Prima di tornare a una versione precedente,
+> verificare che non esistano account che differiscono solo per il case:
+> ```sql
+> SELECT username, COUNT(*) FROM users
+> GROUP BY username COLLATE NOCASE HAVING COUNT(*) > 1;
+> ```
+> Se la query restituisce righe, il vecchio binario non può ricreare l'indice e
+> la lookup case-insensitive diventa ambigua: ripristinare il backup
+> pre-upgrade invece di eseguire il rollback. Dopo l'upgrade gli utenti
+> esistenti devono usare il case originale con cui sono stati creati.
+
 ---
 
 ### 2. `POST /api/v1/sync`

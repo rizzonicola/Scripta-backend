@@ -229,14 +229,17 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	if err != nil {
 		return nil, err
 	}
-	loginRateLimit := middleware.RateLimit(0.5, 5, ips)
+	// Bucket separati: saturare il login pubblico non deve bloccare la
+	// dashboard admin (e viceversa), soprattutto dietro NAT condivisi.
+	apiLoginRateLimit := middleware.RateLimit(0.5, 5, ips)
+	adminLoginRateLimit := middleware.RateLimit(0.5, 5, ips)
 	sameOrigin := middleware.RequireSameOrigin
 
 	mux := http.NewServeMux()
 
 	// --- Dashboard Admin (login form-based + cookie di sessione) ---
 	adminAuth := middleware.SessionAuthAdmin(adminSessions)
-	mux.HandleFunc("/admin/login", adminLoginDispatch(adminHandler, chain(loginRateLimit, sameOrigin)))
+	mux.HandleFunc("/admin/login", adminLoginDispatch(adminHandler, chain(adminLoginRateLimit, sameOrigin)))
 	mux.Handle("/admin/logout", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.Logout))))
 	mux.Handle("/admin", adminAuth(http.HandlerFunc(adminHandler.UsersPage)))
 	mux.Handle("/admin/users/create", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.CreateUser))))
@@ -244,7 +247,7 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	mux.Handle("/admin/users/delete", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.DeleteUser))))
 
 	// --- API pubbliche ---
-	mux.Handle("/api/v1/auth/login", loginRateLimit(http.HandlerFunc(authHandler.Login)))
+	mux.Handle("/api/v1/auth/login", apiLoginRateLimit(http.HandlerFunc(authHandler.Login)))
 
 	// --- API protette da JWT ---
 	requireJWT := middleware.RequireJWT(tm)
