@@ -451,6 +451,25 @@ var migrationStatements = []string{
 		expires_at INTEGER NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_revoked_tokens_exp ON revoked_tokens(expires_at)`,
+	// Refresh token opachi, uno per dispositivo. Il client conserva il valore
+	// in chiaro; qui vive solo l'hash SHA-256. La famiglia (family_id) è la
+	// catena nata da un singolo login: la rotazione sostituisce il token, il
+	// riuso di uno già ruotato revoca tutta la famiglia. ON DELETE CASCADE
+	// ripulisce i token quando l'utente viene eliminato; le revoche JWT
+	// restano invece senza FK per sopravvivere alla DELETE.
+	`CREATE TABLE IF NOT EXISTS refresh_tokens (
+		id          TEXT PRIMARY KEY,
+		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		family_id   TEXT NOT NULL,
+		token_hash  TEXT NOT NULL UNIQUE,
+		issued_at   INTEGER NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		revoked_at  INTEGER,
+		replaced_by TEXT
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_exp ON refresh_tokens(expires_at)`,
 	// Impostazioni globali del server gestite dalla dashboard admin. Riga
 	// unica (id = 1): oggi contiene solo l'interruttore del rate limit
 	// per-utente della sync, che parte ATTIVO anche sulle installazioni

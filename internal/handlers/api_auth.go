@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/google/uuid"
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
@@ -32,12 +35,22 @@ import (
 const minLoginResponseTime = 100 * time.Millisecond
 
 type AuthHandler struct {
-	Users  *db.UsersRepo
-	Tokens *auth.TokenManager
+	Users         *db.UsersRepo
+	Tokens        *auth.TokenManager
+	RefreshTokens *db.RefreshTokensRepo
+	RefreshTTL    time.Duration
 }
 
-func NewAuthHandler(users *db.UsersRepo, tokens *auth.TokenManager) *AuthHandler {
-	return &AuthHandler{Users: users, Tokens: tokens}
+func NewAuthHandler(users *db.UsersRepo, tokens *auth.TokenManager, refreshTokens *db.RefreshTokensRepo, refreshTTL time.Duration) *AuthHandler {
+	if refreshTTL <= 0 {
+		refreshTTL = 90 * 24 * time.Hour
+	}
+	return &AuthHandler{
+		Users:         users,
+		Tokens:        tokens,
+		RefreshTokens: refreshTokens,
+		RefreshTTL:    refreshTTL,
+	}
 }
 
 // maxLoginBodyBytes limita il body di login: username+password non superano
@@ -112,11 +125,150 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now()
+	refreshToken, _, refreshExpiresAt, err := h.createRefreshToken(r, user.ID, auth.NewRefreshFamilyID(), now)
+	if err != nil {
+		log.Printf("login: creazione refresh token fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, models.LoginResponse{
-		Token:     token,
-		ExpiresAt: expiresAt,
+		Token:            token,
+		ExpiresAt:        expiresAt,
+		RefreshToken:     refreshToken,
+		RefreshExpiresAt: refreshExpiresAt.Unix(),
+		UserID:           user.ID,
+		Username:         user.Username,
+	})
+}
+
+// createRefreshToken genera e persiste un nuovo refresh token nella famiglia
+// indicata. Restituisce anche il valore in chiaro (da consegnare al client) e
+// la scadenza.
+func (h *AuthHandler) createRefreshToken(r *http.Request, userID, familyID string, now time.Time) (string, string, time.Time, error) {
+	raw, hash, err := auth.NewRefreshToken()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	expiresAt := now.Add(h.RefreshTTL)
+	id := uuid.NewString()
+	err = h.RefreshTokens.Create(r.Context(), db.RefreshToken{
+		ID:        id,
+		UserID:    userID,
+		FamilyID:  familyID,
+		TokenHash: hash,
+		IssuedAt:  now.UnixMilli(),
+		ExpiresAt: expiresAt.UnixMilli(),
+	})
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	return raw, id, expiresAt, nil
+}
+
+// Refresh gestisce POST /api/v1/auth/refresh. Ruota il refresh token: ogni
+// valore è monouso. Il riuso di un token già ruotato revoca l'intera
+// famiglia, perché significa che una copia è finita nelle mani sbagliate.
+func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		return
+	}
+
+	var req models.RefreshRequest
+	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
+		return
+	}
+	raw := strings.TrimSpace(req.RefreshToken)
+	if raw == "" {
+		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		return
+	}
+
+	current, err := h.RefreshTokens.GetByHash(r.Context(), auth.HashRefreshToken(raw))
+	if err != nil {
+		log.Printf("refresh: lettura token fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		return
+	}
+	if current == nil {
+		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		return
+	}
+
+	now := time.Now()
+	if current.RevokedAt != nil || current.ReplacedBy != nil || current.ExpiresAt <= now.UnixMilli() {
+		// Riuso (o token scaduto): la famiglia non è più affidabile.
+		if err := h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now); err != nil {
+			log.Printf("refresh: revoca famiglia dopo riuso fallita: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "errore interno")
+			return
+		}
+		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		return
+	}
+
+	user, err := h.Users.GetByID(r.Context(), current.UserID)
+	if err != nil {
+		log.Printf("refresh: lettura utente fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		return
+	}
+	if user == nil {
+		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
+		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		return
+	}
+	if user.BlockedAt != nil {
+		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
+		writeJSONErrorCode(w, http.StatusForbidden,
+			"account bloccato dall'amministratore", "account_blocked")
+		return
+	}
+	if h.Tokens.IsUserRevoked(current.UserID, time.UnixMilli(current.IssuedAt)) {
+		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
+		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		return
+	}
+
+	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione del token")
+		return
+	}
+
+	nextRaw, nextHash, err := auth.NewRefreshToken()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
+		return
+	}
+	next := db.RefreshToken{
+		ID:        uuid.NewString(),
 		UserID:    user.ID,
-		Username:  user.Username,
+		FamilyID:  current.FamilyID,
+		TokenHash: nextHash,
+		IssuedAt:  now.UnixMilli(),
+		ExpiresAt: now.Add(h.RefreshTTL).UnixMilli(),
+	}
+	if err := h.RefreshTokens.Rotate(r.Context(), current.ID, next, now); err != nil {
+		if errors.Is(err, db.ErrRefreshTokenInactive) {
+			_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
+			writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+			return
+		}
+		log.Printf("refresh: rotazione fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, models.LoginResponse{
+		Token:            token,
+		ExpiresAt:        expiresAt,
+		RefreshToken:     nextRaw,
+		RefreshExpiresAt: next.ExpiresAt / 1000,
+		UserID:           user.ID,
+		Username:         user.Username,
 	})
 }
 
@@ -140,14 +292,76 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
+	// Il logout non passa da RequireJWT: deve funzionare anche quando
+	// l'access token è scaduto, purché il client presenti il refresh token
+	// della famiglia. La presenza di uno dei due è la credenziale.
+	var claims *auth.Claims
+	if header := r.Header.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
+		claims, _ = h.Tokens.ParseToken(strings.TrimPrefix(header, "Bearer "))
+	}
+
+	var req models.LogoutRequest
+	if !decodeOptionalJSONBody(w, r, &req, maxLoginBodyBytes) {
+		return
+	}
+
+	var current *db.RefreshToken
+	if raw := strings.TrimSpace(req.RefreshToken); raw != "" {
+		rt, err := h.RefreshTokens.GetByHash(r.Context(), auth.HashRefreshToken(raw))
+		if err != nil {
+			log.Printf("logout: lettura refresh token fallita: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "impossibile revocare la sessione")
+			return
+		}
+		current = rt
+	}
+
+	if claims == nil && current == nil {
+		writeJSONErrorCode(w, http.StatusUnauthorized, "utente non autenticato", "invalid_token")
+		return
+	}
+
+	// Un access token valido non deve poter revocare la famiglia di un altro
+	// utente presentando un refresh token che non gli appartiene. Senza
+	// access token (scaduto) il possesso del refresh token è sufficiente.
+	if current != nil && (claims == nil || current.UserID == claims.UserID) {
+		if err := h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, time.Now()); err != nil {
+			log.Printf("logout: revoca famiglia fallita: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "impossibile revocare la sessione")
+			return
+		}
+	}
+	if claims != nil {
+		if err := h.Tokens.RevokeToken(r.Context(), claims); err != nil {
+			log.Printf("logout: revoca token fallita: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "impossibile revocare il token")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// LogoutAll gestisce POST /api/v1/auth/logout-all: chiude tutte le sessioni
+// dell'utente, su ogni dispositivo, incluso quello corrente.
+func (h *AuthHandler) LogoutAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		return
+	}
 	claims, ok := middleware.ClaimsFromContext(r.Context())
 	if !ok {
 		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
 		return
 	}
-	if err := h.Tokens.RevokeToken(r.Context(), claims); err != nil {
-		log.Printf("logout: revoca token fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "impossibile revocare il token")
+	now := time.Now()
+	if err := h.RefreshTokens.RevokeAllForUser(r.Context(), claims.UserID, now); err != nil {
+		log.Printf("logout-all: revoca refresh token fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "impossibile revocare le sessioni")
+		return
+	}
+	if err := h.Tokens.RevokeUser(r.Context(), claims.UserID); err != nil {
+		log.Printf("logout-all: revoca JWT fallita: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "impossibile revocare le sessioni")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

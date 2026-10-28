@@ -72,3 +72,29 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, max
 	}
 	return true
 }
+
+// decodeOptionalJSONBody è come decodeJSONBody ma accetta anche un body
+// vuoto. Serve al logout: i client precedenti non inviano alcun body, quelli
+// nuovi possono inviare il refresh token per revocare la famiglia.
+func decodeOptionalJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
+		} else {
+			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		}
+		return false
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		return false
+	}
+	return true
+}

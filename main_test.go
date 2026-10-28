@@ -93,15 +93,25 @@ func (e *testEnv) do(method, path, token string, body any, hdr map[string]string
 
 func (e *testEnv) login(username string) string {
 	e.t.Helper()
+	token, _ := e.loginTokens(username)
+	return token
+}
+
+func (e *testEnv) loginTokens(username string) (string, string) {
+	e.t.Helper()
 	code, body, _ := e.do("POST", "/api/v1/auth/login", "", map[string]string{"username": username, "password": "password-di-prova"}, nil)
 	if code != 200 {
 		e.t.Fatalf("login %q: %d %s", username, code, body)
 	}
 	var r struct {
-		Token string `json:"token"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	_ = json.Unmarshal(body, &r)
-	return r.Token
+	if r.Token == "" || r.RefreshToken == "" {
+		e.t.Fatalf("login senza token/refresh token: %s", body)
+	}
+	return r.Token, r.RefreshToken
 }
 
 type syncResp struct {
@@ -356,6 +366,166 @@ func TestLogoutRevokesTokenAndPersists(t *testing.T) {
 	}
 	if !tm2.IsRevoked(claims) {
 		t.Fatal("la revoca non è sopravvissuta al riavvio")
+	}
+}
+
+func TestRefreshRotatesAndReuseRevokesFamily(t *testing.T) {
+	e := newEnv(t)
+	access, refresh := e.loginTokens("mario")
+
+	code, body, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("refresh: %d %s", code, body)
+	}
+	var r struct {
+		Token            string `json:"token"`
+		RefreshToken     string `json:"refresh_token"`
+		ExpiresAt        int64  `json:"expires_at"`
+		RefreshExpiresAt int64  `json:"refresh_expires_at"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Token == "" || r.RefreshToken == "" || r.RefreshToken == refresh || r.Token == access {
+		t.Fatalf("rotazione non avvenuta: %s", body)
+	}
+	if r.ExpiresAt <= time.Now().Unix() || r.RefreshExpiresAt <= r.ExpiresAt {
+		t.Fatalf("scadenze non valide: %+v", r)
+	}
+	if code, _, _ := e.sync(r.Token, 0, nil, nil); code != http.StatusOK {
+		t.Fatalf("nuovo access token non valido: %d", code)
+	}
+
+	// Il riuso del token già consumato è un segnale di furto: revoca la famiglia.
+	code, body, _ = e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("riuso: %d %s", code, body)
+	}
+	code, body, _ = e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": r.RefreshToken}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("famiglia non revocata: %d %s", code, body)
+	}
+}
+
+func TestRefreshRejectsUnknownToken(t *testing.T) {
+	e := newEnv(t)
+	code, body, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": "sconosciuto"}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("refresh sconosciuto: %d %s", code, body)
+	}
+}
+
+func TestLogoutRevokesRefreshFamily(t *testing.T) {
+	e := newEnv(t)
+	access, refresh := e.loginTokens("mario")
+
+	code, body, _ := e.do("POST", "/api/v1/auth/logout", access, map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("logout: %d %s", code, body)
+	}
+	if code, _, _ := e.sync(access, 0, nil, nil); code != http.StatusUnauthorized {
+		t.Fatalf("access token ancora valido: %d", code)
+	}
+	code, body, _ = e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("refresh token ancora valido: %d %s", code, body)
+	}
+}
+
+func TestLogoutWorksWithExpiredAccessToken(t *testing.T) {
+	e := newEnv(t)
+	_, refresh := e.loginTokens("mario")
+
+	code, body, _ := e.do("POST", "/api/v1/auth/logout", "", map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("logout con solo refresh: %d %s", code, body)
+	}
+	if code, _, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil); code != http.StatusUnauthorized {
+		t.Fatalf("refresh token non revocato: %d", code)
+	}
+}
+
+func TestLogoutAllRevokesEveryFamilyAndAccessToken(t *testing.T) {
+	e := newEnv(t)
+	accessA, refreshA := e.loginTokens("mario")
+	accessB, refreshB := e.loginTokens("mario")
+
+	code, body, _ := e.do("POST", "/api/v1/auth/logout-all", accessA, nil, nil)
+	if code != http.StatusOK {
+		t.Fatalf("logout-all: %d %s", code, body)
+	}
+	for name, tok := range map[string]string{"A": accessA, "B": accessB} {
+		if code, _, _ := e.sync(tok, 0, nil, nil); code != http.StatusUnauthorized {
+			t.Fatalf("access token %s ancora valido: %d", name, code)
+		}
+	}
+	for name, tok := range map[string]string{"A": refreshA, "B": refreshB} {
+		if code, _, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": tok}, nil); code != http.StatusUnauthorized {
+			t.Fatalf("refresh token %s ancora valido: %d", name, code)
+		}
+	}
+}
+
+func TestAdminBlockRevokesRefreshFamily(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	user, _ := e.users.GetByUsername(ctx, "mario")
+	_, refresh := e.loginTokens("mario")
+	cookie := e.adminCookie()
+
+	if code, _ := e.doAdmin("POST", "/admin/users/block", cookie, url.Values{"user_id": {user.ID}, "blocked": {"1"}}); code != http.StatusSeeOther {
+		t.Fatalf("blocco: %d", code)
+	}
+	code, body, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("famiglia sopravvissuta al blocco: %d %s", code, body)
+	}
+
+	if code, _ := e.doAdmin("POST", "/admin/users/block", cookie, url.Values{"user_id": {user.ID}, "blocked": {"0"}}); code != http.StatusSeeOther {
+		t.Fatalf("sblocco: %d", code)
+	}
+	code, body, _ = e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("famiglia tornata valida dopo lo sblocco: %d %s", code, body)
+	}
+}
+
+func TestAdminResetPasswordRevokesRefreshFamily(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	user, _ := e.users.GetByUsername(ctx, "mario")
+	access, refresh := e.loginTokens("mario")
+	cookie := e.adminCookie()
+
+	code, _ := e.doAdmin("POST", "/admin/users/reset-password", cookie, url.Values{
+		"user_id": {user.ID}, "new_password": {"nuova-password-lunga"},
+	})
+	if code != http.StatusSeeOther {
+		t.Fatalf("reset password: %d", code)
+	}
+	if code, _, _ := e.sync(access, 0, nil, nil); code != http.StatusUnauthorized {
+		t.Fatalf("access token ancora valido dopo il reset: %d", code)
+	}
+	if code, _, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil); code != http.StatusUnauthorized {
+		t.Fatalf("refresh token ancora valido dopo il reset: %d", code)
+	}
+}
+
+func TestAdminDeleteRevokesRefreshFamily(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	user, _ := e.users.GetByUsername(ctx, "mario")
+	access, refresh := e.loginTokens("mario")
+	cookie := e.adminCookie()
+
+	if code, _ := e.doAdmin("POST", "/admin/users/delete", cookie, url.Values{"user_id": {user.ID}}); code != http.StatusSeeOther {
+		t.Fatalf("eliminazione: %d", code)
+	}
+	if code, _, _ := e.sync(access, 0, nil, nil); code != http.StatusUnauthorized {
+		t.Fatalf("access token ancora valido dopo l'eliminazione: %d", code)
+	}
+	if code, _, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil); code != http.StatusUnauthorized {
+		t.Fatalf("refresh token ancora valido dopo l'eliminazione: %d", code)
 	}
 }
 

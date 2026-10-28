@@ -157,6 +157,19 @@ func (tm *TokenManager) IsRevoked(c *Claims) bool {
 	return false
 }
 
+// IsUserRevoked indica se un token emesso a issuedAt è coperto da una revoca
+// per utente (reset password, blocco, cancellazione, logout-all). Serve ai
+// refresh token: non sono JWT e quindi non passano da IsRevoked.
+func (tm *TokenManager) IsUserRevoked(userID string, issuedAt time.Time) bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	t, ok := tm.userRevoked[userID]
+	if !ok {
+		return false
+	}
+	return !issuedAt.After(t)
+}
+
 // PurgeExpired rimuove dalla cache e dal DB le revoche ormai irrilevanti.
 func (tm *TokenManager) PurgeExpired(ctx context.Context) {
 	now := time.Now()

@@ -85,7 +85,8 @@ Il volume Docker `notes-data` persiste il database SQLite (utenti, cartelle e no
 |-------------------|-------------------------|------------------------------------------------|
 | `DB_PATH`         | `data/app.db`           | Percorso file SQLite (contiene TUTTI i dati: utenti, cartelle, note) |
 | `JWT_SECRET`      | **obbligatorio** (≥32 car.) | Chiave HMAC per firma JWT. Nessun default: valori mancanti/d'esempio bloccano l'avvio |
-| `JWT_TTL`         | `24h`                   | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `720h`). Massimo `720h` (30 giorni): oltre, l'avvio viene rifiutato perché supererebbe la retention delle revoche. Vuota o non valida = default |
+| `JWT_TTL`         | `1h`                    | Durata di validità dei JWT utente (formato Go `time.Duration`, es. `12h`, `720h`). Massimo `720h` (30 giorni): oltre, l'avvio viene rifiutato perché supererebbe la retention delle revoche. Vuota o non valida = default |
+| `REFRESH_TOKEN_TTL` | `2160h` (90 giorni)   | Durata del refresh token, sliding: ogni refresh emette un nuovo token con scadenza rinnovata. Vuota o non valida = default |
 | `SYNC_MAX_BODY_BYTES` | `67108864` (64 MiB) | Tetto sul corpo di `POST /api/v1/sync`; oltre risponde `413` |
 | `ADMIN_SESSION_TTL` | `8h`                  | Durata del cookie di sessione admin (`time.Duration`) |
 | `ADMIN_USER`      | **obbligatorio**        | Username login dashboard `/admin`             |
@@ -368,9 +369,12 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
   un rifiuto (`422`) o un errore annulla tutto il batch.
 - **Nessun file su disco**: il contenuto delle note è nella colonna `notes.content`; non ci sono
   percorsi testuali, quindi nemmeno il rischio di path traversal.
-- **JWT**: firma HMAC-SHA256, scadenza di default 24 ore (`JWT_TTL`), claims con
+- **JWT**: firma HMAC-SHA256, scadenza di default 1 ora (`JWT_TTL`), claims con
   `uid` (ID utente), `username` e `iat_ms` (istante di emissione al millisecondo,
-  usato per il confronto con le revoche).
+  usato per il confronto con le revoche). Il refresh token opaco (90 giorni
+  sliding, `REFRESH_TOKEN_TTL`) viene ruotato a ogni uso; il riuso di un token
+  già consumato revoca l'intera famiglia. Endpoint: `POST /api/v1/auth/refresh`,
+  `POST /api/v1/auth/logout`, `POST /api/v1/auth/logout-all`.
 
 
 ## Note di sicurezza e sincronizzazione (v2.1)
@@ -378,7 +382,9 @@ Protetta da un login form-based (`ADMIN_USER` / `ADMIN_PASS`) con cookie di sess
 - **Cursore di pull server-side**: ogni riga ha `synced_at`, assegnato dal server con uno stamp monotono. Il massimo stamp emesso è persistito (tabella `sync_state`, con un margine di 60 s, scrittura al massimo una volta al minuto): dopo un riavvio con l'orologio indietro i nuovi stamp restano comunque maggiori di ogni cursore già consegnato. Il pull filtra solo su `synced_at`; `updated_at` (orologio del client) serve unicamente alla risoluzione LWW. Timestamp del client oltre *ora + 5 min* vengono riportati all'ora del server.
 - **Rifiuti espliciti**: un `folder_id`/`parent_id` non valido produce `422` con l'elenco `rejected` e rollback dell'intero batch; il client non riceve `server_time` e non avanza il cursore.
 - **Tombstone**: purge dopo 30 giorni dall'accettazione sul server (`synced_at`). Un client con cursore più vecchio riceve `full_resync: true` (stato completo) e ripulisce i residui locali.
-- **Revoca token persistente** (`user_token_revocations`, `revoked_tokens`) + `POST /api/v1/auth/logout`.
+- **Revoca token persistente** (`user_token_revocations`, `revoked_tokens`,
+  `refresh_tokens`) + `POST /api/v1/auth/logout`, `POST /api/v1/auth/logout-all`.
+  Blocco, reset password ed eliminazione utente revocano anche le famiglie refresh.
 - **Rate limit**: login basato sull'IP del peer; sync basata sull'utente autenticato
   (2 req/s, burst 60), con toggle globale ed esenzioni per-utente gestiti da
   `/admin`. Header di inoltro creduti solo da `TRUSTED_PROXIES`.

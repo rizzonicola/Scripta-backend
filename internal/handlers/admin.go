@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -20,10 +21,11 @@ import (
 )
 
 type AdminHandler struct {
-	Users    *db.UsersRepo
-	Tokens   *auth.TokenManager        // per revocare i JWT utente su reset password / cancellazione
-	Sessions *auth.AdminSessionManager // firma/valida il cookie di sessione della dashboard
-	Settings *db.ServerSettingsRepo    // toggle globale del rate limit
+	Users         *db.UsersRepo
+	Tokens        *auth.TokenManager        // per revocare i JWT utente su reset password / cancellazione
+	RefreshTokens *db.RefreshTokensRepo     // per revocare le famiglie refresh sugli stessi eventi
+	Sessions      *auth.AdminSessionManager // firma/valida il cookie di sessione della dashboard
+	Settings      *db.ServerSettingsRepo    // toggle globale del rate limit
 
 	adminUser string
 	adminPass string
@@ -40,20 +42,36 @@ const adminSessionCookiePath = "/admin"
 // Cartelle e note vivono interamente nel database: cancellare un utente è
 // una singola operazione a DB, propagata dalle foreign key ON DELETE CASCADE
 // (che restano attive su ogni connessione: vedi internal/db/db.go).
-func NewAdminHandler(users *db.UsersRepo, tokens *auth.TokenManager, sessions *auth.AdminSessionManager, settings *db.ServerSettingsRepo, adminUser, adminPass string, templatesFS embed.FS) (*AdminHandler, error) {
+func NewAdminHandler(users *db.UsersRepo, tokens *auth.TokenManager, refreshTokens *db.RefreshTokensRepo, sessions *auth.AdminSessionManager, settings *db.ServerSettingsRepo, adminUser, adminPass string, templatesFS embed.FS) (*AdminHandler, error) {
 	tmpl, err := template.ParseFS(templatesFS, "web/templates/*.html")
 	if err != nil {
 		return nil, err
 	}
 	return &AdminHandler{
-		Users:     users,
-		Tokens:    tokens,
-		Sessions:  sessions,
-		Settings:  settings,
-		adminUser: adminUser,
-		adminPass: adminPass,
-		tmpl:      tmpl,
+		Users:         users,
+		Tokens:        tokens,
+		RefreshTokens: refreshTokens,
+		Sessions:      sessions,
+		Settings:      settings,
+		adminUser:     adminUser,
+		adminPass:     adminPass,
+		tmpl:          tmpl,
 	}, nil
+}
+
+// revokeUserSessions invalida sia i JWT sia le famiglie refresh dell'utente.
+// Le due revoche sono indipendenti: se la prima fallisce non si tenta la
+// seconda, così il chiamante può annullare l'operazione pericolosa.
+func (h *AdminHandler) revokeUserSessions(ctx context.Context, userID string) error {
+	if h.RefreshTokens != nil {
+		if err := h.RefreshTokens.RevokeAllForUser(ctx, userID, time.Now()); err != nil {
+			return err
+		}
+	}
+	if h.Tokens != nil {
+		return h.Tokens.RevokeUser(ctx, userID)
+	}
+	return nil
 }
 
 // constantTimeEqual confronta due stringhe in tempo costante rispetto sia al
@@ -414,23 +432,19 @@ func (h *AdminHandler) SetUserBlocked(w http.ResponseWriter, r *http.Request) {
 			redirectAdminFlash(w, r, "user_update_failed")
 			return
 		}
-		if h.Tokens != nil {
-			if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
-				log.Printf("admin: revoca token dopo il blocco di %s: %v", userID, err)
-				redirectAdminFlash(w, r, "block_revoke_warning")
-				return
-			}
+		if err := h.revokeUserSessions(r.Context(), userID); err != nil {
+			log.Printf("admin: revoca sessioni dopo il blocco di %s: %v", userID, err)
+			redirectAdminFlash(w, r, "block_revoke_warning")
+			return
 		}
 		redirectAdminFlash(w, r, "user_blocked")
 		return
 	}
 
-	if h.Tokens != nil {
-		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
-			log.Printf("admin: revoca token prima dello sblocco di %s: %v", userID, err)
-			redirectAdminFlash(w, r, "block_revoke_warning")
-			return
-		}
+	if err := h.revokeUserSessions(r.Context(), userID); err != nil {
+		log.Printf("admin: revoca sessioni prima dello sblocco di %s: %v", userID, err)
+		redirectAdminFlash(w, r, "block_revoke_warning")
+		return
 	}
 	if err := h.Users.SetBlocked(r.Context(), userID, false); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -550,12 +564,10 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	// persistente fallisce, l'operazione pericolosa non avviene e i vecchi
 	// token restano validi (come prima del reset), invece di restare
 	// validi nella sola RAM fino al prossimo riavvio.
-	if h.Tokens != nil {
-		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
-			log.Printf("admin: revoca token prima del reset non riuscita (utente %s): %v", userID, err)
-			redirectAdminFlash(w, r, "reset_revoke_failed")
-			return
-		}
+	if err := h.revokeUserSessions(r.Context(), userID); err != nil {
+		log.Printf("admin: revoca sessioni prima del reset non riuscita (utente %s): %v", userID, err)
+		redirectAdminFlash(w, r, "reset_revoke_failed")
+		return
 	}
 
 	if err := h.Users.UpdatePassword(r.Context(), userID, hash); err != nil {
@@ -606,12 +618,10 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	// l'amministratore può ritentare. Dopo la DELETE non ci sarebbe più una
 	// riga utente a cui riferirsi e un fallimento lascerebbe token validi
 	// senza un percorso di recupero.
-	if h.Tokens != nil {
-		if err := h.Tokens.RevokeUser(r.Context(), userID); err != nil {
-			log.Printf("admin: revoca token prima dell'eliminazione non riuscita (utente %s): %v", userID, err)
-			redirectAdminFlash(w, r, "delete_revoke_failed")
-			return
-		}
+	if err := h.revokeUserSessions(r.Context(), userID); err != nil {
+		log.Printf("admin: revoca sessioni prima dell'eliminazione non riuscita (utente %s): %v", userID, err)
+		redirectAdminFlash(w, r, "delete_revoke_failed")
+		return
 	}
 
 	if err := h.Users.Delete(r.Context(), userID); err != nil {

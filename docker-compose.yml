@@ -20,10 +20,12 @@ services:
       # IP/CIDR dei reverse proxy fidati (separati da virgola). Solo da questi
       # peer vengono creduti Cf-Connecting-IP / X-Forwarded-For. Vuoto = mai.
       TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
-      # Durata del token di accesso (formato Go, es. 24h, 720h). Vuoto = default
-      # del server (24h). Un TTL lungo evita re-login frequenti e non indebolisce
-      # la revoca: logout e reset password invalidano i token subito.
+      # Durata del token di accesso (formato Go, es. 1h, 720h). Vuoto = default
+      # del server (1h). Il refresh token evita i re-login frequenti; logout e
+      # reset password invalidano subito access e refresh token.
       JWT_TTL: "${JWT_TTL:-}"
+      # Durata del refresh token (default 2160h = 90 giorni, sliding).
+      REFRESH_TOKEN_TTL: "${REFRESH_TOKEN_TTL:-}"
       # Durata del cookie della dashboard admin (default 8h). Vuoto = default.
       ADMIN_SESSION_TTL: "${ADMIN_SESSION_TTL:-}"
       # Tetto del body di POST /api/v1/sync in byte (default 64 MiB). Senza

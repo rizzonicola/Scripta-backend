@@ -207,10 +207,26 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
-// LoginResponse è la risposta di POST /api/v1/auth/login.
+// LoginResponse è la risposta di POST /api/v1/auth/login e
+// POST /api/v1/auth/refresh. I campi token/expires_at restano invariati per
+// i client esistenti; refresh_token/refresh_expires_at sono additivi.
 type LoginResponse struct {
-	Token     string `json:"token"`
-	ExpiresAt int64  `json:"expires_at"`
-	UserID    string `json:"user_id"`
-	Username  string `json:"username"`
+	Token            string `json:"token"`
+	ExpiresAt        int64  `json:"expires_at"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
+	RefreshExpiresAt int64  `json:"refresh_expires_at,omitempty"`
+	UserID           string `json:"user_id"`
+	Username         string `json:"username"`
+}
+
+// RefreshRequest è il body di POST /api/v1/auth/refresh.
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// LogoutRequest è il body opzionale di POST /api/v1/auth/logout. Se il client
+// invia il refresh token, il logout revoca l'intera famiglia del dispositivo
+// anche quando l'access token è già scaduto.
+type LogoutRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }

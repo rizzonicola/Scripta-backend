@@ -93,6 +93,7 @@ type config struct {
 	AdminPass       string
 	Port            string
 	JWTTTL          time.Duration
+	RefreshTTL      time.Duration
 	AdminSessionTTL time.Duration
 	TrustedProxies  []string
 	SyncMaxBody     int64
@@ -132,7 +133,8 @@ func loadConfig() (config, error) {
 		AdminUser:       os.Getenv("ADMIN_USER"),
 		AdminPass:       os.Getenv("ADMIN_PASS"),
 		Port:            getEnv("PORT", "8080"),
-		JWTTTL:          24 * time.Hour,
+		JWTTTL:          1 * time.Hour,
+		RefreshTTL:      90 * 24 * time.Hour,
 		AdminSessionTTL: 8 * time.Hour,
 		TrustedProxies:  middleware.ParseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
 		TursoURL:        os.Getenv("TURSO_SYNC_URL"),
@@ -168,6 +170,7 @@ func loadConfig() (config, error) {
 		}
 	}
 	parseDur("JWT_TTL", &c.JWTTTL)
+	parseDur("REFRESH_TOKEN_TTL", &c.RefreshTTL)
 	parseDur("ADMIN_SESSION_TTL", &c.AdminSessionTTL)
 	parseDur("TURSO_SYNC_INTERVAL", &c.TursoInterval)
 
@@ -207,14 +210,15 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	notesRepo := db.NewNotesRepo(sqlDB)
 	settingsRepo := db.NewSettingsRepo(sqlDB)
 	serverSettingsRepo := db.NewServerSettingsRepo(sqlDB)
+	refreshTokensRepo := db.NewRefreshTokensRepo(sqlDB)
 
 	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminSessionTTL)
 
-	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, adminSessions, serverSettingsRepo, cfg.AdminUser, cfg.AdminPass, templatesFS)
+	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, refreshTokensRepo, adminSessions, serverSettingsRepo, cfg.AdminUser, cfg.AdminPass, templatesFS)
 	if err != nil {
 		return nil, fmt.Errorf("caricamento template admin: %w", err)
 	}
-	authHandler := handlers.NewAuthHandler(usersRepo, tm)
+	authHandler := handlers.NewAuthHandler(usersRepo, tm, refreshTokensRepo, cfg.RefreshTTL)
 	syncHandler := handlers.NewSyncHandler(sqlDB)
 	if cfg.SyncMaxBody > 0 {
 		syncHandler.MaxBodyBytes = cfg.SyncMaxBody
@@ -257,10 +261,18 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 
 	// --- API pubbliche ---
 	mux.Handle("/api/v1/auth/login", apiLoginRateLimit(http.HandlerFunc(authHandler.Login)))
+	// Il refresh è pubblico perché deve funzionare anche con l'access token
+	// scaduto; il possesso del refresh token opaco è la credenziale. Non usa
+	// il rate limit del login (0.5 req/s) perché più dispositivi possono
+	// rinnovare quasi insieme.
+	mux.HandleFunc("/api/v1/auth/refresh", authHandler.Refresh)
+	// Il logout accetta un access token valido oppure il refresh token: deve
+	// chiudere la famiglia anche se l'access token è già scaduto.
+	mux.HandleFunc("/api/v1/auth/logout", authHandler.Logout)
 
 	// --- API protette da JWT ---
 	requireJWT := middleware.RequireJWT(tm, usersRepo)
-	mux.Handle("/api/v1/auth/logout", requireJWT(http.HandlerFunc(authHandler.Logout)))
+	mux.Handle("/api/v1/auth/logout-all", requireJWT(http.HandlerFunc(authHandler.LogoutAll)))
 	mux.Handle("/api/v1/sync", requireJWT(http.HandlerFunc(syncHandler.Sync)))
 	mux.Handle("/api/v1/notes/download", requireJWT(http.HandlerFunc(notesHandler.DownloadMarkdown)))
 	mux.Handle("/api/v1/user/settings", requireJWT(http.HandlerFunc(settingsDispatch(settingsHandler))))
@@ -307,7 +319,7 @@ func main() {
 	}
 
 	isLocalDB := cfg.TursoURL == ""
-	stopMaintenance := startTombstonePurgeLoop(rootCtx, tokenManager, db.NewNotesRepo(sqlDB), db.NewFoldersRepo(sqlDB), sqlDB, isLocalDB)
+	stopMaintenance := startTombstonePurgeLoop(rootCtx, tokenManager, db.NewNotesRepo(sqlDB), db.NewFoldersRepo(sqlDB), db.NewRefreshTokensRepo(sqlDB), sqlDB, isLocalDB)
 	// Ferma e attende la manutenzione PRIMA del defer sqlDB.Close() (i defer
 	// sono LIFO): senza questa attesa il checkpoint/purge potrebbe usare il
 	// pool mentre viene chiuso.
@@ -394,7 +406,7 @@ func tombstonePurgeCutoff(now time.Time) int64 {
 // chiudere il pool SQL, altrimenti un checkpoint in corso può usare una
 // connessione già chiusa. Non blocca mai l'avvio del server: eventuali errori
 // vengono solo loggati, il giro successivo riprova.
-func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, sqlDB *sql.DB, isLocalDB bool) func() {
+func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, refreshTokensRepo *db.RefreshTokensRepo, sqlDB *sql.DB, isLocalDB bool) func() {
 	ctx, cancel := context.WithCancel(ctx)
 	purgeAndReclaim := func() {
 		cutoff := tombstonePurgeCutoff(time.Now())
@@ -433,11 +445,18 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 		}
 	}
 
+	purgeExpiredTokens := func() {
+		tm.PurgeExpired(ctx)
+		if err := refreshTokensRepo.PurgeExpired(ctx, time.Now()); err != nil {
+			log.Printf("purge refresh token scaduti fallito: %v", err)
+		}
+	}
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		purgeAndReclaim()
-		tm.PurgeExpired(ctx)
+		purgeExpiredTokens()
 
 		purgeTicker := time.NewTicker(tombstonePurgeInterval)
 		defer purgeTicker.Stop()
@@ -450,7 +469,7 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 				return
 			case <-purgeTicker.C:
 				purgeAndReclaim()
-				tm.PurgeExpired(ctx)
+				purgeExpiredTokens()
 			case <-checkpointTicker.C:
 				checkpointOnly()
 			}
