@@ -105,7 +105,7 @@ Base URL: `http://<host>:8080/api/v1`
 
 Tutte le risposte sono in JSON (`Content-Type: application/json; charset=utf-8`), tranne il
 download delle note (`text/markdown; charset=utf-8`). Timestamp di sincronizzazione
-(`updated_at`, `deleted_at`, `last_synced_at`, `server_time`): **millisecondi** Unix.
+(`created_at`, `updated_at`, `deleted_at`, `last_synced_at`, `server_time`): **millisecondi** Unix.
 
 > **La fonte di verità è il codice** (`internal/handlers/api_sync.go`, `internal/models/models.go`),
 > non questo documento: se divergono, vale il codice.
@@ -182,7 +182,7 @@ risolvono **riga per riga** con **Last-Write-Wins** su `updated_at`.
     {
       "id": "n-1", "title": "Riunione", "content": "# Riunione\n\n...",
       "folder_id": "f-1", "is_favorite": false, "is_pinned": false, "order_index": 0,
-      "updated_at": 1756900000000, "deleted_at": null
+      "created_at": 1756800000000, "updated_at": 1756900000000, "deleted_at": null
     }
   ]
 }
@@ -196,6 +196,9 @@ risolvono **riga per riga** con **Last-Write-Wins** su `updated_at`.
 **Cosa fa il server** (in un'unica transazione):
 1. **Push**: per ogni elemento, upsert condizionato: ha effetto solo se `updated_at` del client è
    **≥** di quello memorizzato. Un `updated_at` oltre «adesso + 5 minuti» viene riportato all'ora del server.
+   Per le note, `created_at` assente (client precedenti) vale `updated_at` per una nota nuova; su una
+   nota già esistente il server conserva il `created_at` già noto. In ogni caso `created_at` non può
+   superare `updated_at`.
 2. **Cascata**: se una cartella risulta cancellata, la cancellazione si propaga a sottocartelle e note ancora attive.
 3. **Pull**: restituisce le entità dell'utente con `synced_at` in `(last_synced_at, server_time]`,
    calcolate **dopo** il push. Comprende quindi anche l'**eco** di ciò che il client ha appena inviato e,
@@ -217,7 +220,7 @@ genitore che non esiste né nel batch né sul server, o un ciclo fra cartelle nu
     {
       "id": "n-1", "title": "Riunione", "content": "# Riunione\n\n...",
       "folder_id": "f-1", "is_favorite": false, "is_pinned": false, "order_index": 0,
-      "updated_at": 1756900000000, "deleted_at": null
+      "created_at": 1756800000000, "updated_at": 1756900000000, "deleted_at": null
     }
   ],
   "caps": { "proto": 2 }

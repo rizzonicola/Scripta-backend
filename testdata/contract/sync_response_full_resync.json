@@ -9,7 +9,7 @@
     {
       "id": "n-1", "title": "Perché → già 😀", "content": "# Titolo\n\nTesto con «accenti» e 😀\n",
       "folder_id": "f-figlia", "is_favorite": true, "is_pinned": false, "order_index": 3,
-      "updated_at": 1700000000002, "deleted_at": null
+      "created_at": 1700000000000, "updated_at": 1700000000002, "deleted_at": null
     }
   ],
   "caps": { "proto": 2 }

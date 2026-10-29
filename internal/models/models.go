@@ -44,9 +44,14 @@ type Note struct {
 	IsFavorite bool
 	IsPinned   bool
 	OrderIndex int
-	UpdatedAt  int64  // unix millis UTC (orologio CLIENT), usato SOLO per la risoluzione LWW
-	SyncedAt   int64  // unix millis (orologio SERVER, monotono), usato SOLO come cursore di pull
-	DeletedAt  *int64 // nil = attiva; non-nil = soft-deleted (tombstone)
+	CreatedAt  int64 // unix millis UTC (orologio CLIENT), data di creazione modificabile
+	// CreatedAtProvided distingue un createdAt assente (client vecchio) da uno
+	// valorizzato: sul conflitto il primo preserva il valore già sul server,
+	// il secondo lo aggiorna come gli altri campi LWW.
+	CreatedAtProvided bool
+	UpdatedAt         int64  // unix millis UTC (orologio CLIENT), usato SOLO per la risoluzione LWW
+	SyncedAt          int64  // unix millis (orologio SERVER, monotono), usato SOLO come cursore di pull
+	DeletedAt         *int64 // nil = attiva; non-nil = soft-deleted (tombstone)
 }
 
 // FolderDTO è la rappresentazione JSON di una cartella scambiata durante la
@@ -70,6 +75,10 @@ type FolderDTO struct {
 // applicava comunque localmente la nota appena echeggiata dal server con
 // updated_at >= a quello locale, sovrascrivendo silenziosamente isPinned con
 // il default false. Vedi lo stesso commento in NoteChangeDto lato client.
+//
+// CreatedAt segue la stessa regola: è la data di creazione modificabile
+// dall'utente, non un valore immutabile. I client precedenti non lo inviano;
+// in quel caso il server usa UpdatedAt.
 type NoteDTO struct {
 	ID         string  `json:"id"`
 	Title      string  `json:"title"`
@@ -78,6 +87,7 @@ type NoteDTO struct {
 	IsFavorite bool    `json:"is_favorite"`
 	IsPinned   bool    `json:"is_pinned"`
 	OrderIndex int     `json:"order_index"`
+	CreatedAt  int64   `json:"created_at"`
 	UpdatedAt  int64   `json:"updated_at"`
 	DeletedAt  *int64  `json:"deleted_at"`
 }

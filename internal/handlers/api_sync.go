@@ -53,11 +53,11 @@ const TombstoneRetention = 30 * 24 * time.Hour
 const TombstonePurgeSafetyMargin = 5 * time.Minute
 
 // MaxClockSkew è la tolleranza massima accettata tra l'orologio del client e
-// quello del server: un updated_at/deleted_at che supera "adesso + 5 minuti"
-// non è una modifica reale ma un orologio sballato (o un tentativo di
-// "bloccare" una riga per sempre: con LWW un timestamp nel futuro vincerebbe
-// contro qualunque modifica legittima successiva). Il server lo CORREGGE
-// riportandolo all'istante corrente del server.
+// quello del server: un created_at/updated_at/deleted_at che supera "adesso +
+// 5 minuti" non è una modifica reale ma un orologio sballato (o un tentativo
+// di "bloccare" una riga per sempre: con LWW un timestamp nel futuro
+// vincerebbe contro qualunque modifica legittima successiva). Il server lo
+// CORREGGE riportandolo all'istante corrente del server.
 const MaxClockSkew = 5 * time.Minute
 
 // stampLease è di quanto l'high-water mark persistente supera lo stamp
@@ -216,6 +216,22 @@ func clampClientTime(ts, serverNow int64) (int64, bool) {
 	return ts, false
 }
 
+// normalizeNoteTimestamps applica le regole di createdAt/updatedAt ricevuti
+// dal client: timestamp non plausibili vengono riportati a serverNow, i client
+// precedenti (createdAt assente) usano updatedAt e createdAt non può mai
+// superare updatedAt.
+func normalizeNoteTimestamps(createdAt, updatedAt, serverNow int64) (int64, int64) {
+	updated, _ := clampClientTime(updatedAt, serverNow)
+	if createdAt <= 0 {
+		return updated, updated
+	}
+	created, _ := clampClientTime(createdAt, serverNow)
+	if created > updated {
+		created = updated
+	}
+	return created, updated
+}
+
 func validID(id string) bool {
 	if id == "" || len(id) > maxIDLen {
 		return false
@@ -295,9 +311,10 @@ func (h *SyncHandler) rateLimitApplies(ctx context.Context) bool {
 //     eseguita DOPO aver applicato push e cascata, include sia le modifiche
 //     remote di altri dispositivi sia l'esito (accettato o "server wins") di
 //     ciò che il client ha appena inviato.
-//  4. TIMESTAMP: updated_at/deleted_at del client oltre "adesso + 5 min"
-//     (MaxClockSkew) vengono riportati all'ora del server. updated_at serve
-//     SOLO alla risoluzione LWW, mai come cursore.
+//  4. TIMESTAMP: created_at/updated_at/deleted_at del client oltre "adesso +
+//     5 min" (MaxClockSkew) vengono riportati all'ora del server. created_at
+//     non può superare updated_at; updated_at serve SOLO alla risoluzione LWW,
+//     mai come cursore.
 //  5. RIFIUTI: un record con parent_id/folder_id non valido causa un 422
 //     esplicito con l'elenco dei record rifiutati e il ROLLBACK dell'intero
 //     batch: il client non riceve server_time e non avanza il cursore.
@@ -581,24 +598,30 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		if utf8.RuneCountInString(title) > maxTitleLen {
 			title = string([]rune(title)[:maxTitleLen])
 		}
-		updatedAt, _ := clampClientTime(nc.UpdatedAt, now)
+		// I client precedenti non inviano created_at: in quel caso la miglior
+		// stima è updated_at. Un createdAt futuro viene corretto e, in ogni
+		// caso, non può superare updated_at (una nota non può essere creata
+		// dopo la sua ultima modifica).
+		createdAt, updatedAt := normalizeNoteTimestamps(nc.CreatedAt, nc.UpdatedAt, now)
 		var deletedAt *int64
 		if nc.DeletedAt != nil {
 			d, _ := clampClientTime(*nc.DeletedAt, now)
 			deletedAt = &d
 		}
 		note := &models.Note{
-			ID:         nc.ID,
-			UserID:     userID,
-			Title:      title,
-			Content:    nc.Content,
-			FolderID:   nc.FolderID,
-			IsFavorite: nc.IsFavorite,
-			IsPinned:   nc.IsPinned,
-			OrderIndex: nc.OrderIndex,
-			UpdatedAt:  updatedAt,
-			SyncedAt:   now,
-			DeletedAt:  deletedAt,
+			ID:                nc.ID,
+			UserID:            userID,
+			Title:             title,
+			Content:           nc.Content,
+			FolderID:          nc.FolderID,
+			IsFavorite:        nc.IsFavorite,
+			IsPinned:          nc.IsPinned,
+			OrderIndex:        nc.OrderIndex,
+			CreatedAt:         createdAt,
+			CreatedAtProvided: nc.CreatedAt > 0,
+			UpdatedAt:         updatedAt,
+			SyncedAt:          now,
+			DeletedAt:         deletedAt,
 		}
 		if err := notesTx.UpsertLWW(ctx, note); err != nil {
 			if isOwnershipViolation(err) {
@@ -696,6 +719,7 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 			IsFavorite: n.IsFavorite,
 			IsPinned:   n.IsPinned,
 			OrderIndex: n.OrderIndex,
+			CreatedAt:  n.CreatedAt,
 			UpdatedAt:  n.UpdatedAt,
 			DeletedAt:  n.DeletedAt,
 		})

@@ -421,6 +421,7 @@ var migrationStatements = []string{
 		is_favorite INTEGER NOT NULL DEFAULT 0,
 		is_pinned   INTEGER NOT NULL DEFAULT 0,
 		order_index INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL DEFAULT 0,
 		updated_at  INTEGER NOT NULL,
 		synced_at   INTEGER NOT NULL DEFAULT 0,
 		deleted_at  INTEGER
@@ -536,6 +537,14 @@ func migrate(conn *sql.DB) error {
 	// additivo (ALTER TABLE ADD COLUMN, idempotente) quando risultano assenti.
 	if err := addNotesPinningColumns(conn); err != nil {
 		return fmt.Errorf("migrazione colonne pin/favorite: %w", err)
+	}
+
+	// created_at: data di creazione modificabile, sincronizzata come gli altri
+	// metadati della nota. Sulle installazioni esistenti viene riempita con
+	// updated_at: è la migliore stima disponibile e mantiene l'invariante
+	// created_at <= updated_at.
+	if err := addNotesCreatedAtColumn(conn); err != nil {
+		return fmt.Errorf("migrazione colonna created_at: %w", err)
 	}
 
 	// synced_at: timestamp SERVER monotono, unico cursore di pull (vedi
@@ -933,6 +942,26 @@ func addNotesPinningColumns(conn *sql.DB) error {
 			return fmt.Errorf("alter table %q: %w", w.column, err)
 		}
 		log.Printf("migrazione: aggiunta colonna notes.%s mancante (default 0)", w.column)
+	}
+	return nil
+}
+
+// addNotesCreatedAtColumn aggiunge notes.created_at se manca e riempie le
+// righe storiche con updated_at. È idempotente: PRAGMA table_info prima
+// dell'ALTER e UPDATE limitato alle righe ancora a 0.
+func addNotesCreatedAtColumn(conn *sql.DB) error {
+	cols, err := tableColumns(conn, "notes")
+	if err != nil {
+		return err
+	}
+	if !cols["created_at"] {
+		if _, err := conn.Exec(`ALTER TABLE notes ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("alter table notes.created_at: %w", err)
+		}
+		log.Printf("migrazione: aggiunta colonna notes.created_at mancante")
+	}
+	if _, err := conn.Exec(`UPDATE notes SET created_at = updated_at WHERE created_at = 0`); err != nil {
+		return fmt.Errorf("backfill notes.created_at: %w", err)
 	}
 	return nil
 }

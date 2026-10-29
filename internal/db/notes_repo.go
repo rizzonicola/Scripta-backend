@@ -38,10 +38,10 @@ func NewNotesRepo(d execer) *NotesRepo {
 func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, error) {
 	var n models.Note
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, synced_at, deleted_at
+		`SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at
 		 FROM notes WHERE id = ? AND user_id = ?`,
 		id, userID,
-	).Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.SyncedAt, &n.DeletedAt)
+	).Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.CreatedAt, &n.UpdatedAt, &n.SyncedAt, &n.DeletedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -58,7 +58,9 @@ func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, e
 //   - se la nota non esiste ancora, viene inserita;
 //   - se esiste già, viene aggiornata SOLO SE updated_at in arrivo è >=
 //     dell'updated_at attualmente memorizzato (client vince i pareggi, come
-//     nel comportamento storico del server);
+//     nel comportamento storico del server). created_at segue l'LWW solo se
+//     il client lo ha davvero inviato; un client vecchio che non lo conosce
+//     non azzera la data di creazione già presente sul server;
 //   - altrimenti la riga resta invariata (il server ha già una versione più
 //     recente): non è un errore, è il caso "server wins", che il chiamante
 //     scoprirà semplicemente rileggendo lo stato con la successiva query di
@@ -75,8 +77,8 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 		n.ID = uuid.NewString()
 	}
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, synced_at, deleted_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title       = excluded.title,
 			content     = excluded.content,
@@ -84,12 +86,13 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 			is_favorite = excluded.is_favorite,
 			is_pinned   = excluded.is_pinned,
 			order_index = excluded.order_index,
+			created_at  = CASE WHEN ? THEN excluded.created_at ELSE notes.created_at END,
 			updated_at  = excluded.updated_at,
 			synced_at   = excluded.synced_at,
 			deleted_at  = excluded.deleted_at
 		WHERE excluded.updated_at >= notes.updated_at
 		  AND notes.user_id = excluded.user_id
-	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.UpdatedAt, n.SyncedAt, n.DeletedAt)
+	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.CreatedAt, n.UpdatedAt, n.SyncedAt, n.DeletedAt, n.CreatedAtProvided)
 	return err
 }
 
@@ -118,7 +121,7 @@ func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, 
 // cursore restituito al client sicuro: tutto ciò che ha synced_at <= upTo è
 // già committato e incluso.
 func (r *NotesRepo) ListSyncedBetween(ctx context.Context, userID string, since, upTo int64, includeTombstones bool) ([]models.Note, error) {
-	query := `SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, updated_at, synced_at, deleted_at
+	query := `SELECT id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at
 		 FROM notes WHERE user_id = ? AND synced_at > ? AND synced_at <= ?`
 	if !includeTombstones {
 		query += ` AND deleted_at IS NULL`
@@ -133,7 +136,7 @@ func (r *NotesRepo) ListSyncedBetween(ctx context.Context, userID string, since,
 	var notes []models.Note
 	for rows.Next() {
 		var n models.Note
-		if err := rows.Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.UpdatedAt, &n.SyncedAt, &n.DeletedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.UserID, &n.Title, &n.Content, &n.FolderID, &n.IsFavorite, &n.IsPinned, &n.OrderIndex, &n.CreatedAt, &n.UpdatedAt, &n.SyncedAt, &n.DeletedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
