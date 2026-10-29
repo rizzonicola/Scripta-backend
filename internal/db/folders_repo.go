@@ -42,12 +42,12 @@ func (r *FoldersRepo) Get(ctx context.Context, userID, id string) (*models.Folde
 // l'updated_at in arrivo è >= di quello già memorizzato, altrimenti la riga
 // resta quella (più recente) già presente sul server. Vedi il commento su
 // NotesRepo.UpsertLWW per il dettaglio della clausola di isolamento per
-// utente.
-func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) error {
+// utente. Il bool restituito è true quando l'upsert ha scritto la riga.
+func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) (bool, error) {
 	if f.ID == "" {
 		f.ID = uuid.NewString()
 	}
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO folders (id, user_id, name, parent_id, updated_at, synced_at, deleted_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -59,7 +59,14 @@ func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) error {
 		WHERE excluded.updated_at >= folders.updated_at
 		  AND folders.user_id = excluded.user_id
 	`, f.ID, f.UserID, f.Name, f.ParentID, f.UpdatedAt, f.SyncedAt, f.DeletedAt)
-	return err
+	if err != nil {
+		return false, err
+	}
+	nRows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return nRows > 0, nil
 }
 
 // ForceSet sovrascrive incondizionatamente lo stato di cancellazione di una
@@ -99,6 +106,30 @@ func (r *FoldersRepo) ListSyncedBetween(ctx context.Context, userID string, sinc
 		folders = append(folders, f)
 	}
 	return folders, rows.Err()
+}
+
+// ListChildIDs restituisce gli ID di tutte le sottocartelle dirette,
+// tombstone inclusi. La cascade la usa per attraversare anche un ramo già
+// cancellato e raggiungere eventuali discendenti ancora attivi.
+func (r *FoldersRepo) ListChildIDs(ctx context.Context, userID, parentID string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id FROM folders WHERE user_id = ? AND parent_id = ?`,
+		userID, parentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // ListActiveChildIDs restituisce gli ID delle sottocartelle dirette e ancora

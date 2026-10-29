@@ -217,14 +217,10 @@ func clampClientTime(ts, serverNow int64) (int64, bool) {
 }
 
 // normalizeNoteTimestamps applica le regole di createdAt/updatedAt ricevuti
-// dal client: timestamp non plausibili vengono riportati a serverNow, i client
-// precedenti (createdAt assente) usano updatedAt e createdAt non può mai
-// superare updatedAt.
+// dal client: timestamp non plausibili vengono riportati a serverNow e
+// createdAt non può mai superare updatedAt.
 func normalizeNoteTimestamps(createdAt, updatedAt, serverNow int64) (int64, int64) {
 	updated, _ := clampClientTime(updatedAt, serverNow)
-	if createdAt <= 0 {
-		return updated, updated
-	}
 	created, _ := clampClientTime(createdAt, serverNow)
 	if created > updated {
 		created = updated
@@ -368,7 +364,7 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		// per capire chi sta inviando cosa; nessun titolo né contenuto).
 		log.Printf("sync: 422, %d elementi rifiutati (client=%s)", len(res.rejected), clientTag(r))
 		writeJSON(w, http.StatusUnprocessableEntity, models.SyncRejectedResponse{
-			Error:    "alcuni elementi sono stati rifiutati: riferimento a cartella non valido",
+			Error:    "alcuni elementi sono stati rifiutati: dati non validi",
 			Rejected: res.rejected,
 		})
 	case res.status != 0:
@@ -594,14 +590,17 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 			rejected = append(rejected, models.RejectedItem{Kind: "note", ID: nc.ID, Reason: "invalid_folder_id"})
 			continue
 		}
+		if nc.CreatedAt <= 0 {
+			rejected = append(rejected, models.RejectedItem{Kind: "note", ID: nc.ID, Reason: "invalid_created_at"})
+			continue
+		}
 		title := nc.Title
 		if utf8.RuneCountInString(title) > maxTitleLen {
 			title = string([]rune(title)[:maxTitleLen])
 		}
-		// I client precedenti non inviano created_at: in quel caso la miglior
-		// stima è updated_at. Un createdAt futuro viene corretto e, in ogni
-		// caso, non può superare updated_at (una nota non può essere creata
-		// dopo la sua ultima modifica).
+		// created_at è obbligatorio. Un createdAt futuro viene corretto e, in
+		// ogni caso, non può superare updated_at (una nota non può essere
+		// creata dopo la sua ultima modifica).
 		createdAt, updatedAt := normalizeNoteTimestamps(nc.CreatedAt, nc.UpdatedAt, now)
 		var deletedAt *int64
 		if nc.DeletedAt != nil {
@@ -609,21 +608,21 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 			deletedAt = &d
 		}
 		note := &models.Note{
-			ID:                nc.ID,
-			UserID:            userID,
-			Title:             title,
-			Content:           nc.Content,
-			FolderID:          nc.FolderID,
-			IsFavorite:        nc.IsFavorite,
-			IsPinned:          nc.IsPinned,
-			OrderIndex:        nc.OrderIndex,
-			CreatedAt:         createdAt,
-			CreatedAtProvided: nc.CreatedAt > 0,
-			UpdatedAt:         updatedAt,
-			SyncedAt:          now,
-			DeletedAt:         deletedAt,
+			ID:         nc.ID,
+			UserID:     userID,
+			Title:      title,
+			Content:    nc.Content,
+			FolderID:   nc.FolderID,
+			IsFavorite: nc.IsFavorite,
+			IsPinned:   nc.IsPinned,
+			OrderIndex: nc.OrderIndex,
+			CreatedAt:  createdAt,
+			UpdatedAt:  updatedAt,
+			SyncedAt:   now,
+			DeletedAt:  deletedAt,
 		}
-		if err := notesTx.UpsertLWW(ctx, note); err != nil {
+		won, err := notesTx.UpsertLWW(ctx, note)
+		if err != nil {
 			if isOwnershipViolation(err) {
 				log.Printf("sync: nota %s rifiutata, folder_id non valido o non dell'utente", nc.ID)
 				rejected = append(rejected, models.RejectedItem{Kind: "note", ID: nc.ID, Reason: "invalid_folder_id"})
@@ -634,10 +633,7 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		}
 		// Se il server aveva già una versione più recente (LWW perso dal
 		// client), la si ri-consegna nella pull di questa stessa richiesta.
-		if cur, err := notesTx.Get(ctx, userID, nc.ID); err != nil {
-			log.Printf("sync: errore lettura nota %s: %v", nc.ID, err)
-			return failure(http.StatusInternalServerError, "errore lettura nota")
-		} else if cur != nil && cur.UpdatedAt > updatedAt {
+		if !won {
 			if err := notesTx.TouchSynced(ctx, userID, nc.ID, now); err != nil {
 				log.Printf("sync: errore touch nota %s: %v", nc.ID, err)
 				return failure(http.StatusInternalServerError, "errore elaborazione nota")
@@ -854,7 +850,8 @@ func applyFolder(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.Not
 		SyncedAt:  now,
 		DeletedAt: deletedAt,
 	}
-	if err := foldersTx.UpsertLWW(ctx, folder); err != nil {
+	won, err := foldersTx.UpsertLWW(ctx, folder)
+	if err != nil {
 		if isOwnershipViolation(err) || db.IsFolderCycleViolation(err) {
 			return folderParentMissing, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"}, nil
 		}
@@ -863,25 +860,28 @@ func applyFolder(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.Not
 		return folderRejected, models.RejectedItem{}, &f
 	}
 
-	// Rileggiamo lo stato risultante (non ciò che il client ha inviato):
-	// se l'upsert è stato respinto dalla condizione LWW perché il server
-	// aveva già una versione più recente E ATTIVA, la cartella non va
-	// messa in cascata solo perché il client la voleva cancellare.
-	current, err := foldersTx.Get(ctx, userID, fc.ID)
-	if err != nil {
-		log.Printf("sync: errore lettura cartella %s: %v", fc.ID, err)
-		f := failure(http.StatusInternalServerError, "errore lettura cartella")
-		return folderRejected, models.RejectedItem{}, &f
-	}
-	if current != nil && current.UpdatedAt > updatedAt {
-		// Il push ha perso il LWW: ri-consegna la versione vincente.
-		if err := foldersTx.TouchSynced(ctx, userID, fc.ID, now); err != nil {
-			log.Printf("sync: errore touch cartella %s: %v", fc.ID, err)
-			f := failure(http.StatusInternalServerError, "errore elaborazione cartella")
+	// Se il push ha vinto, lo stato risultante è quello appena scritto. Se ha
+	// perso, serve una lettura per distinguere una versione attiva da un
+	// tombstone e per ri-consegnare la versione vincente.
+	deleted := folder.DeletedAt != nil
+	if !won {
+		current, err := foldersTx.Get(ctx, userID, fc.ID)
+		if err != nil {
+			log.Printf("sync: errore lettura cartella %s: %v", fc.ID, err)
+			f := failure(http.StatusInternalServerError, "errore lettura cartella")
 			return folderRejected, models.RejectedItem{}, &f
 		}
+		if current != nil && current.UpdatedAt > updatedAt {
+			// Il push ha perso il LWW: ri-consegna la versione vincente.
+			if err := foldersTx.TouchSynced(ctx, userID, fc.ID, now); err != nil {
+				log.Printf("sync: errore touch cartella %s: %v", fc.ID, err)
+				f := failure(http.StatusInternalServerError, "errore elaborazione cartella")
+				return folderRejected, models.RejectedItem{}, &f
+			}
+		}
+		deleted = current != nil && current.DeletedAt != nil
 	}
-	if current != nil && current.DeletedAt != nil {
+	if deleted {
 		if err := cascadeSoftDeleteFolder(ctx, foldersTx, notesTx, userID, fc.ID, now); err != nil {
 			log.Printf("sync: errore cascata cartella %s: %v", fc.ID, err)
 			f := failure(http.StatusInternalServerError, "errore cascata cancellazione cartella")
@@ -964,6 +964,7 @@ func truncateForLog(s string) string {
 func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.NotesRepo, userID, rootFolderID string, now int64) error {
 	deletedAt := now
 	queue := []string{rootFolderID}
+	visited := map[string]struct{}{rootFolderID: {}}
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -979,13 +980,27 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 			}
 		}
 
-		childIDs, err := foldersTx.ListActiveChildIDs(ctx, userID, current)
+		childIDs, err := foldersTx.ListChildIDs(ctx, userID, current)
 		if err != nil {
 			return err
 		}
+		activeIDs, err := foldersTx.ListActiveChildIDs(ctx, userID, current)
+		if err != nil {
+			return err
+		}
+		active := make(map[string]struct{}, len(activeIDs))
+		for _, id := range activeIDs {
+			active[id] = struct{}{}
+		}
 		for _, id := range childIDs {
-			if err := foldersTx.ForceSet(ctx, userID, id, now, now, &deletedAt); err != nil {
-				return err
+			if _, seen := visited[id]; seen {
+				continue
+			}
+			visited[id] = struct{}{}
+			if _, ok := active[id]; ok {
+				if err := foldersTx.ForceSet(ctx, userID, id, now, now, &deletedAt); err != nil {
+					return err
+				}
 			}
 			queue = append(queue, id)
 		}

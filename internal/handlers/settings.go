@@ -79,6 +79,25 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, saved)
 }
 
+var (
+	validThemes = map[string]struct{}{
+		"light": {}, "dark": {}, "system": {},
+	}
+	validColorSchemes = map[string]struct{}{
+		"dark_teal": {}, "oled": {}, "nord": {}, "midnight_purple": {},
+		"forest": {}, "coffee": {}, "clean_light": {}, "solarized_light": {},
+	}
+	validLanguages = map[string]struct{}{
+		"it": {}, "en": {}, "fr": {}, "system": {},
+	}
+	validFontFamilies = map[string]struct{}{
+		"Inter": {}, "JetBrains Mono": {},
+	}
+	validLayouts = map[string]struct{}{
+		"single_pane": {}, "split": {}, "grid": {},
+	}
+)
+
 // validateSettings applica controlli minimi e valori di fallback sicuri,
 // evitando di persistere dati palesemente invalidi (es. font size negativo).
 func validateSettings(s *models.UserSettings) error {
@@ -110,6 +129,21 @@ func validateSettings(s *models.UserSettings) error {
 	}
 	if s.LineSpacing < 0.8 || s.LineSpacing > 3.0 {
 		return errInvalidField("line_spacing deve essere tra 0.8 e 3.0")
+	}
+	if _, ok := validThemes[s.Theme]; !ok {
+		return errInvalidField("theme non valido")
+	}
+	if _, ok := validColorSchemes[s.ColorScheme]; !ok {
+		return errInvalidField("color_scheme non valido")
+	}
+	if _, ok := validLanguages[s.Language]; !ok {
+		return errInvalidField("language non valido")
+	}
+	if _, ok := validFontFamilies[s.FontFamily]; !ok {
+		return errInvalidField("font_family non valido")
+	}
+	if _, ok := validLayouts[s.Layout]; !ok {
+		return errInvalidField("layout non valido")
 	}
 	return nil
 }

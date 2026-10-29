@@ -1,5 +1,5 @@
 {
-  "error": "alcuni elementi sono stati rifiutati: riferimento a cartella non valido",
+  "error": "alcuni elementi sono stati rifiutati: dati non validi",
   "rejected": [
     { "kind": "folder", "id": "f-orfana", "reason": "invalid_parent_id" },
     { "kind": "note", "id": "n-orfana", "reason": "invalid_folder_id" }

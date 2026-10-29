@@ -13,6 +13,7 @@
     "notes": [
       {
         "content": "y",
+        "created_at": 1700000000000,
         "deleted_at": null,
         "folder_id": "non-esiste-neanche-questa",
         "id": "n-orfana",
@@ -27,7 +28,7 @@
   "status": 422,
   "content_type": "application/json",
   "response": {
-    "error": "alcuni elementi sono stati rifiutati: riferimento a cartella non valido",
+    "error": "alcuni elementi sono stati rifiutati: dati non validi",
     "rejected": [
       {
         "id": "f-orfana",

@@ -18,15 +18,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          # go.mod dichiara `go 1.26`, lo stesso ramo usato qui. Si tiene la
-          # versione esplicita con check-latest per avere sempre l'ultima patch
-          # (go-version-file non seleziona la patch più recente).
-          # 1.26: govulncheck (CI del 2026-10-19) segnala 9 vulnerabilità della
-          # stdlib raggiunte dal codice (net/http, net/textproto, crypto/tls,
-          # html/template) presenti in 1.25.14 e corrette in 1.26.9. check-latest
-          # garantisce l'ultima patch del ramo.
-          go-version: '1.26'
-          check-latest: true
+          # go.mod dichiara `go 1.26` e richiede il toolchain 1.26.10: la patch
+          # include le correzioni stdlib segnalate da govulncheck, compresa
+          # GO-2026-6809 (crypto/x509). Il pin esplicito rende la CI
+          # riproducibile e impedisce di testare con una patch precedente.
+          go-version: '1.26.10'
           cache: true
       - run: go mod download
       - run: go vet ./...

@@ -44,14 +44,10 @@ type Note struct {
 	IsFavorite bool
 	IsPinned   bool
 	OrderIndex int
-	CreatedAt  int64 // unix millis UTC (orologio CLIENT), data di creazione modificabile
-	// CreatedAtProvided distingue un createdAt assente (client vecchio) da uno
-	// valorizzato: sul conflitto il primo preserva il valore già sul server,
-	// il secondo lo aggiorna come gli altri campi LWW.
-	CreatedAtProvided bool
-	UpdatedAt         int64  // unix millis UTC (orologio CLIENT), usato SOLO per la risoluzione LWW
-	SyncedAt          int64  // unix millis (orologio SERVER, monotono), usato SOLO come cursore di pull
-	DeletedAt         *int64 // nil = attiva; non-nil = soft-deleted (tombstone)
+	CreatedAt  int64  // unix millis UTC (orologio CLIENT), data di creazione modificabile
+	UpdatedAt  int64  // unix millis UTC (orologio CLIENT), usato SOLO per la risoluzione LWW
+	SyncedAt   int64  // unix millis (orologio SERVER, monotono), usato SOLO come cursore di pull
+	DeletedAt  *int64 // nil = attiva; non-nil = soft-deleted (tombstone)
 }
 
 // FolderDTO è la rappresentazione JSON di una cartella scambiata durante la
@@ -77,8 +73,8 @@ type FolderDTO struct {
 // il default false. Vedi lo stesso commento in NoteChangeDto lato client.
 //
 // CreatedAt segue la stessa regola: è la data di creazione modificabile
-// dall'utente, non un valore immutabile. I client precedenti non lo inviano;
-// in quel caso il server usa UpdatedAt.
+// dall'utente, non un valore immutabile. È obbligatorio: il server rifiuta
+// le note che non lo inviano.
 type NoteDTO struct {
 	ID         string  `json:"id"`
 	Title      string  `json:"title"`
@@ -202,12 +198,12 @@ type UserSettings struct {
 func DefaultUserSettings() UserSettings {
 	return UserSettings{
 		Theme:       "system",
-		ColorScheme: "default",
+		ColorScheme: "dark_teal",
 		Language:    "it",
 		FontFamily:  "Inter",
 		FontSize:    16,
-		LineSpacing: 1.4,
-		Layout:      "single_pane",
+		LineSpacing: 1.6,
+		Layout:      "split",
 	}
 }
 

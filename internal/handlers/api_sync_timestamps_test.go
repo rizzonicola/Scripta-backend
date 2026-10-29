@@ -14,12 +14,6 @@ func TestNormalizeNoteTimestamps(t *testing.T) {
 		wantUpdatedAt int64
 	}{
 		{
-			name:          "client vecchio senza created_at",
-			updatedAt:     5_000,
-			wantCreatedAt: 5_000,
-			wantUpdatedAt: 5_000,
-		},
-		{
 			name:          "created_at valido precedente a updated_at",
 			createdAt:     4_000,
 			updatedAt:     5_000,

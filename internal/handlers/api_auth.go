@@ -282,8 +282,9 @@ func sleepUntilMinResponseTime(start time.Time) {
 	}
 }
 
-// Logout gestisce POST /api/v1/auth/logout (protetto da JWT): revoca il token
-// usato per la richiesta. La revoca è persistita su DB (vedi
+// Logout gestisce POST /api/v1/auth/logout (rotta pubblica): revoca il token
+// usato per la richiesta. Accetta un access token valido oppure il refresh
+// token della famiglia. La revoca è persistita su DB (vedi
 // auth.TokenManager.AttachStore), quindi resta valida anche dopo un riavvio
 // del server. Prima non esisteva alcun logout lato server: il token restava
 // valido fino alla scadenza anche dopo il "logout" dell'app.

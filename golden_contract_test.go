@@ -1,23 +1,19 @@
 package main
 
-// Golden N-1: richieste e risposte del server 2.1.0 *prima* delle modifiche di
-// P6, registrate una volta e poi riconfrontate a ogni test.
+// Golden contract: richieste e risposte del server corrente, registrate una
+// volta e poi riconfrontate a ogni test.
 //
-// Perché esiste: le app 0.9.x già in circolazione devono continuare a
-// funzionare col server nuovo (regola 3 del PM). Il confronto è «contiene»,
-// non «uguale»: ogni campo che il server 2.1.0 emetteva deve esserci ancora,
-// con lo stesso valore; campi NUOVI sono ammessi (le app 0.9.x leggono per
-// chiave e ignorano il resto). Un campo tolto, rinominato o con un valore
-// diverso fa fallire il test.
+// Il confronto è «contiene»: ogni campo atteso deve esserci con lo stesso
+// valore; campi NUOVI sono ammessi. Un campo tolto, rinominato o con un
+// valore diverso fa fallire il test.
 //
-// PROCEDURA OBBLIGATORIA (una tantum, sul server NON modificato):
+// PROCEDURA:
 //
-//	UPDATE_GOLDEN=1 go test -run TestGoldenN1 -count=1 .
+//	UPDATE_GOLDEN=1 go test -run TestGoldenContract -count=1 .
 //
-// Il file va eseguito sullo zip originale (Scripta-backend-main-p5) e i
-// JSON generati in testdata/golden_n1/ vanno committati PRIMA di applicare la
-// patch di P6. Registrarli dal server già modificato vanifica la prova.
-// Lo script scripts/record_golden_n1.sh automatizza il passaggio.
+// I JSON generati in testdata/golden_contract/ vanno committati insieme al
+// codice. Lo script scripts/record_golden_contract.sh automatizza la
+// rigenerazione.
 //
 // Non coperto: il 503 («database temporaneamente occupato»), perché richiede
 // una contesa reale su SQLite e non è riproducibile in modo deterministico;
@@ -208,7 +204,7 @@ func goldenDo(t *testing.T, base, token string, s goldenStep) goldenRecord {
 	}
 }
 
-func TestGoldenN1(t *testing.T) {
+func TestGoldenContract(t *testing.T) {
 	// Valori fissi e nel passato: nessun clamp, nessuna dipendenza dall'ora.
 	const ts = int64(1700000000000)
 	folderDTO := func(id string, parent any) map[string]any {
@@ -216,7 +212,7 @@ func TestGoldenN1(t *testing.T) {
 	}
 	noteDTO := func(id string, folder any, title, content string) map[string]any {
 		return map[string]any{"id": id, "title": title, "content": content, "folder_id": folder,
-			"is_favorite": true, "is_pinned": false, "order_index": 3, "updated_at": ts, "deleted_at": nil}
+			"is_favorite": true, "is_pinned": false, "order_index": 3, "created_at": ts, "updated_at": ts, "deleted_at": nil}
 	}
 
 	steps := []goldenStep{
@@ -246,7 +242,7 @@ func TestGoldenN1(t *testing.T) {
 	step413 := goldenStep{name: "sync_413_body_troppo_grande", method: "POST", path: "/api/v1/sync", auth: true, body: big}
 
 	update := os.Getenv("UPDATE_GOLDEN") == "1"
-	dir := filepath.Join("testdata", "golden_n1")
+	dir := filepath.Join("testdata", "golden_contract")
 
 	check := func(rec goldenRecord, name string) {
 		path := filepath.Join(dir, name+".json")
@@ -262,7 +258,7 @@ func TestGoldenN1(t *testing.T) {
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("%s: golden mancante (%v). Registrarlo sul server 2.1.0 NON modificato con: UPDATE_GOLDEN=1 go test -run TestGoldenN1 -count=1 .", name, err)
+			t.Fatalf("%s: golden mancante (%v). Rigenerarlo con: UPDATE_GOLDEN=1 go test -run TestGoldenContract -count=1 .", name, err)
 		}
 		var want goldenRecord
 		if err := json.Unmarshal(raw, &want); err != nil {
@@ -280,7 +276,7 @@ func TestGoldenN1(t *testing.T) {
 		if !goldenContains(want.Response, rec.Response) {
 			g, _ := json.MarshalIndent(rec.Response, "", "  ")
 			w, _ := json.MarshalIndent(want.Response, "", "  ")
-			t.Errorf("%s: la risposta non contiene più il golden N-1\natteso (almeno):\n%s\nottenuto:\n%s", name, w, g)
+			t.Errorf("%s: la risposta non contiene più il golden contract\natteso (almeno):\n%s\nottenuto:\n%s", name, w, g)
 		}
 	}
 

@@ -7,6 +7,9 @@
   "status": 200,
   "content_type": "application/json",
   "response": {
+    "caps": {
+      "proto": 2
+    },
     "folders": [],
     "full_resync": false,
     "notes": [],

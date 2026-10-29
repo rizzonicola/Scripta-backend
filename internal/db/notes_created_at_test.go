@@ -65,16 +65,15 @@ func TestNotesRepoPersistsCreatedAt(t *testing.T) {
 	}
 	repo := NewNotesRepo(conn)
 	want := &models.Note{
-		ID:                "n1",
-		UserID:            "u1",
-		Title:             "titolo",
-		Content:           "contenuto",
-		CreatedAt:         1000,
-		CreatedAtProvided: true,
-		UpdatedAt:         2000,
-		SyncedAt:          3000,
+		ID:        "n1",
+		UserID:    "u1",
+		Title:     "titolo",
+		Content:   "contenuto",
+		CreatedAt: 1000,
+		UpdatedAt: 2000,
+		SyncedAt:  3000,
 	}
-	if err := repo.UpsertLWW(ctx, want); err != nil {
+	if _, err := repo.UpsertLWW(ctx, want); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,7 +88,7 @@ func TestNotesRepoPersistsCreatedAt(t *testing.T) {
 	want.CreatedAt = 500
 	want.UpdatedAt = 4000
 	want.SyncedAt = 4000
-	if err := repo.UpsertLWW(ctx, want); err != nil {
+	if _, err := repo.UpsertLWW(ctx, want); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := repo.ListSyncedBetween(ctx, "u1", 3000, 4000, false)
@@ -98,27 +97,5 @@ func TestNotesRepoPersistsCreatedAt(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].CreatedAt != 500 {
 		t.Fatalf("righe dopo ListSyncedBetween = %+v, atteso created_at 500", rows)
-	}
-
-	// Un client precedente non invia created_at: il suo updated_at usato come
-	// fallback non deve cancellare la data di creazione già nota al server.
-	oldClient := &models.Note{
-		ID:        "n1",
-		UserID:    "u1",
-		Title:     "titolo aggiornato",
-		Content:   "contenuto",
-		CreatedAt: 5000,
-		UpdatedAt: 5000,
-		SyncedAt:  5000,
-	}
-	if err := repo.UpsertLWW(ctx, oldClient); err != nil {
-		t.Fatal(err)
-	}
-	got, err = repo.Get(ctx, "u1", "n1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got == nil || got.CreatedAt != 500 || got.UpdatedAt != 5000 {
-		t.Fatalf("dopo push client vecchio = %+v, attesi created_at 500 e updated_at 5000", got)
 	}
 }

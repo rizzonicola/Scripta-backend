@@ -142,7 +142,7 @@ func (e *testEnv) sync(token string, last int64, folders, notes []map[string]any
 }
 
 func note(id, title string, updated int64, folder any) map[string]any {
-	return map[string]any{"id": id, "title": title, "content": "c", "folder_id": folder, "is_favorite": false, "is_pinned": false, "order_index": 0, "updated_at": updated, "deleted_at": nil}
+	return map[string]any{"id": id, "title": title, "content": "c", "folder_id": folder, "is_favorite": false, "is_pinned": false, "order_index": 0, "created_at": updated, "updated_at": updated, "deleted_at": nil}
 }
 
 func TestHealth(t *testing.T) {

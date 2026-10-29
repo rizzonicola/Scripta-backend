@@ -6,9 +6,11 @@
 # dinamico e il binario non parte ("invalid ELF header" / crash al primo
 # uso del DB). Per questo la migrazione sposta anche l'immagine base.
 # Go 1.26: il binario di produzione deve includere le correzioni di sicurezza
-# della stdlib (net/http, crypto/tls, html/template) presenti solo da 1.26.9;
-# 1.25.14 è affetto (govulncheck). Il tag `1.26` segue l'ultima patch del ramo.
-FROM golang:1.26-bookworm AS builder
+# della stdlib (net/http, crypto/tls, crypto/x509, html/template). Le patch
+# 1.26.9 correggono net/http, net/textproto, crypto/tls e html/template;
+# crypto/x509 richiede 1.26.10 (GO-2026-6809). Il tag è fissato alla patch
+# verificata per rendere la build riproducibile.
+FROM golang:1.26.10-bookworm AS builder
 
 WORKDIR /src
 

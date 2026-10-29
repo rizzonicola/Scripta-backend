@@ -58,9 +58,8 @@ func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, e
 //   - se la nota non esiste ancora, viene inserita;
 //   - se esiste già, viene aggiornata SOLO SE updated_at in arrivo è >=
 //     dell'updated_at attualmente memorizzato (client vince i pareggi, come
-//     nel comportamento storico del server). created_at segue l'LWW solo se
-//     il client lo ha davvero inviato; un client vecchio che non lo conosce
-//     non azzera la data di creazione già presente sul server;
+//     nel comportamento storico del server). created_at segue la stessa
+//     regola LWW ed è sempre valorizzato dal chiamante;
 //   - altrimenti la riga resta invariata (il server ha già una versione più
 //     recente): non è un errore, è il caso "server wins", che il chiamante
 //     scoprirà semplicemente rileggendo lo stato con la successiva query di
@@ -72,11 +71,14 @@ func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, e
 // sovrascrivere il contenuto di una nota che appartiene a un utente B anche
 // nell'eventualità (qui non raggiungibile dai livelli superiori, che passano
 // sempre lo user_id autenticato) in cui indovinasse l'ID di una nota altrui.
-func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
+//
+// Il bool restituito è true quando l'upsert ha effettivamente scritto la
+// riga; è false quando il server aveva già una versione più recente.
+func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) (bool, error) {
 	if n.ID == "" {
 		n.ID = uuid.NewString()
 	}
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
@@ -86,14 +88,21 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) error {
 			is_favorite = excluded.is_favorite,
 			is_pinned   = excluded.is_pinned,
 			order_index = excluded.order_index,
-			created_at  = CASE WHEN ? THEN excluded.created_at ELSE notes.created_at END,
+			created_at  = excluded.created_at,
 			updated_at  = excluded.updated_at,
 			synced_at   = excluded.synced_at,
 			deleted_at  = excluded.deleted_at
 		WHERE excluded.updated_at >= notes.updated_at
 		  AND notes.user_id = excluded.user_id
-	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.CreatedAt, n.UpdatedAt, n.SyncedAt, n.DeletedAt, n.CreatedAtProvided)
-	return err
+	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.CreatedAt, n.UpdatedAt, n.SyncedAt, n.DeletedAt)
+	if err != nil {
+		return false, err
+	}
+	nRows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return nRows > 0, nil
 }
 
 // ForceSet sovrascrive incondizionatamente una nota (usata dalla cascade

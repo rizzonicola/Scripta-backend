@@ -78,6 +78,11 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 	if cfg.Path == "" {
 		return nil, fmt.Errorf("db: Path non può essere vuoto")
 	}
+	var conn *sql.DB
+	closeOnError := func(err error) (*sql.DB, error) {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir data dir: %w", err)
 	}
@@ -90,7 +95,6 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 		return nil, err
 	}
 
-	var conn *sql.DB
 	maxOpen := cfg.MaxOpenConns
 
 	if rawConnector != nil {
@@ -130,17 +134,17 @@ func OpenWithConfig(cfg Config) (*sql.DB, error) {
 	conn.SetConnMaxLifetime(0) // nessun limite: file locale/replica, non connessione di rete
 
 	if err := conn.Ping(); err != nil {
-		return nil, fmt.Errorf("ping libsql: %w", err)
+		return closeOnError(fmt.Errorf("ping libsql: %w", err))
 	}
 
 	// Verifica esplicita: se foreign_keys non risulta attivo, meglio non
 	// avviare il server che perdere in silenzio l'integrità referenziale.
 	if err := verifyForeignKeys(conn); err != nil {
-		return nil, err
+		return closeOnError(err)
 	}
 
 	if err := migrate(conn); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
+		return closeOnError(fmt.Errorf("migrate: %w", err))
 	}
 
 	if rawConnector == nil {
@@ -294,23 +298,16 @@ func (p *pragmaConnector) Close() error {
 func execOnConn(ctx context.Context, conn driver.Conn, query string) error {
 	// Come in queryDiscard: i PRAGMA di libSQL possono restituire righe
 	// (es. il valore impostato), quindi usiamo l'interfaccia Query e non Exec.
-	if queryer, ok := conn.(driver.QueryerContext); ok {
-		rows, err := queryer.QueryContext(ctx, query, nil)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		return drainRows(rows)
+	queryer, ok := conn.(driver.QueryerContext)
+	if !ok {
+		return fmt.Errorf("il driver libsql non espone driver.QueryerContext")
 	}
-	if queryer, ok := conn.(driver.Queryer); ok { //nolint:staticcheck // fallback per driver senza supporto context
-		rows, err := queryer.Query(query, nil)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		return drainRows(rows)
+	rows, err := queryer.QueryContext(ctx, query, nil)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("il driver libsql non espone QueryerContext/Queryer")
+	defer rows.Close()
+	return drainRows(rows)
 }
 
 func drainRows(rows driver.Rows) error {

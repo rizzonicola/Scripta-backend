@@ -7,6 +7,9 @@
   "status": 200,
   "content_type": "application/json",
   "response": {
+    "caps": {
+      "proto": 2
+    },
     "folders": [
       {
         "deleted_at": null,
@@ -27,6 +30,7 @@
     "notes": [
       {
         "content": "Perché → già: «ciao» 😀\n",
+        "created_at": 1700000000000,
         "deleted_at": null,
         "folder_id": "f2",
         "id": "n1",

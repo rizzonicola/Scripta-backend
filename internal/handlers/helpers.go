@@ -74,8 +74,8 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, max
 }
 
 // decodeOptionalJSONBody è come decodeJSONBody ma accetta anche un body
-// vuoto. Serve al logout: i client precedenti non inviano alcun body, quelli
-// nuovi possono inviare il refresh token per revocare la famiglia.
+// vuoto. Il logout può essere inviato senza body; se il client conosce il
+// refresh token lo include per revocare anche la famiglia.
 func decodeOptionalJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	dec := json.NewDecoder(r.Body)

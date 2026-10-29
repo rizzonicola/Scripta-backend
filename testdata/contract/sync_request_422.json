@@ -7,7 +7,7 @@
     {
       "id": "n-orfana", "title": "x", "content": "y",
       "folder_id": "non-esiste-neanche-questa", "is_favorite": false, "is_pinned": false, "order_index": 0,
-      "updated_at": 1700000000000, "deleted_at": null
+      "created_at": 1700000000000, "updated_at": 1700000000000, "deleted_at": null
     }
   ]
 }

@@ -38,7 +38,7 @@ notes-server/
 │   ├── middleware/                  # JWT, rate limit, CSRF, gzip, header, timing, IP
 │   └── models/
 │       └── models.go
-├── scripts/record_golden_n1.sh      # rigenera i fixture golden
+├── scripts/record_golden_contract.sh  # rigenera i fixture golden
 ├── testdata/                        # fixture di contratto e golden
 └── web/templates/
     ├── admin_login.html             # login dashboard
@@ -196,9 +196,8 @@ risolvono **riga per riga** con **Last-Write-Wins** su `updated_at`.
 **Cosa fa il server** (in un'unica transazione):
 1. **Push**: per ogni elemento, upsert condizionato: ha effetto solo se `updated_at` del client è
    **≥** di quello memorizzato. Un `updated_at` oltre «adesso + 5 minuti» viene riportato all'ora del server.
-   Per le note, `created_at` assente (client precedenti) vale `updated_at` per una nota nuova; su una
-   nota già esistente il server conserva il `created_at` già noto. In ogni caso `created_at` non può
-   superare `updated_at`.
+   Per le note `created_at` è obbligatorio: un valore assente o non positivo fa fallire il batch con
+   `422` e `reason=invalid_created_at`. Il valore inviato non può superare `updated_at`.
 2. **Cascata**: se una cartella risulta cancellata, la cancellazione si propaga a sottocartelle e note ancora attive.
 3. **Pull**: restituisce le entità dell'utente con `synced_at` in `(last_synced_at, server_time]`,
    calcolate **dopo** il push. Comprende quindi anche l'**eco** di ciò che il client ha appena inviato e,
@@ -248,9 +247,9 @@ server (compare nel riepilogo dei `422`); non cambia nessun comportamento.
 | `403` | account bloccato dall'amministratore | `{"error":"...","code":"account_blocked"}` |
 | `405` | metodo diverso da `POST` | `{"error":"metodo non consentito"}` |
 | `413` | corpo oltre `SYNC_MAX_BODY_BYTES` o più di 100000 elementi | `{"error":"payload troppo grande"}` |
-| `422` | almeno un elemento rifiutato: **nessuna modifica applicata** (rollback dell'intero batch), nessun `server_time` | `{"error":"...","rejected":[{"kind":"folder\|note","id":"...","reason":"invalid_id\|invalid_parent_id\|invalid_folder_id"}]}` |
+| `422` | almeno un elemento rifiutato: **nessuna modifica applicata** (rollback dell'intero batch), nessun `server_time` | `{"error":"...","rejected":[{"kind":"folder\|note","id":"...","reason":"invalid_id\|invalid_parent_id\|invalid_folder_id\|invalid_created_at"}]}` |
 | `429` | rate limit per-utente superato (se attivo e non esente); riprovare dopo `Retry-After` | `{"error":"...","code":"rate_limited"}` |
-| `500` | errore interno | `{"error":"...","code":"internal_error"}` |
+| `500` | errore interno | `{"error":"..."}` |
 | `503` | database occupato; riprovare (header `Retry-After: 1`) | `{"error":"database temporaneamente occupato, riprovare"}` |
 
 La sync è **idempotente**: rinviare lo stesso corpo (per esempio dopo una rete caduta) dà lo stesso stato finale.
@@ -268,12 +267,12 @@ restituisce i valori di default senza scrivere nel DB.
 **Response 200**
 ```json
 {
-  "theme": "dark",
-  "color_scheme": "solarized",
+  "theme": "system",
+  "color_scheme": "dark_teal",
   "language": "it",
   "font_family": "Inter",
   "font_size": 16,
-  "line_spacing": 1.4,
+  "line_spacing": 1.6,
   "layout": "split",
   "updated_at": 1756950000000
 }
@@ -287,14 +286,16 @@ restituisce i valori di default senza scrivere nel DB.
 
 Sostituisce integralmente le preferenze dell'utente (il client invia sempre lo
 stato completo, non una patch parziale). Applica validazioni minime (`font_size`
-tra 8 e 48, `line_spacing` tra 0.8 e 3.0) e valori di fallback ai campi vuoti.
+tra 8 e 48, `line_spacing` tra 0.8 e 3.0), verifica che `theme`, `color_scheme`,
+`language`, `font_family` e `layout` appartengano ai valori supportati e usa
+valori di fallback per i campi vuoti.
 
 **Request body**: stesso schema della response di `GET /api/v1/user/settings`
 (il campo `updated_at` viene ignorato in input e ricalcolato dal server).
 
 **Response 200**: le impostazioni salvate, con `updated_at` aggiornato.
 
-**Errori**: `400` (JSON non valido o valori fuori range), `401`, `500`.
+**Errori**: `400` (JSON non valido, valori fuori range o enum non ammesso), `401`, `500`.
 
 ---
 
