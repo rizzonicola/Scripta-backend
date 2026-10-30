@@ -4,147 +4,261 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="light dark" />
-  <meta name="theme-color" content="#f6f7fb" />
-  <title data-i18n="pageTitle">Accesso Admin · Note Markdown</title>
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#0b0f0d" />
+  <title data-i18n="pageTitle">Admin · Scripta</title>
   <script nonce="{{.Nonce}}">
     (function () {
       try {
-        var stored = localStorage.getItem('scripta_admin_theme') || 'auto';
+        var stored = localStorage.getItem('scripta_admin_theme') || 'dark';
         var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
         var theme = stored === 'auto' ? (dark ? 'dark' : 'light') : stored;
         document.documentElement.setAttribute('data-theme', theme);
       } catch (e) {
-        document.documentElement.setAttribute('data-theme', 'light');
+        document.documentElement.setAttribute('data-theme', 'dark');
       }
     })();
   </script>
   <style nonce="{{.Nonce}}">
     :root {
-      color-scheme: light;
-      --bg: #f6f7fb;
-      --surface: #ffffff;
-      --surface-2: #f1f5f9;
-      --text: #111827;
-      --muted: #64748b;
-      --border: #e2e8f0;
-      --accent: #2563eb;
-      --accent-hover: #1d4ed8;
-      --danger: #dc2626;
-      --danger-soft: #fee2e2;
-      --success: #15803d;
-      --success-soft: #dcfce7;
-      --shadow: 0 1px 2px rgba(15, 23, 42, .05), 0 24px 60px rgba(15, 23, 42, .08);
-      --radius: 14px;
-    }
-    html[data-theme="dark"] {
       color-scheme: dark;
-      --bg: #0b1120;
-      --surface: #111827;
-      --surface-2: #172033;
-      --text: #e5e7eb;
-      --muted: #94a3b8;
-      --border: #263349;
-      --accent: #60a5fa;
-      --accent-hover: #93c5fd;
-      --danger: #f87171;
-      --danger-soft: #3f1d1d;
-      --success: #4ade80;
-      --success-soft: #14351f;
-      --shadow: 0 1px 2px rgba(0, 0, 0, .25), 0 24px 60px rgba(0, 0, 0, .35);
+      --bg: #0b0f0d;
+      --surface: #111714;
+      --surface-2: #161e1a;
+      --surface-3: #1c2621;
+      --text: #e8f0eb;
+      --muted: #9aaba2;
+      --border: #29372f;
+      --border-strong: #3a4b42;
+      --accent: #5eead4;
+      --accent-hover: #99f6e4;
+      --accent-ink: #052e2a;
+      --danger: #fca5a5;
+      --danger-soft: #2a1416;
+      --danger-border: #6b2b31;
+      --success: #86efac;
+      --success-soft: #12251a;
+      --success-border: #28553a;
+      --focus: rgba(94, 234, 212, .38);
+      --radius: 14px;
+      --control: 10px;
+    }
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #f2f5f3;
+      --surface: #ffffff;
+      --surface-2: #edf2ef;
+      --surface-3: #e2e9e5;
+      --text: #17211c;
+      --muted: #5d7066;
+      --border: #d4dfd9;
+      --border-strong: #b9c9c0;
+      --accent: #0f766e;
+      --accent-hover: #0b5f59;
+      --accent-ink: #ffffff;
+      --danger: #b42318;
+      --danger-soft: #fff1f0;
+      --danger-border: #f3b6af;
+      --success: #067647;
+      --success-soft: #ecfdf3;
+      --success-border: #abefc6;
+      --focus: rgba(15, 118, 110, .26);
     }
     * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(900px 500px at 50% -10%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 70%),
-        var(--bg);
       margin: 0;
-      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+    main {
+      width: 100%;
+      max-width: 400px;
+      margin: 0 auto;
+      padding: 40px 20px 28px;
+      display: flex;
+      min-height: 100dvh;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .brand {
       display: flex;
       align-items: center;
-      justify-content: center;
-      padding: 24px 16px;
+      gap: 11px;
+      margin-bottom: 22px;
+      padding-left: 2px;
     }
-    .login-wrap { width: 100%; max-width: 380px; }
-    .login-header { text-align: center; margin-bottom: 20px; }
-    .login-header h1 { font-size: 21px; margin: 0 0 5px; letter-spacing: -0.02em; }
-    .login-header p { font-size: 13px; color: var(--muted); margin: 0; }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      background: var(--surface-2);
+      color: var(--accent);
+      font-size: 17px;
+      font-weight: 750;
+      letter-spacing: -.04em;
+    }
+    .brand-copy { display: grid; gap: 1px; }
+    .brand-copy strong { font-size: 15px; letter-spacing: -.01em; }
+    .brand-copy span { color: var(--muted); font-size: 12px; }
     .card {
-      background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 26px;
-      box-shadow: var(--shadow);
+      background: var(--surface);
+      padding: 28px;
     }
+    .card-head { margin-bottom: 22px; }
+    h1 {
+      margin: 0 0 5px;
+      font-size: 24px;
+      line-height: 1.15;
+      letter-spacing: -.035em;
+      font-weight: 700;
+    }
+    .card-head p { margin: 0; color: var(--muted); font-size: 13px; }
+    .field { margin-bottom: 16px; }
     label.field-label {
       display: block;
-      font-size: 13px;
-      color: var(--muted);
       margin-bottom: 6px;
-      font-weight: 600;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
     }
-    .field { margin-bottom: 16px; }
     input {
       width: 100%;
-      padding: 11px 12px;
+      min-height: 44px;
+      padding: 10px 12px;
       border: 1px solid var(--border);
-      border-radius: 9px;
-      font-size: 15px;
-      background: var(--surface);
+      border-radius: var(--control);
+      background: var(--surface-2);
       color: var(--text);
+      font: inherit;
+      font-size: 15px;
     }
-    input:focus, button:focus-visible, select:focus {
-      outline: 2px solid var(--accent);
+    input::placeholder { color: var(--muted); }
+    input:hover { border-color: var(--border-strong); }
+    input:focus, button:focus-visible, select:focus-visible {
+      outline: 3px solid var(--focus);
       outline-offset: 2px;
-    }
-    @media (max-width: 480px) {
-      input { font-size: 16px; }
+      border-color: var(--accent);
     }
     button {
       width: 100%;
-      padding: 11px 14px;
+      min-height: 44px;
+      padding: 10px 14px;
       border: 1px solid transparent;
-      border-radius: 9px;
+      border-radius: var(--control);
       background: var(--accent);
-      color: #fff;
-      font-size: 15px;
-      font-weight: 600;
+      color: var(--accent-ink);
+      font: inherit;
+      font-size: 14px;
+      font-weight: 700;
       cursor: pointer;
+      transition: background-color .16s ease, border-color .16s ease;
     }
     button:hover { background: var(--accent-hover); }
     .flash {
-      padding: 10px 14px;
-      border-radius: 9px;
       margin-bottom: 16px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--control);
       font-size: 13px;
-      border: 1px solid transparent;
     }
-    .flash.ok { background: var(--success-soft); color: var(--success); }
-    .flash.error { background: var(--danger-soft); color: var(--danger); }
-    .controls {
+    .flash.ok { background: var(--success-soft); border-color: var(--success-border); color: var(--success); }
+    .flash.error { background: var(--danger-soft); border-color: var(--danger-border); color: var(--danger); }
+    .preferences {
       display: flex;
       align-items: center;
-      justify-content: center;
+      justify-content: space-between;
       gap: 14px;
       flex-wrap: wrap;
       margin-top: 18px;
+      padding: 0 2px;
     }
-    .control {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .control select {
-      padding: 5px 7px;
+    .control { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    select {
+      min-height: 32px;
+      padding: 4px 7px;
       border: 1px solid var(--border);
-      border-radius: 7px;
-      font-size: 12px;
+      border-radius: 8px;
       background: var(--surface);
       color: var(--text);
+      font: inherit;
+      font-size: 12px;
+    }
+    .menu-shell { position: relative; }
+    .menu-trigger {
+      width: auto;
+      min-height: 32px;
+      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 500;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .menu-trigger:hover { background: var(--surface-2); border-color: var(--border-strong); }
+    .menu-chevron {
+      width: 6px;
+      height: 6px;
+      border-right: 1.5px solid currentColor;
+      border-bottom: 1.5px solid currentColor;
+      transform: translateY(-1px) rotate(45deg);
+      transition: transform .16s ease;
+    }
+    .menu-trigger[aria-expanded="true"] .menu-chevron { transform: translateY(1px) rotate(225deg); }
+    .menu-popover {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      z-index: 50;
+      min-width: 100%;
+      width: max-content;
+      max-width: 240px;
+      margin: 0;
+      padding: 4px;
+      list-style: none;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, .28);
+    }
+    .menu-popover[hidden] { display: none; }
+    .menu-option {
+      padding: 7px 9px;
+      border-radius: 7px;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.3;
+      cursor: pointer;
+      white-space: nowrap;
+      outline: none;
+    }
+    .menu-option:hover, .menu-option:focus { background: var(--surface-2); }
+    .menu-option[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+    .menu-option[aria-selected="true"]::after { content: "✓"; float: right; margin-left: 18px; color: var(--accent); }
+    .native-select { display: none !important; }
+    .footer {
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+    @media (max-width: 480px) {
+      main { padding: 24px 16px 20px; }
+      .card { padding: 22px; }
+      input, button { font-size: 16px; }
+      .preferences { justify-content: center; }
     }
     @media (prefers-reduced-motion: reduce) {
       * { transition: none !important; }
@@ -152,13 +266,21 @@
   </style>
 </head>
 <body>
-  <div class="login-wrap">
-    <div class="login-header">
-      <h1 data-i18n="heading">📝 Amministrazione — Note Markdown</h1>
-      <p data-i18n="subheading">Accesso riservato agli amministratori</p>
-    </div>
+  <main>
+    <header class="brand">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <span class="brand-copy">
+        <strong>Scripta</strong>
+        <span data-i18n="brandSubtitle">Console di amministrazione</span>
+      </span>
+    </header>
 
-    <div class="card">
+    <section class="card" aria-labelledby="login-title">
+      <div class="card-head">
+        <h1 id="login-title" data-i18n="heading">Accedi alla dashboard</h1>
+        <p data-i18n="subheading">Gestisci utenti e impostazioni del server.</p>
+      </div>
+
       {{if .Flash}}
         <div class="flash {{if .FlashIsError}}error{{else}}ok{{end}}" role="status">{{.Flash}}</div>
       {{end}}
@@ -190,35 +312,63 @@
         </div>
         <button type="submit" data-i18n="loginBtn">Accedi</button>
       </form>
-    </div>
+    </section>
 
-    <div class="controls">
-      <div class="control">
-        <label for="lang-select" data-i18n="langLabel">Lingua</label>
-        <select id="lang-select">
+    <div class="preferences">
+      <div class="control custom-select">
+        <span id="lang-label" data-i18n="langLabel">Lingua</span>
+        <div class="menu-shell">
+          <button type="button" class="menu-trigger" aria-haspopup="listbox" aria-expanded="false"
+            aria-controls="lang-menu" aria-labelledby="lang-label lang-menu-value">
+            <span id="lang-menu-value" data-menu-value>Sistema / Auto</span>
+            <span class="menu-chevron" aria-hidden="true"></span>
+          </button>
+          <ul id="lang-menu" class="menu-popover" role="listbox" aria-labelledby="lang-label" hidden>
+            <li class="menu-option" role="option" data-value="auto" aria-selected="true" data-i18n="langAuto">Sistema / Auto</li>
+            <li class="menu-option" role="option" data-value="it" aria-selected="false" data-i18n="langIt">Italiano</li>
+            <li class="menu-option" role="option" data-value="en" aria-selected="false" data-i18n="langEn">English</li>
+            <li class="menu-option" role="option" data-value="fr" aria-selected="false" data-i18n="langFr">Français</li>
+          </ul>
+        </div>
+        <select id="lang-select" class="native-select" hidden>
           <option value="auto" data-i18n="langAuto">Sistema / Auto</option>
           <option value="it" data-i18n="langIt">Italiano</option>
           <option value="en" data-i18n="langEn">English</option>
           <option value="fr" data-i18n="langFr">Français</option>
         </select>
       </div>
-      <div class="control">
-        <label for="theme-select" data-i18n="themeLabel">Tema</label>
-        <select id="theme-select">
+      <div class="control custom-select">
+        <span id="theme-label" data-i18n="themeLabel">Tema</span>
+        <div class="menu-shell">
+          <button type="button" class="menu-trigger" aria-haspopup="listbox" aria-expanded="false"
+            aria-controls="theme-menu" aria-labelledby="theme-label theme-menu-value">
+            <span id="theme-menu-value" data-menu-value>Scuro</span>
+            <span class="menu-chevron" aria-hidden="true"></span>
+          </button>
+          <ul id="theme-menu" class="menu-popover" role="listbox" aria-labelledby="theme-label" hidden>
+            <li class="menu-option" role="option" data-value="auto" aria-selected="false" data-i18n="themeAuto">Sistema / Auto</li>
+            <li class="menu-option" role="option" data-value="light" aria-selected="false" data-i18n="themeLight">Chiaro</li>
+            <li class="menu-option" role="option" data-value="dark" aria-selected="true" data-i18n="themeDark">Scuro</li>
+          </ul>
+        </div>
+        <select id="theme-select" class="native-select" hidden>
           <option value="auto" data-i18n="themeAuto">Sistema / Auto</option>
           <option value="light" data-i18n="themeLight">Chiaro</option>
           <option value="dark" data-i18n="themeDark">Scuro</option>
         </select>
       </div>
     </div>
-  </div>
+
+    <p class="footer">Scripta Notes Server</p>
+  </main>
 
   <script nonce="{{.Nonce}}">
     var translations = {
       it: {
-        pageTitle: 'Accesso Admin · Note Markdown',
-        heading: '📝 Amministrazione — Note Markdown',
-        subheading: 'Accesso riservato agli amministratori',
+        pageTitle: 'Admin · Scripta',
+        heading: 'Accedi alla dashboard',
+        subheading: 'Gestisci utenti e impostazioni del server.',
+        brandSubtitle: 'Console di amministrazione',
         usernameLabel: 'Username',
         passwordLabel: 'Password',
         loginBtn: 'Accedi',
@@ -233,12 +383,13 @@
         themeDark: 'Scuro'
       },
       en: {
-        pageTitle: 'Admin Login · Markdown Notes',
-        heading: '📝 Administration — Markdown Notes',
-        subheading: 'Access restricted to administrators',
+        pageTitle: 'Admin · Scripta',
+        heading: 'Sign in to the dashboard',
+        subheading: 'Manage users and server settings.',
+        brandSubtitle: 'Administration console',
         usernameLabel: 'Username',
         passwordLabel: 'Password',
-        loginBtn: 'Log in',
+        loginBtn: 'Sign in',
         langLabel: 'Language',
         langAuto: 'System / Auto',
         langIt: 'Italiano',
@@ -250,9 +401,10 @@
         themeDark: 'Dark'
       },
       fr: {
-        pageTitle: 'Connexion Admin · Notes Markdown',
-        heading: '📝 Administration — Notes Markdown',
-        subheading: 'Accès réservé aux administrateurs',
+        pageTitle: 'Admin · Scripta',
+        heading: 'Connexion à la dashboard',
+        subheading: 'Gérez les utilisateurs et les paramètres du serveur.',
+        brandSubtitle: 'Console d’administration',
         usernameLabel: "Nom d'utilisateur",
         passwordLabel: 'Mot de passe',
         loginBtn: 'Se connecter',
@@ -288,6 +440,101 @@
         var key = el.getAttribute('data-i18n');
         if (dict[key] !== undefined) el.textContent = dict[key];
       });
+      document.querySelectorAll('.native-select').forEach(syncCustomSelect);
+    }
+
+    function closeCustomSelect(root, refocus) {
+      var trigger = root.querySelector('.menu-trigger');
+      var list = root.querySelector('.menu-popover');
+      if (!trigger || !list) return;
+      var wasOpen = !list.hidden;
+      list.hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      if (refocus && wasOpen) trigger.focus();
+    }
+
+    function closeAllCustomSelects(except) {
+      document.querySelectorAll('.custom-select').forEach(function (root) {
+        if (root !== except) closeCustomSelect(root, false);
+      });
+    }
+
+    function syncCustomSelect(select) {
+      var root = select.closest('.custom-select');
+      if (!root) return;
+      var options = root.querySelectorAll('.menu-option');
+      var current = null;
+      options.forEach(function (option) {
+        var selected = option.getAttribute('data-value') === select.value;
+        option.setAttribute('aria-selected', selected ? 'true' : 'false');
+        option.tabIndex = selected ? 0 : -1;
+        if (selected) current = option;
+      });
+      var label = root.querySelector('[data-menu-value]');
+      if (label && current) label.textContent = current.textContent.trim();
+    }
+
+    function selectCustomOption(root, select, option) {
+      if (!option) return;
+      select.value = option.getAttribute('data-value');
+      syncCustomSelect(select);
+      closeCustomSelect(root, true);
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function openCustomSelect(root) {
+      closeAllCustomSelects(root);
+      var trigger = root.querySelector('.menu-trigger');
+      var list = root.querySelector('.menu-popover');
+      if (!trigger || !list) return;
+      list.hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      var selected = list.querySelector('[aria-selected="true"]') || list.querySelector('.menu-option');
+      if (selected) selected.focus();
+    }
+
+    function initCustomSelect(select) {
+      var root = select.closest('.custom-select');
+      if (!root) return;
+      var trigger = root.querySelector('.menu-trigger');
+      var list = root.querySelector('.menu-popover');
+      var options = Array.prototype.slice.call(root.querySelectorAll('.menu-option'));
+      if (!trigger || !list || !options.length) return;
+
+      trigger.addEventListener('click', function () {
+        if (list.hidden) openCustomSelect(root);
+        else closeCustomSelect(root, true);
+      });
+      trigger.addEventListener('keydown', function (ev) {
+        if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+          ev.preventDefault();
+          openCustomSelect(root);
+        }
+      });
+      options.forEach(function (option, index) {
+        option.addEventListener('click', function () {
+          selectCustomOption(root, select, option);
+        });
+        option.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') {
+            ev.preventDefault();
+            selectCustomOption(root, select, option);
+          } else if (ev.key === 'Escape') {
+            ev.preventDefault();
+            closeCustomSelect(root, true);
+          } else if (ev.key === 'Tab') {
+            closeCustomSelect(root, false);
+          } else if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            var step = ev.key === 'ArrowDown' ? 1 : -1;
+            options[(index + step + options.length) % options.length].focus();
+          } else if (ev.key === 'Home' || ev.key === 'End') {
+            ev.preventDefault();
+            options[ev.key === 'Home' ? 0 : options.length - 1].focus();
+          }
+        });
+      });
+      syncCustomSelect(select);
     }
 
     function resolveTheme(pref) {
@@ -300,7 +547,7 @@
       var theme = resolveTheme(pref);
       document.documentElement.setAttribute('data-theme', theme);
       var meta = document.querySelector('meta[name="theme-color"]');
-      if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b1120' : '#f6f7fb');
+      if (meta) meta.setAttribute('content', theme === 'dark' ? '#0b0f0d' : '#f2f5f3');
     }
 
     document.addEventListener('DOMContentLoaded', function () {
@@ -308,6 +555,7 @@
       var THEME_KEY = 'scripta_admin_theme';
 
       var langSelect = document.getElementById('lang-select');
+      initCustomSelect(langSelect);
       var storedLang = localStorage.getItem(LANG_KEY) || 'auto';
       langSelect.value = storedLang;
       applyTranslations(resolveLang(storedLang));
@@ -317,17 +565,27 @@
       });
 
       var themeSelect = document.getElementById('theme-select');
-      var storedTheme = localStorage.getItem(THEME_KEY) || 'auto';
+      initCustomSelect(themeSelect);
+      var storedTheme = localStorage.getItem(THEME_KEY) || 'dark';
       themeSelect.value = storedTheme;
       applyTheme(storedTheme);
+      syncCustomSelect(themeSelect);
       themeSelect.addEventListener('change', function () {
         localStorage.setItem(THEME_KEY, themeSelect.value);
         applyTheme(themeSelect.value);
       });
+      document.addEventListener('click', function (ev) {
+        document.querySelectorAll('.custom-select').forEach(function (root) {
+          if (!root.contains(ev.target)) closeCustomSelect(root, false);
+        });
+      });
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') closeAllCustomSelects(null);
+      });
       if (window.matchMedia) {
         var query = window.matchMedia('(prefers-color-scheme: dark)');
         var onChange = function () {
-          if ((localStorage.getItem(THEME_KEY) || 'auto') === 'auto') applyTheme('auto');
+          if ((localStorage.getItem(THEME_KEY) || 'dark') === 'auto') applyTheme('auto');
         };
         if (query.addEventListener) query.addEventListener('change', onChange);
       }
