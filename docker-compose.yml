@@ -18,8 +18,11 @@ services:
       ADMIN_USER: "${ADMIN_USER:?Impostare ADMIN_USER}"
       ADMIN_PASS: "${ADMIN_PASS:?Impostare ADMIN_PASS (min 12 caratteri)}"
       # IP/CIDR dei reverse proxy fidati (separati da virgola). Solo da questi
-      # peer vengono creduti Cf-Connecting-IP / X-Forwarded-For. Vuoto = mai.
+      # peer viene creduto l'header scelto sotto. Vuoto = mai.
       TRUSTED_PROXIES: "${TRUSTED_PROXIES:-}"
+      # Unico header di inoltro creduto: cf-connecting-ip (default quando
+      # TRUSTED_PROXIES è impostato), x-forwarded-for o none. Vuoto = default.
+      TRUSTED_CLIENT_IP_HEADER: "${TRUSTED_CLIENT_IP_HEADER:-}"
       # Durata del token di accesso (formato Go, es. 1h, 720h). Vuoto = default
       # del server (1h). Il refresh token evita i re-login frequenti; logout e
       # reset password invalidano subito access e refresh token.

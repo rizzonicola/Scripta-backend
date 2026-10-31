@@ -38,10 +38,12 @@ func TestConfigRejectsWhitespaceOnlySecrets(t *testing.T) {
 	}
 }
 
-func TestTombstonePurgeCutoffIncludesSafetyMargin(t *testing.T) {
-	now := time.UnixMilli(1_700_000_000_000)
-	want := now.Add(-handlers.TombstoneRetention - handlers.TombstonePurgeSafetyMargin).UnixMilli()
-	if got := tombstonePurgeCutoff(now); got != want {
+func TestTombstonePurgeCutoffUsesStampAndIncludesSafetyMargin(t *testing.T) {
+	// La retention è nella linea temporale degli stamp, non dell'orologio:
+	// anche un salto in avanti dell'orologio non deve far scadere i tombstone.
+	latestStamp := int64(1_700_000_000_000)
+	want := latestStamp - (handlers.TombstoneRetention + handlers.TombstonePurgeSafetyMargin).Milliseconds()
+	if got := tombstonePurgeCutoff(latestStamp); got != want {
 		t.Fatalf("cutoff = %d, atteso %d", got, want)
 	}
 }

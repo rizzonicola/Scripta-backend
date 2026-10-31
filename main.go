@@ -96,7 +96,10 @@ type config struct {
 	RefreshTTL      time.Duration
 	AdminSessionTTL time.Duration
 	TrustedProxies  []string
-	SyncMaxBody     int64
+	// TrustedClientIPHeader è l'unico header di inoltro creduto quando la
+	// connessione arriva da un proxy in TrustedProxies. Vuoto = nessuno.
+	TrustedClientIPHeader string
+	SyncMaxBody           int64
 
 	TursoURL      string
 	TursoToken    string
@@ -139,6 +142,20 @@ func loadConfig() (config, error) {
 		TrustedProxies:  middleware.ParseTrustedProxies(os.Getenv("TRUSTED_PROXIES")),
 		TursoURL:        os.Getenv("TURSO_SYNC_URL"),
 		TursoToken:      os.Getenv("TURSO_AUTH_TOKEN"),
+	}
+
+	// Header di inoltro: scelta esplicita. Per compatibilità con le
+	// installazioni dietro Cloudflare, se TRUSTED_PROXIES è impostato e la
+	// variabile non lo è, si assume cf-connecting-ip; "none" lo disabilita.
+	rawIPHeader := strings.ToLower(strings.TrimSpace(os.Getenv("TRUSTED_CLIENT_IP_HEADER")))
+	if rawIPHeader == "" && len(c.TrustedProxies) > 0 {
+		rawIPHeader = "cf-connecting-ip"
+	}
+	switch rawIPHeader {
+	case "", "none", "cf-connecting-ip", "x-forwarded-for":
+		c.TrustedClientIPHeader = rawIPHeader
+	default:
+		return c, fmt.Errorf("configurazione non valida: TRUSTED_CLIENT_IP_HEADER=%q (usare cf-connecting-ip, x-forwarded-for o none)", rawIPHeader)
 	}
 
 	var problems []string
@@ -213,6 +230,9 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	refreshTokensRepo := db.NewRefreshTokensRepo(sqlDB)
 
 	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminSessionTTL)
+	if err := adminSessions.AttachStore(context.Background(), db.NewRevocationRepo(sqlDB)); err != nil {
+		return nil, fmt.Errorf("caricamento revoche sessioni admin: %w", err)
+	}
 
 	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, refreshTokensRepo, adminSessions, serverSettingsRepo, cfg.AdminUser, cfg.AdminPass, templatesFS)
 	if err != nil {
@@ -235,7 +255,7 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	// X-Forwarded-For sono creduti SOLO se il peer è in TRUSTED_PROXIES
 	// (vedi middleware.ClientIPResolver). Il WAF Cloudflare resta la prima
 	// linea di difesa; questa è la seconda.
-	ips, err := middleware.NewClientIPResolver(cfg.TrustedProxies)
+	ips, err := middleware.NewClientIPResolver(cfg.TrustedProxies, cfg.TrustedClientIPHeader)
 	if err != nil {
 		return nil, err
 	}
@@ -243,6 +263,10 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	// dashboard admin (e viceversa), soprattutto dietro NAT condivisi.
 	apiLoginRateLimit := middleware.RateLimit(0.5, 5, ips)
 	adminLoginRateLimit := middleware.RateLimit(0.5, 5, ips)
+	// Il refresh è pubblico e ogni chiamata valida crea una nuova riga. Un
+	// limite più permissivo del login evita di penalizzare più dispositivi,
+	// ma impedisce che un singolo IP generi rotazioni a raffica.
+	refreshRateLimit := middleware.RateLimit(2, 20, ips)
 	sameOrigin := middleware.RequireSameOrigin
 
 	mux := http.NewServeMux()
@@ -262,10 +286,10 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler
 	// --- API pubbliche ---
 	mux.Handle("/api/v1/auth/login", apiLoginRateLimit(http.HandlerFunc(authHandler.Login)))
 	// Il refresh è pubblico perché deve funzionare anche con l'access token
-	// scaduto; il possesso del refresh token opaco è la credenziale. Non usa
-	// il rate limit del login (0.5 req/s) perché più dispositivi possono
-	// rinnovare quasi insieme.
-	mux.HandleFunc("/api/v1/auth/refresh", authHandler.Refresh)
+	// scaduto; il possesso del refresh token opaco è la credenziale. Ha un
+	// limite per IP più ampio di quello del login ma comunque finito, perché
+	// ogni rotazione valida aggiunge una riga alla tabella.
+	mux.Handle("/api/v1/auth/refresh", refreshRateLimit(http.HandlerFunc(authHandler.Refresh)))
 	// Il logout accetta un access token valido oppure il refresh token: deve
 	// chiudere la famiglia anche se l'access token è già scaduto.
 	mux.HandleFunc("/api/v1/auth/logout", authHandler.Logout)
@@ -312,6 +336,10 @@ func main() {
 	if err := tokenManager.AttachStore(rootCtx, db.NewRevocationRepo(sqlDB)); err != nil {
 		log.Fatalf("caricamento revoche token: %v", err)
 	}
+	// Con più istanze sullo stesso primary, una revoca scritta da un'altra
+	// istanza deve diventare visibile anche qui senza riavvio.
+	stopRevocationReload := startRevocationReloadLoop(rootCtx, tokenManager)
+	defer stopRevocationReload()
 
 	handler, err := buildRouter(cfg, sqlDB, tokenManager)
 	if err != nil {
@@ -379,12 +407,50 @@ const walCheckpointInterval = 1 * time.Hour
 // (incremental_vacuum) + checkpoint del WAL.
 const tombstonePurgeInterval = 24 * time.Hour
 
+// revocationReloadInterval è ogni quanto un processo rilegge dal DB le
+// revoche scritte da altre istanze. Con una sola istanza il costo è una query
+// ogni 30 s; con più istanze limita la finestra di revoca non immediata.
+const revocationReloadInterval = 30 * time.Second
+
+// startRevocationReloadLoop rilegge periodicamente le revoche JWT dal DB.
+// Restituisce una funzione di stop che attende la fine del ciclo: va chiamata
+// prima di chiudere il pool SQL.
+func startRevocationReloadLoop(ctx context.Context, tm *auth.TokenManager) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(revocationReloadInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reloadCtx, reloadCancel := context.WithTimeout(ctx, 10*time.Second)
+				if err := tm.ReloadRevocations(reloadCtx); err != nil {
+					log.Printf("reload revoche token fallito, riprovo al prossimo giro: %v", err)
+				}
+				reloadCancel()
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 // tombstonePurgeCutoff calcola il limite di synced_at sotto il quale un
-// tombstone può essere eliminato fisicamente. Include un margine oltre la
-// retention per non cancellare tombstone che una sync già in volo deve
-// ancora consegnare.
-func tombstonePurgeCutoff(now time.Time) int64 {
-	return now.Add(-handlers.TombstoneRetention - handlers.TombstonePurgeSafetyMargin).UnixMilli()
+// tombstone può essere eliminato fisicamente. Il riferimento è l'ultimo stamp
+// emesso dal server, NON l'orologio: la retention è espressa nella stessa
+// linea temporale dei cursori dei client. Se l'orologio salta avanti, usare
+// time.Now() farebbe scadere all'istante tombstone ancora dentro la finestra
+// dei cursori e un dispositivo non riceverebbe mai la cancellazione. Include
+// un margine oltre la retention per non cancellare tombstone che una sync già
+// in volo deve ancora consegnare.
+func tombstonePurgeCutoff(latestStamp int64) int64 {
+	return latestStamp - (handlers.TombstoneRetention + handlers.TombstonePurgeSafetyMargin).Milliseconds()
 }
 
 // startTombstonePurgeLoop avvia una goroutine in background con due cicli
@@ -409,26 +475,34 @@ func tombstonePurgeCutoff(now time.Time) int64 {
 func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRepo *db.NotesRepo, foldersRepo *db.FoldersRepo, refreshTokensRepo *db.RefreshTokensRepo, sqlDB *sql.DB, isLocalDB bool) func() {
 	ctx, cancel := context.WithCancel(ctx)
 	purgeAndReclaim := func() {
-		cutoff := tombstonePurgeCutoff(time.Now())
 		purgeCtx, purgeCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer purgeCancel()
 
 		var nDeleted, fDeleted int64
-		var err error
 
-		nDeleted, err = notesRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
+		// Riferimento della retention: l'ultimo stamp effettivamente emesso.
+		// Se non è leggibile (o non c'è ancora stato alcun sync) si salta la
+		// purge: meglio rimandare che cancellare tombstone ancora necessari.
+		latestStamp, err := db.NewSyncStateRepo(sqlDB).GetInt(purgeCtx, db.StampLastKey)
 		if err != nil {
-			log.Printf("purge tombstone note fallito: %v", err)
-		} else if nDeleted > 0 {
-			log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s (+ margine)", nDeleted, handlers.TombstoneRetention)
-		}
+			log.Printf("purge tombstone saltata: lettura ultimo stamp fallita: %v", err)
+		} else if latestStamp > 0 {
+			cutoff := tombstonePurgeCutoff(latestStamp)
 
-		fDeleted, err = foldersRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
-		if err != nil {
-			log.Printf("purge tombstone cartelle fallito: %v", err)
-		} else if fDeleted > 0 {
-			log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s (+ margine)", fDeleted, handlers.TombstoneRetention)
+			nDeleted, err = notesRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
+			if err != nil {
+				log.Printf("purge tombstone note fallito: %v", err)
+			} else if nDeleted > 0 {
+				log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s (+ margine)", nDeleted, handlers.TombstoneRetention)
+			}
+
+			fDeleted, err = foldersRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
+			if err != nil {
+				log.Printf("purge tombstone cartelle fallito: %v", err)
+			} else if fDeleted > 0 {
+				log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s (+ margine)", fDeleted, handlers.TombstoneRetention)
+			}
 		}
-		purgeCancel()
 
 		maintCtx, maintCancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer maintCancel()
@@ -449,6 +523,9 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 		tm.PurgeExpired(ctx)
 		if err := refreshTokensRepo.PurgeExpired(ctx, time.Now()); err != nil {
 			log.Printf("purge refresh token scaduti fallito: %v", err)
+		}
+		if err := refreshTokensRepo.PurgeRevoked(ctx, time.Now(), db.RefreshTokenRevokedRetention); err != nil {
+			log.Printf("purge refresh token revocati fallito: %v", err)
 		}
 	}
 

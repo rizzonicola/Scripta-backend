@@ -91,7 +91,8 @@ Il volume Docker `notes-data` persiste il database SQLite (utenti, cartelle e no
 | `ADMIN_SESSION_TTL` | `8h`                  | Durata del cookie di sessione admin (`time.Duration`) |
 | `ADMIN_USER`      | **obbligatorio**        | Username login dashboard `/admin`             |
 | `ADMIN_PASS`      | **obbligatorio** (≥12 car.) | Password login dashboard `/admin` (nessun default) |
-| `TRUSTED_PROXIES` | *(vuoto)*               | IP/CIDR dei reverse proxy fidati, separati da virgola. Solo da questi peer sono creduti `Cf-Connecting-IP` / `X-Forwarded-For` (rate limit per IP reale). Vuoto = si usa sempre l'IP del peer TCP |
+| `TRUSTED_PROXIES` | *(vuoto)*               | IP/CIDR dei reverse proxy fidati, separati da virgola. Solo da questi peer sono creduti gli header di inoltro (rate limit per IP reale). Vuoto = si usa sempre l'IP del peer TCP |
+| `TRUSTED_CLIENT_IP_HEADER` | `cf-connecting-ip` se `TRUSTED_PROXIES` è impostato, altrimenti vuoto | Unico header di inoltro creduto dai proxy fidati: `cf-connecting-ip`, `x-forwarded-for` o `none`. `none` disabilita gli header anche per i proxy fidati. Un valore diverso blocca l'avvio |
 | `TURSO_SYNC_URL`  | *(vuoto)*               | Primario libSQL/Turso per la modalità embedded replica (`libsql://`, `https://`, `wss://`; `http://`/`ws://` solo loopback). Vuoto = database locale puro |
 | `TURSO_AUTH_TOKEN`| *(vuoto)*               | Token di autenticazione per `TURSO_SYNC_URL` |
 | `TURSO_SYNC_INTERVAL` | `0`                 | Intervallo di sync automatica della replica (`time.Duration`); `0` = sync solo all'apertura |
