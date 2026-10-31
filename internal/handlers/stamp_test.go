@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,6 +51,15 @@ func persistedHWM(t *testing.T, sqlDB *sql.DB) int64 {
 	v, err := db.NewSyncStateRepo(sqlDB).GetInt(context.Background(), db.StampHWMKey)
 	if err != nil {
 		t.Fatalf("lettura hwm: %v", err)
+	}
+	return v
+}
+
+func persistedLastStamp(t *testing.T, sqlDB *sql.DB) int64 {
+	t.Helper()
+	v, err := db.NewSyncStateRepo(sqlDB).GetInt(context.Background(), db.StampLastKey)
+	if err != nil {
+		t.Fatalf("lettura ultimo stamp: %v", err)
 	}
 	return v
 }
@@ -134,5 +144,108 @@ func TestStampNeverExceedsPersistedHighWaterMark(t *testing.T) {
 		if hwm := persistedHWM(t, sqlDB); r.ServerTime > hwm {
 			t.Fatalf("giro %d: stamp %d oltre l'hwm persistito %d", i, r.ServerTime, hwm)
 		}
+	}
+}
+
+// L'ultimo stamp allocato è persistito nella stessa transazione che scrive le
+// righe: dopo un riavvio l'allocatore riparte da lì.
+func TestStampLastIsPersistedWithTheSync(t *testing.T) {
+	sqlDB, userID := newStampTestDB(t)
+	clock := time.UnixMilli(1_800_000_000_000)
+	h := handlerWithClock(sqlDB, &clock)
+
+	r := syncAt(t, h, userID, 0)
+	if got := persistedLastStamp(t, sqlDB); got != r.ServerTime {
+		t.Fatalf("stamp_last=%d, server_time=%d", got, r.ServerTime)
+	}
+}
+
+// Un batch rifiutato fa rollback anche dell'allocazione: nessuno stamp viene
+// consumato e il client non può avanzare il cursore.
+func TestStampAllocationRollsBackWithRejectedBatch(t *testing.T) {
+	sqlDB, userID := newStampTestDB(t)
+	clock := time.UnixMilli(1_800_000_000_000)
+	h := handlerWithClock(sqlDB, &clock)
+
+	res := h.process(context.Background(), userID, &models.SyncRequest{
+		LastSyncedAt: 0,
+		Folders:      []models.FolderDTO{},
+		Notes: []models.NoteDTO{{
+			ID:        "nota-non-valida",
+			CreatedAt: 0, // rifiutata: created_at obbligatorio
+		}},
+	})
+	if res.resp != nil || len(res.rejected) == 0 {
+		t.Fatalf("batch non rifiutato: resp=%v rejected=%v", res.resp, res.rejected)
+	}
+	if got := persistedLastStamp(t, sqlDB); got != 0 {
+		t.Fatalf("stamp consumato da un batch rifiutato: %d", got)
+	}
+
+	// La sync successiva riparte senza «buchi» e lo stamp è persistito.
+	r := syncAt(t, h, userID, 0)
+	if got := persistedLastStamp(t, sqlDB); got != r.ServerTime {
+		t.Fatalf("stamp_last=%d, server_time=%d", got, r.ServerTime)
+	}
+}
+
+// Più connessioni/processi sullo stesso database non devono mai ottenere lo
+// stesso stamp: INSERT ... ON CONFLICT è la prima scrittura di ogni tx.
+func TestStampAllocationIsAtomicAcrossConnections(t *testing.T) {
+	sqlDB, _ := newStampTestDB(t)
+	const workers = 4
+	const perWorker = 10
+	const candidate = int64(1_000_000)
+
+	stamps := make(chan int64, workers*perWorker)
+	errs := make(chan error, workers*perWorker)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				tx, err := sqlDB.BeginTx(context.Background(), nil)
+				if err != nil {
+					errs <- err
+					return
+				}
+				stamp, err := db.NewSyncStateRepo(tx).AllocateStamp(context.Background(), candidate)
+				if err != nil {
+					_ = tx.Rollback()
+					errs <- err
+					return
+				}
+				if err := tx.Commit(); err != nil {
+					errs <- err
+					return
+				}
+				stamps <- stamp
+			}
+		}()
+	}
+	wg.Wait()
+	close(stamps)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("allocazione concorrente: %v", err)
+	}
+
+	seen := make(map[int64]bool, workers*perWorker)
+	var max int64
+	for s := range stamps {
+		if seen[s] {
+			t.Fatalf("stamp duplicato: %d", s)
+		}
+		seen[s] = true
+		if s > max {
+			max = s
+		}
+	}
+	if len(seen) != workers*perWorker {
+		t.Fatalf("allocati %d stamp, attesi %d", len(seen), workers*perWorker)
+	}
+	if got := persistedLastStamp(t, sqlDB); got != max {
+		t.Fatalf("stamp_last=%d, massimo allocato=%d", got, max)
 	}
 }

@@ -98,21 +98,11 @@ type SyncHandler struct {
 		Allow(userID string) bool
 	}
 
-	// stampMu serializza le sync e garantisce che gli stamp (synced_at)
-	// assegnati siano strettamente crescenti nell'ordine di commit: vedi
-	// nextStamp. Il server è un singolo processo con un singolo writer
-	// SQLite, quindi la serializzazione non costa throughput reale.
-	stampMu   sync.Mutex
-	lastStamp int64
-
-	// Y-04: high-water mark persistente degli stamp. Invariante: ogni stamp
-	// consegnato a un client è <= dell'hwm GIÀ scritto su disco. Dopo un
-	// riavvio lastStamp riparte dall'hwm, quindi i nuovi stamp superano ogni
-	// cursore mai consegnato, anche se l'orologio di sistema è tornato
-	// indietro. Tutti e tre i campi sono protetti da stampMu.
-	SyncState   *db.SyncStateRepo // bound a SQLDB (creato al bisogno)
-	stampLoaded bool
-	stampHWM    int64
+	// stampMu serializza le sync di questo processo. Gli stamp sono allocati
+	// dentro la transazione (vedi reserveStampTx) e il lock di scrittura
+	// SQLite serializza i processi; il mutex evita comunque che più sync
+	// locali si accodino sul lock del database.
+	stampMu sync.Mutex
 
 	// clock è un gancio per i test (orologio finto). Nil = time.Now.
 	clock func() time.Time
@@ -123,7 +113,6 @@ func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
 		SQLDB:        sqlDB,
 		Folders:      db.NewFoldersRepo(sqlDB),
 		Notes:        db.NewNotesRepo(sqlDB),
-		SyncState:    db.NewSyncStateRepo(sqlDB),
 		Settings:     db.NewServerSettingsRepo(sqlDB),
 		MaxBodyBytes: defaultMaxSyncBodyBytes,
 	}
@@ -141,19 +130,6 @@ func isTransientBusyErr(err error) bool {
 		strings.Contains(msg, "sqlite_busy")
 }
 
-// nextStamp restituisce lo stamp SERVER per la sync corrente: l'orologio
-// del server, ma mai <= dello stamp precedente (monotono anche se l'orologio
-// di sistema torna indietro). DEVE essere chiamata con stampMu acquisito,
-// DENTRO la sezione critica che comprende anche il commit.
-func (h *SyncHandler) nextStamp() int64 {
-	now := h.nowMillis()
-	if now <= h.lastStamp {
-		now = h.lastStamp + 1
-	}
-	h.lastStamp = now
-	return now
-}
-
 // nowMillis è l'orologio di sistema in millisecondi (sostituibile nei test).
 func (h *SyncHandler) nowMillis() int64 {
 	if h.clock != nil {
@@ -162,44 +138,43 @@ func (h *SyncHandler) nowMillis() int64 {
 	return time.Now().UnixMilli()
 }
 
-// reserveStamp assegna lo stamp della sync corrente (Y-04). DEVE essere
-// chiamata con stampMu acquisito e PRIMA di aprire la transazione di sync.
+// reserveStampTx assegna lo stamp della sync corrente (Y-04) come PRIMA
+// scrittura della transazione. DEVE essere chiamata con stampMu acquisito e
+// con tx già aperta.
 //
-// Perché serve: lastStamp solo in RAM ripartiva da zero a ogni riavvio. Con
-// l'orologio di sistema tornato indietro (step NTP, snapshot di VM/container)
-// i nuovi stamp risultavano minori dei cursori già consegnati e le righe
-// scritte da quel momento non arrivavano mai ai dispositivi, senza errori.
-// Persistere MAX(synced_at) non basta: lo stamp di una sync a vuoto non è
-// scritto in nessuna riga. Si persiste quindi il massimo stamp EMESSO, con un
-// margine («lease»): si scrive su disco solo quando lo stamp raggiunge l'hwm
-// già scritto, cioè al massimo una volta per stampLease.
+// Perché dentro la transazione: l'allocazione solo in RAM non era sicura con
+// più processi sullo stesso database. Due sync potevano ottenere stamp
+// crescenti ma committare in ordine inverso; il cursore della sync committata
+// per seconda «scavalcava» le righe della prima, che non venivano mai
+// consegnate. Facendo dell'allocazione la prima scrittura del tx, il lock di
+// scrittura SQLite serializza allocazione e commit: l'ordine degli stamp è
+// l'ordine di commit.
 //
-// Se la scrittura dell'hwm fallisce NON si consegna nessuno stamp (si
-// risponde con un errore e il client riprova): consegnare uno stamp oltre
-// l'hwm persistente romperebbe l'invariante. Non cambia il significato del
-// cursore, né LWW, né i tombstone: è solo più restrittivo di prima.
-func (h *SyncHandler) reserveStamp(ctx context.Context) (int64, error) {
-	if h.SyncState == nil {
-		h.SyncState = db.NewSyncStateRepo(h.SQLDB)
+// StampLastKey rende l'allocazione persistente: dopo un riavvio (anche con
+// l'orologio di sistema indietro, step NTP o snapshot di VM/container) il
+// prossimo stamp è sempre maggiore dell'ultimo emesso. Persistere
+// MAX(synced_at) non basterebbe: lo stamp di una sync a vuoto non è scritto
+// in nessuna riga. StampHWMKey resta un high-water mark con lease, esteso
+// solo quando lo stamp lo raggiunge (al massimo una scrittura per
+// stampLease), così l'invariante «stamp consegnato ≤ hwm persistito» vale
+// anche per la riparazione dei cicli.
+//
+// Se una delle scritture fallisce la transazione viene annullata e nessuno
+// stamp viene consegnato: il client riprova.
+func (h *SyncHandler) reserveStampTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+	state := db.NewSyncStateRepo(tx)
+	stamp, err := state.AllocateStamp(ctx, h.nowMillis())
+	if err != nil {
+		return 0, err
 	}
-	if !h.stampLoaded {
-		hwm, err := h.SyncState.GetInt(ctx, db.StampHWMKey)
-		if err != nil {
+	hwm, err := state.GetInt(ctx, db.StampHWMKey)
+	if err != nil {
+		return 0, err
+	}
+	if stamp >= hwm {
+		if err := state.SetMaxInt(ctx, db.StampHWMKey, stamp+stampLease.Milliseconds()); err != nil {
 			return 0, err
 		}
-		h.stampHWM = hwm
-		if hwm > h.lastStamp {
-			h.lastStamp = hwm
-		}
-		h.stampLoaded = true
-	}
-	stamp := h.nextStamp()
-	if stamp >= h.stampHWM {
-		newHWM := stamp + stampLease.Milliseconds()
-		if err := h.SyncState.SetMaxInt(ctx, db.StampHWMKey, newHWM); err != nil {
-			return 0, err
-		}
-		h.stampHWM = newHWM
 	}
 	return stamp, nil
 }
@@ -537,17 +512,6 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 	// sync successiva ha uno stamp maggiore di quello restituito qui.
 	h.stampMu.Lock()
 	defer h.stampMu.Unlock()
-	now, err := h.reserveStamp(ctx)
-	if err != nil {
-		if ctx.Err() != nil {
-			return syncResult{aborted: true} // client disconnesso
-		}
-		if isTransientBusyErr(err) {
-			return syncResult{status: http.StatusServiceUnavailable, message: "database temporaneamente occupato, riprovare", retryAfter: true}
-		}
-		log.Printf("sync: errore stato stamp: %v", err)
-		return failure(http.StatusInternalServerError, "errore stato sync")
-	}
 
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
@@ -563,6 +527,21 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 			_ = tx.Rollback()
 		}
 	}()
+
+	// Prima scrittura della transazione: da qui in poi il lock di scrittura
+	// SQLite è nostro, quindi l'allocazione dello stamp e il commit delle
+	// righe sono serializzati rispetto agli altri processi.
+	now, err := h.reserveStampTx(ctx, tx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return syncResult{aborted: true} // client disconnesso
+		}
+		if isTransientBusyErr(err) {
+			return syncResult{status: http.StatusServiceUnavailable, message: "database temporaneamente occupato, riprovare", retryAfter: true}
+		}
+		log.Printf("sync: errore stato stamp: %v", err)
+		return failure(http.StatusInternalServerError, "errore stato sync")
+	}
 
 	foldersTx := db.NewFoldersRepo(tx)
 	notesTx := db.NewNotesRepo(tx)
