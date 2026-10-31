@@ -10,7 +10,8 @@
 # 1.26.9 correggono net/http, net/textproto, crypto/tls e html/template;
 # crypto/x509 richiede 1.26.10 (GO-2026-6809). Il tag è fissato alla patch
 # verificata per rendere la build riproducibile.
-FROM golang:1.26.10-bookworm AS builder
+# Digest multi-arch (OCI index) fissato: il tag da solo può essere ripuntato.
+FROM golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS builder
 
 WORKDIR /src
 
@@ -35,7 +36,7 @@ RUN go build -ldflags="-s -w" -o /out/notes-server .
 
 # --- Stage 2: runtime ---
 # debian-slim (glibc) invece di alpine: vedi nota sopra sul binding nativo.
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     ca-certificates \

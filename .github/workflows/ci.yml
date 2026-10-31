@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -30,6 +32,9 @@ jobs:
       # go-libsql è un binding CGO: gcc è già presente su ubuntu-latest.
       - name: Download modules
         run: go mod download
+
+      - name: Verify module checksums
+        run: go mod verify
 
       - name: Verify go.mod / go.sum are tidy
         run: |
