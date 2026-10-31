@@ -22,6 +22,11 @@ type Claims struct {
 	// confronto con una revoca rendeva "revocato" anche un token emesso
 	// subito DOPO il reset password, nello stesso secondo della revoca.
 	IssuedAtMillis int64 `json:"iat_ms,omitempty"`
+	// PasswordVersion è l'epoch della password al momento del login. Il
+	// middleware la confronta con users.password_version: chiude la race in cui
+	// un login legge l'hash vecchio, il reset cambia password e revoca, e il
+	// login emette comunque un token con iat successivo alla revoca.
+	PasswordVersion int64 `json:"pv,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -85,6 +90,38 @@ func (tm *TokenManager) AttachStore(ctx context.Context, store RevocationStore) 
 	}
 	for k, v := range tokens {
 		tm.tokenRevoked[k] = v
+	}
+	return nil
+}
+
+// ReloadRevocations rilegge dal DB le revoche attive e le fonde nella cache
+// locale. Serve quando più processi/repliche condividono lo stesso primary:
+// senza reload una revoca scritta da un processo resterebbe invisibile agli
+// altri fino al riavvio. Il merge non fa mai regredire una revoca locale
+// (max per utente, unione per jti) e non elimina voci: la potatura resta
+// compito di PurgeExpired.
+func (tm *TokenManager) ReloadRevocations(ctx context.Context) error {
+	tm.mu.RLock()
+	store := tm.store
+	tm.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	users, tokens, err := store.LoadActive(ctx, time.Now())
+	if err != nil {
+		return err
+	}
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	for id, at := range users {
+		if prev, ok := tm.userRevoked[id]; !ok || at.After(prev) {
+			tm.userRevoked[id] = at
+		}
+	}
+	for jti, exp := range tokens {
+		if prev, ok := tm.tokenRevoked[jti]; !ok || exp.After(prev) {
+			tm.tokenRevoked[jti] = exp
+		}
 	}
 	return nil
 }
@@ -193,14 +230,17 @@ func (tm *TokenManager) PurgeExpired(ctx context.Context) {
 	}
 }
 
-// GenerateToken crea un JWT firmato per l'utente indicato.
-func (tm *TokenManager) GenerateToken(userID, username string) (string, int64, error) {
+// GenerateToken crea un JWT firmato per l'utente indicato. passwordVersion è
+// l'epoch letta insieme all'hash verificato: se nel frattempo un reset la
+// incrementa, il middleware rifiuterà il token.
+func (tm *TokenManager) GenerateToken(userID, username string, passwordVersion int64) (string, int64, error) {
 	now := time.Now()
 	expiresAt := now.Add(tm.ttl)
 	claims := Claims{
-		UserID:         userID,
-		Username:       username,
-		IssuedAtMillis: now.UnixMilli(),
+		UserID:          userID,
+		Username:        username,
+		IssuedAtMillis:  now.UnixMilli(),
+		PasswordVersion: passwordVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        uuid.NewString(),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),

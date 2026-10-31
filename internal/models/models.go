@@ -5,8 +5,12 @@ type User struct {
 	ID           string
 	Username     string
 	PasswordHash string
-	CreatedAt    int64  // unix millis
-	BlockedAt    *int64 // nil = account attivo; non-nil = bloccato dall'admin
+	// PasswordVersion cambia a ogni reset password. È inclusa nei JWT e
+	// confrontata a ogni richiesta autenticata: un login che ha letto l'hash
+	// vecchio e termina dopo un reset non può produrre un token valido.
+	PasswordVersion int64
+	CreatedAt       int64  // unix millis
+	BlockedAt       *int64 // nil = account attivo; non-nil = bloccato dall'admin
 	// RateLimitExempt disattiva il rate limit per-utente della sync. Ha
 	// effetto solo quando il limite globale è attivo.
 	RateLimitExempt bool

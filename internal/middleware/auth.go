@@ -83,6 +83,19 @@ func RequireJWT(tm *auth.TokenManager, users *db.UsersRepo) func(http.Handler) h
 				return
 			}
 
+			// Epoch della password: un token emesso prima di un reset password
+			// non è valido, anche se il suo iat è successivo alla revoca (race
+			// reset/login). I token emessi prima di questa versione non hanno
+			// il claim: valgono come epoch 1, che è il default dello schema.
+			effectiveVersion := claims.PasswordVersion
+			if effectiveVersion == 0 {
+				effectiveVersion = 1
+			}
+			if effectiveVersion != status.PasswordVersion {
+				writeJSONErrorCode(w, http.StatusUnauthorized, "token non più valido", "revoked_token")
+				return
+			}
+
 			// Revoca (logout / reset password / cancellazione utente):
 			// lookup O(1) in RAM, senza query aggiuntiva. La cache è popolata
 			// all'avvio dalla tabella persistente delle revoche (vedi

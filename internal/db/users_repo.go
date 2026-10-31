@@ -36,10 +36,11 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 		return nil, ErrUsernameTaken
 	}
 	u := &models.User{
-		ID:           uuid.NewString(),
-		Username:     username,
-		PasswordHash: passwordHash,
-		CreatedAt:    time.Now().UnixMilli(),
+		ID:              uuid.NewString(),
+		Username:        username,
+		PasswordHash:    passwordHash,
+		PasswordVersion: 1,
+		CreatedAt:       time.Now().UnixMilli(),
 	}
 	_, err = r.db.ExecContext(ctx,
 		`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
@@ -111,7 +112,7 @@ func escapeLike(s string) string {
 // account distinti: il case è parte dell'identità.
 func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models.User, error) {
 	row := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at, blocked_at, rate_limit_exempt
+		`SELECT id, username, password_hash, password_version, created_at, blocked_at, rate_limit_exempt
 		 FROM users WHERE username = ? COLLATE BINARY`, username,
 	)
 	u, err := scanUserRow(row)
@@ -124,7 +125,7 @@ func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models
 // GetByID recupera un utente per ID.
 func (r *UsersRepo) GetByID(ctx context.Context, id string) (*models.User, error) {
 	row := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, created_at, blocked_at, rate_limit_exempt
+		`SELECT id, username, password_hash, password_version, created_at, blocked_at, rate_limit_exempt
 		 FROM users WHERE id = ?`, id,
 	)
 	u, err := scanUserRow(row)
@@ -140,6 +141,11 @@ func (r *UsersRepo) GetByID(ctx context.Context, id string) (*models.User, error
 type AccountStatus struct {
 	Blocked         bool
 	RateLimitExempt bool
+	// PasswordVersion è la versione corrente dell'hash password. Il middleware
+	// la confronta con quella nel JWT: un token emesso prima di un reset
+	// password (o da un login concorrente che aveva letto l'hash vecchio) non
+	// è più accettato, anche se il suo iat è successivo alla revoca.
+	PasswordVersion int64
 }
 
 // GetAccountStatus legge lo stato di sicurezza dell'utente. found=false
@@ -147,16 +153,21 @@ type AccountStatus struct {
 func (r *UsersRepo) GetAccountStatus(ctx context.Context, id string) (status AccountStatus, found bool, err error) {
 	var blockedAt sql.NullInt64
 	var exempt int
+	var passwordVersion int64
 	err = r.db.QueryRowContext(ctx,
-		`SELECT blocked_at, rate_limit_exempt FROM users WHERE id = ?`, id,
-	).Scan(&blockedAt, &exempt)
+		`SELECT blocked_at, rate_limit_exempt, password_version FROM users WHERE id = ?`, id,
+	).Scan(&blockedAt, &exempt, &passwordVersion)
 	if err == sql.ErrNoRows {
 		return AccountStatus{}, false, nil
 	}
 	if err != nil {
 		return AccountStatus{}, false, err
 	}
-	return AccountStatus{Blocked: blockedAt.Valid, RateLimitExempt: exempt != 0}, true, nil
+	return AccountStatus{
+		Blocked:         blockedAt.Valid,
+		RateLimitExempt: exempt != 0,
+		PasswordVersion: passwordVersion,
+	}, true, nil
 }
 
 // SetBlocked blocca o sblocca un account. Il timestamp di blocco viene
@@ -213,7 +224,7 @@ func scanUserRow(row interface {
 	var u models.User
 	var blockedAt sql.NullInt64
 	var exempt int
-	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt, &blockedAt, &exempt); err != nil {
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.PasswordVersion, &u.CreatedAt, &blockedAt, &exempt); err != nil {
 		return nil, err
 	}
 	if blockedAt.Valid {
@@ -248,8 +259,12 @@ func (r *UsersRepo) Delete(ctx context.Context, userID string) error {
 
 // UpdatePassword sovrascrive l'hash della password di un utente esistente (reset password).
 // La vecchia password non è mai leggibile: viene semplicemente sostituito l'hash.
+// password_version viene incrementata nella stessa UPDATE: è l'epoch che
+// invalida i token emessi da un login che aveva letto l'hash precedente.
 func (r *UsersRepo) UpdatePassword(ctx context.Context, userID, newPasswordHash string) error {
-	res, err := r.db.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, newPasswordHash, userID)
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE users SET password_hash = ?, password_version = password_version + 1 WHERE id = ?`,
+		newPasswordHash, userID)
 	if err != nil {
 		return err
 	}

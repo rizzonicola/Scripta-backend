@@ -20,7 +20,7 @@ func TestRevocationUsesMillisecondIssueTime(t *testing.T) {
 		t.Fatal("token emesso dopo la revoca (stesso secondo) erroneamente revocato")
 	}
 
-	token, _, err := tm.GenerateToken("u2", "mario")
+	token, _, err := tm.GenerateToken("u2", "mario", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -119,7 +119,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username)
+	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username, user.PasswordVersion)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione del token")
 		return
@@ -232,7 +232,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username)
+	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username, user.PasswordVersion)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione del token")
 		return
