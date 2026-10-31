@@ -237,11 +237,20 @@ func (h *AdminHandler) Login(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
 }
 
-// Logout gestisce POST /admin/logout: cancella il cookie di sessione.
+// Logout gestisce POST /admin/logout: revoca la sessione lato server e
+// cancella il cookie. Senza la revoca server-side il cookie resterebbe valido
+// fino alla scadenza anche dopo il logout.
 func (h *AdminHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
+	}
+	if c, err := r.Cookie(middleware.AdminSessionCookieName); err == nil {
+		if err := h.Sessions.Revoke(r.Context(), c.Value); err != nil {
+			log.Printf("admin: revoca sessione al logout fallita: %v", err)
+			http.Error(w, "impossibile revocare la sessione", http.StatusInternalServerError)
+			return
+		}
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     middleware.AdminSessionCookieName,

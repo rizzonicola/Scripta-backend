@@ -22,25 +22,30 @@ import "net/http"
 //     configurare alcun dominio fisso: funziona automaticamente su
 //     qualunque hostname pubblico sia stato configurato per il tunnel.
 //
-// Se nessuno dei due header è presente (client molto datati) la richiesta
-// viene lasciata passare: nella pratica ogni browser in uso oggi invia
-// almeno uno dei due, quindi il caso "nessun header" non offre comunque a
-// un attaccante web un modo per forgiare la richiesta.
+// Se nessuno dei due header è presente la richiesta viene RIFIUTATA: un
+// client che parla con la dashboard deve dichiarare la propria origine. I
+// browser moderni inviano sempre almeno uno dei due header; curl e altri
+// client non-browser non sono il target di /admin e possono essere adattati.
 func RequireSameOrigin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+			site := r.Header.Get("Sec-Fetch-Site")
+			origin := r.Header.Get("Origin")
+			if site != "" {
 				if site != "same-origin" {
 					writeJSONError(w, http.StatusForbidden, "richiesta cross-site non consentita")
 					return
 				}
-			} else if origin := r.Header.Get("Origin"); origin != "" {
+			} else if origin != "" {
 				expectedHTTPS := "https://" + r.Host
 				expectedHTTP := "http://" + r.Host
 				if origin != expectedHTTPS && origin != expectedHTTP {
 					writeJSONError(w, http.StatusForbidden, "origin non consentita")
 					return
 				}
+			} else {
+				writeJSONError(w, http.StatusForbidden, "origine della richiesta non verificabile")
+				return
 			}
 		}
 		next.ServeHTTP(w, r)
