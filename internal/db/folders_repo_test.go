@@ -54,8 +54,24 @@ func TestFoldersUpsertLWWReportsWhetherItWon(t *testing.T) {
 		t.Fatalf("stato inatteso: %+v", got)
 	}
 
+	// Stesso ID, altro utente: la chiave composita (user_id, id) lo rende una
+	// riga distinta. Non c'è conflitto né possibilità di sovrascrivere.
 	other := &models.Folder{ID: "f1", UserID: "u2", Name: "intruso", UpdatedAt: 500, SyncedAt: 500}
-	if won, err := repo.UpsertLWW(ctx, other); err != nil || won {
+	if won, err := repo.UpsertLWW(ctx, other); err != nil || !won {
 		t.Fatalf("altro utente: won=%v err=%v", won, err)
+	}
+	gotOther, err := repo.Get(ctx, "u2", "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOther == nil || gotOther.Name != "intruso" {
+		t.Fatalf("cartella dell'altro utente: %+v", gotOther)
+	}
+	got, err = repo.Get(ctx, "u1", "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "pareggio" || got.SyncedAt != 400 {
+		t.Fatalf("la cartella di u1 è stata modificata: %+v", got)
 	}
 }

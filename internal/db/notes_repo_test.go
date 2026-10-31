@@ -54,8 +54,24 @@ func TestNotesUpsertLWWReportsWhetherItWon(t *testing.T) {
 		t.Fatalf("stato inatteso: %+v", got)
 	}
 
+	// Stesso ID, altro utente: la chiave composita (user_id, id) lo rende una
+	// riga distinta. Non c'è conflitto né possibilità di sovrascrivere.
 	other := &models.Note{ID: "n1", UserID: "u2", Title: "intruso", UpdatedAt: 500, SyncedAt: 500}
-	if won, err := repo.UpsertLWW(ctx, other); err != nil || won {
+	if won, err := repo.UpsertLWW(ctx, other); err != nil || !won {
 		t.Fatalf("altro utente: won=%v err=%v", won, err)
+	}
+	gotOther, err := repo.Get(ctx, "u2", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOther == nil || gotOther.Title != "intruso" {
+		t.Fatalf("nota dell'altro utente: %+v", gotOther)
+	}
+	got, err = repo.Get(ctx, "u1", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "pareggio" || got.SyncedAt != 400 {
+		t.Fatalf("la nota di u1 è stata modificata: %+v", got)
 	}
 }

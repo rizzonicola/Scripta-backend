@@ -212,6 +212,14 @@ func validatePrimaryURL(raw string) error {
 	if u.Host == "" {
 		return fmt.Errorf("URL primario %q non valido: host mancante", raw)
 	}
+	// Credenziali, query e fragment non servono al driver e finirebbero nei
+	// log o nella configurazione: il token viaggia separato in TURSO_AUTH_TOKEN.
+	if u.User != nil {
+		return fmt.Errorf("URL primario %q non valido: credenziali nell'URL non ammesse", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("URL primario %q non valido: query e fragment non ammessi", raw)
+	}
 	switch strings.ToLower(u.Scheme) {
 	case "libsql", "https", "wss":
 		return nil
@@ -389,16 +397,22 @@ var migrationStatements = []string{
 		password_hash     TEXT NOT NULL,
 		created_at        INTEGER NOT NULL,
 		blocked_at        INTEGER,
-		rate_limit_exempt INTEGER NOT NULL DEFAULT 0
+		rate_limit_exempt INTEGER NOT NULL DEFAULT 0,
+		password_version  INTEGER NOT NULL DEFAULT 1
 	)`,
+	// Chiave primaria COMPOSITA (user_id, id): l'ID è unico solo all'interno
+	// dell'account, non globalmente. Un client non può quindi «occupare» l'ID
+	// di una cartella altrui né usare il conflitto di chiave come oracolo per
+	// scoprire se un certo ID esiste su un altro account.
 	`CREATE TABLE IF NOT EXISTS folders (
-		id         TEXT PRIMARY KEY,
+		id         TEXT NOT NULL,
 		user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		name       TEXT NOT NULL,
 		parent_id  TEXT,
 		updated_at INTEGER NOT NULL,
 		synced_at  INTEGER NOT NULL DEFAULT 0,
-		deleted_at INTEGER
+		deleted_at INTEGER,
+		PRIMARY KEY (user_id, id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`,
 	// Indice parziale: PurgeExpiredTombstones (folders_repo.go) filtra
@@ -409,8 +423,9 @@ var migrationStatements = []string{
 	// con deleted_at valorizzato, cioè i soli tombstone) resta piccolo e
 	// economico da mantenere anche sulle scritture normali di righe attive.
 	`CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
+	// Come folders: chiave primaria composita (user_id, id), vedi sopra.
 	`CREATE TABLE IF NOT EXISTS notes (
-		id          TEXT PRIMARY KEY,
+		id          TEXT NOT NULL,
 		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 		title       TEXT NOT NULL DEFAULT '',
 		content     TEXT NOT NULL DEFAULT '',
@@ -421,7 +436,8 @@ var migrationStatements = []string{
 		created_at  INTEGER NOT NULL DEFAULT 0,
 		updated_at  INTEGER NOT NULL,
 		synced_at   INTEGER NOT NULL DEFAULT 0,
-		deleted_at  INTEGER
+		deleted_at  INTEGER,
+		PRIMARY KEY (user_id, id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
 	// Stessa motivazione di idx_folders_deleted_at, per NotesRepo.PurgeExpiredTombstones.
@@ -548,6 +564,14 @@ func migrate(conn *sql.DB) error {
 	// addSyncedAtColumns).
 	if err := addSyncedAtColumns(conn); err != nil {
 		return fmt.Errorf("migrazione colonne synced_at: %w", err)
+	}
+
+	// Chiavi primarie composite (user_id, id) per notes/folders. Va dopo
+	// tutte le migrazioni additive (la copia dei dati deve vedere tutte le
+	// colonne) e prima dei trigger, che vengono ricreati subito dopo perché
+	// il rebuild delle tabelle li elimina insieme alle tabelle stesse.
+	if err := migrateCompositePrimaryKeys(conn); err != nil {
+		return fmt.Errorf("migrazione chiavi composite: %w", err)
 	}
 
 	// Vincola a livello di schema che folders.parent_id e notes.folder_id
@@ -833,14 +857,20 @@ func repairFolderCycles(conn *sql.DB) error {
 			return fmt.Errorf("distacco cartella %s: %w", id, err)
 		}
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO sync_state(key, value) VALUES(?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value
-		 WHERE excluded.value > sync_state.value`,
-		StampHWMKey, stamp,
-	); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("aggiornamento high-water mark: %w", err)
+	// Lo stamp della riparazione deve essere rispettato anche dall'allocatore
+	// delle sync: si aggiornano sia l'high-water mark sia l'ultimo stamp
+	// allocato, così un riavvio con l'orologio indietro non riusa un valore
+	// già consegnato ai client.
+	for _, key := range []string{StampHWMKey, StampLastKey} {
+		if _, err := tx.Exec(
+			`INSERT INTO sync_state(key, value) VALUES(?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value
+			 WHERE excluded.value > sync_state.value`,
+			key, stamp,
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("aggiornamento %s: %w", key, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit riparazione cicli: %w", err)
@@ -881,6 +911,7 @@ func addUserSecurityColumns(conn *sql.DB) error {
 	}{
 		{"blocked_at", `ALTER TABLE users ADD COLUMN blocked_at INTEGER`},
 		{"rate_limit_exempt", `ALTER TABLE users ADD COLUMN rate_limit_exempt INTEGER NOT NULL DEFAULT 0`},
+		{"password_version", `ALTER TABLE users ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1`},
 	}
 	for _, w := range wanted {
 		if cols[w.column] {
@@ -997,6 +1028,139 @@ func addSyncedAtColumns(conn *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// userIDInPrimaryKey indica se user_id fa parte della chiave primaria della
+// tabella. Serve a distinguere lo schema nuovo (PK composita) da quello
+// storico (PK sul solo id), che va ricostruito una sola volta.
+func userIDInPrimaryKey(conn *sql.DB, table string) (bool, error) {
+	rows, err := conn.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, fmt.Errorf("pragma table_info(%s): %w", table, err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return false, fmt.Errorf("scan table_info(%s): %w", table, err)
+		}
+		if name == "user_id" {
+			found = pk > 0
+		}
+	}
+	return found, rows.Err()
+}
+
+// migrateCompositePrimaryKeys porta notes/folders dalla PK globale su id alla
+// PK composita (user_id, id). SQLite non supporta ALTER TABLE per cambiare una
+// chiave primaria: serve ricostruire la tabella. L'operazione è transazionale
+// (un crash lascia intatta la tabella originale) e copia tutte le colonne già
+// migrate; non introduce FOREIGN KEY, quindi non esegue foreign_key_check sui
+// dati storici. Gli indici vengono ricreati subito e i trigger vengono
+// ricreati da addOwnershipTriggers/addFolderCycleTriggers al passo successivo
+// (DROP TABLE li elimina insieme alla tabella).
+type compositePKSpec struct {
+	table   string
+	columns string
+	create  string
+	indexes []string
+}
+
+func migrateCompositePrimaryKeys(conn *sql.DB) error {
+	specs := []compositePKSpec{
+		{
+			table:   "folders",
+			columns: "id, user_id, name, parent_id, updated_at, synced_at, deleted_at",
+			create: `CREATE TABLE folders__composite_pk (
+				id         TEXT NOT NULL,
+				user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+				name       TEXT NOT NULL,
+				parent_id  TEXT,
+				updated_at INTEGER NOT NULL,
+				synced_at  INTEGER NOT NULL DEFAULT 0,
+				deleted_at INTEGER,
+				PRIMARY KEY (user_id, id)
+			)`,
+			indexes: []string{
+				`CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`,
+				`CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
+			},
+		},
+		{
+			table:   "notes",
+			columns: "id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at",
+			create: `CREATE TABLE notes__composite_pk (
+				id          TEXT NOT NULL,
+				user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+				title       TEXT NOT NULL DEFAULT '',
+				content     TEXT NOT NULL DEFAULT '',
+				folder_id   TEXT,
+				is_favorite INTEGER NOT NULL DEFAULT 0,
+				is_pinned   INTEGER NOT NULL DEFAULT 0,
+				order_index INTEGER NOT NULL DEFAULT 0,
+				created_at  INTEGER NOT NULL DEFAULT 0,
+				updated_at  INTEGER NOT NULL,
+				synced_at   INTEGER NOT NULL DEFAULT 0,
+				deleted_at  INTEGER,
+				PRIMARY KEY (user_id, id)
+			)`,
+			indexes: []string{
+				`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
+				`CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
+			},
+		},
+	}
+
+	for _, s := range specs {
+		composite, err := userIDInPrimaryKey(conn, s.table)
+		if err != nil {
+			return err
+		}
+		if composite {
+			continue
+		}
+		if err := rebuildWithCompositePK(conn, s); err != nil {
+			return fmt.Errorf("rebuild %s: %w", s.table, err)
+		}
+		log.Printf("migrazione: %s ricreata con chiave primaria (user_id, id)", s.table)
+	}
+	return nil
+}
+
+func rebuildWithCompositePK(conn *sql.DB, s compositePKSpec) error {
+	tmp := s.table + "__composite_pk"
+	tx, err := conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + tmp); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(s.create); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO ` + tmp + ` (` + s.columns + `) SELECT ` + s.columns + ` FROM ` + s.table); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE ` + s.table); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE ` + tmp + ` RENAME TO ` + s.table); err != nil {
+		return err
+	}
+	for _, index := range s.indexes {
+		if _, err := tx.Exec(index); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // tableColumns restituisce l'insieme dei nomi colonna di una tabella.

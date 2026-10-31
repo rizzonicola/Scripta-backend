@@ -66,11 +66,9 @@ func (r *NotesRepo) Get(ctx context.Context, userID, id string) (*models.Note, e
 //     pull (vedi ListSyncedBetween), senza bisogno di alcuna segnalazione
 //     esplicita qui.
 //
-// La clausola "AND notes.user_id = excluded.user_id" è una difesa in
-// profondità: impedisce che un client autenticato come utente A possa
-// sovrascrivere il contenuto di una nota che appartiene a un utente B anche
-// nell'eventualità (qui non raggiungibile dai livelli superiori, che passano
-// sempre lo user_id autenticato) in cui indovinasse l'ID di una nota altrui.
+// La chiave di conflitto è (user_id, id): l'ID è unico solo all'interno
+// dell'account, quindi un client non può sovrascrivere né «occupare» la nota
+// di un altro utente pur conoscendone l'ID.
 //
 // Il bool restituito è true quando l'upsert ha effettivamente scritto la
 // riga; è false quando il server aveva già una versione più recente.
@@ -81,7 +79,7 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) (bool, error)
 	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO notes (id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+		ON CONFLICT(user_id, id) DO UPDATE SET
 			title       = excluded.title,
 			content     = excluded.content,
 			folder_id   = excluded.folder_id,
@@ -93,7 +91,6 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) (bool, error)
 			synced_at   = excluded.synced_at,
 			deleted_at  = excluded.deleted_at
 		WHERE excluded.updated_at >= notes.updated_at
-		  AND notes.user_id = excluded.user_id
 	`, n.ID, n.UserID, n.Title, n.Content, n.FolderID, n.IsFavorite, n.IsPinned, n.OrderIndex, n.CreatedAt, n.UpdatedAt, n.SyncedAt, n.DeletedAt)
 	if err != nil {
 		return false, err

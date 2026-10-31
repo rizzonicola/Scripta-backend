@@ -130,3 +130,18 @@ func (r *RefreshTokensRepo) PurgeExpired(ctx context.Context, now time.Time) err
 	_, err := r.db.ExecContext(ctx, `DELETE FROM refresh_tokens WHERE expires_at <= ?`, now.UnixMilli())
 	return err
 }
+
+// RefreshTokenRevokedRetention è per quanto tempo si conserva un refresh token
+// già ruotato/revocato per il rilevamento del riuso. Oltre questa finestra la
+// riga viene potata: un riuso molto vecchio non revoca più la famiglia, ma la
+// crescita della tabella resta limitata anche con rotazioni frequenti.
+const RefreshTokenRevokedRetention = 7 * 24 * time.Hour
+
+// PurgeRevoked elimina i refresh token revocati da più di retention. I token
+// scaduti sono già coperti da PurgeExpired.
+func (r *RefreshTokensRepo) PurgeRevoked(ctx context.Context, now time.Time, retention time.Duration) error {
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM refresh_tokens WHERE revoked_at IS NOT NULL AND revoked_at < ?`,
+		now.Add(-retention).UnixMilli())
+	return err
+}

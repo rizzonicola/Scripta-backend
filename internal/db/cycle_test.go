@@ -69,7 +69,7 @@ func TestFolderCycleTriggerRejectsUpsertOfExistingRow(t *testing.T) {
 
 	_, err = conn.ExecContext(ctx,
 		`INSERT INTO folders(id, user_id, name, parent_id, updated_at, synced_at) VALUES('a', 'u1', 'a', 'b', 20, 20)
-		 ON CONFLICT(id) DO UPDATE SET parent_id = excluded.parent_id, updated_at = excluded.updated_at, synced_at = excluded.synced_at`,
+		 ON CONFLICT(user_id, id) DO UPDATE SET parent_id = excluded.parent_id, updated_at = excluded.updated_at, synced_at = excluded.synced_at`,
 	)
 	if err == nil || !strings.Contains(err.Error(), FolderCycleViolationMarker) {
 		t.Fatalf("upsert ciclico: err = %v, atteso %s", err, FolderCycleViolationMarker)

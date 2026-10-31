@@ -40,9 +40,9 @@ func (r *FoldersRepo) Get(ctx context.Context, userID, id string) (*models.Folde
 // UpsertLWW inserisce o aggiorna una cartella con la stessa semantica
 // Last-Write-Wins di NotesRepo.UpsertLWW: la UPDATE ha effetto solo se
 // l'updated_at in arrivo è >= di quello già memorizzato, altrimenti la riga
-// resta quella (più recente) già presente sul server. Vedi il commento su
-// NotesRepo.UpsertLWW per il dettaglio della clausola di isolamento per
-// utente. Il bool restituito è true quando l'upsert ha scritto la riga.
+// resta quella (più recente) già presente sul server. La chiave di conflitto
+// è (user_id, id): l'ID è unico solo all'interno dell'account. Il bool
+// restituito è true quando l'upsert ha scritto la riga.
 func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) (bool, error) {
 	if f.ID == "" {
 		f.ID = uuid.NewString()
@@ -50,14 +50,13 @@ func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) (bool, er
 	res, err := r.db.ExecContext(ctx, `
 		INSERT INTO folders (id, user_id, name, parent_id, updated_at, synced_at, deleted_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+		ON CONFLICT(user_id, id) DO UPDATE SET
 			name       = excluded.name,
 			parent_id  = excluded.parent_id,
 			updated_at = excluded.updated_at,
 			synced_at  = excluded.synced_at,
 			deleted_at = excluded.deleted_at
 		WHERE excluded.updated_at >= folders.updated_at
-		  AND folders.user_id = excluded.user_id
 	`, f.ID, f.UserID, f.Name, f.ParentID, f.UpdatedAt, f.SyncedAt, f.DeletedAt)
 	if err != nil {
 		return false, err

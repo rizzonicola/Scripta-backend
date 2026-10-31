@@ -57,6 +57,10 @@ func TestValidatePrimaryURL(t *testing.T) {
 		"https://",
 		"http://",
 		"://",
+		"https://user:pass@example.turso.io",
+		"libsql://user@example.turso.io",
+		"https://example.turso.io?token=secret",
+		"https://example.turso.io#fragment",
 	}
 	for _, raw := range bad {
 		if err := validatePrimaryURL(raw); err == nil {
