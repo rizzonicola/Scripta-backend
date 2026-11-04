@@ -28,6 +28,14 @@ import (
 // processo. Sovrascrivibile per-istanza tramite SYNC_MAX_BODY_BYTES.
 const defaultMaxSyncBodyBytes = 64 << 20 // 64 MiB
 
+// defaultMaxConcurrentSyncs limita quante richieste di sync possono essere
+// lette/decodificate contemporaneamente. Il limite per-utente (burst 60) e
+// quello per-body (64 MiB) non limitano la SOMMA dei body in volo: senza
+// questo semaforo N richieste concorrenti trattengono N copie JSON grezze più
+// i DTO. Le scritture sono già serializzate da stampMu, quindi 2 slot bastano
+// a sovrapporre una decodifica a una transazione senza amplificare la RAM.
+const defaultMaxConcurrentSyncs = 2
+
 // maxBeginTxRetries e beginTxBackoff regolano il retry di BeginTx quando il
 // database segnala una contesa transitoria (SQLITE_BUSY / "database is
 // locked"). È sicuro ritentare BeginTx perché, a differenza di un Commit,
@@ -104,6 +112,11 @@ type SyncHandler struct {
 	// locali si accodino sul lock del database.
 	stampMu sync.Mutex
 
+	// syncSlots limita le richieste che possono trattenere in RAM un body
+	// decodificato (vedi defaultMaxConcurrentSyncs). Nil = nessun limite
+	// (solo per test/istanze costruite a mano).
+	syncSlots chan struct{}
+
 	// clock è un gancio per i test (orologio finto). Nil = time.Now.
 	clock func() time.Time
 }
@@ -115,6 +128,7 @@ func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
 		Notes:        db.NewNotesRepo(sqlDB),
 		Settings:     db.NewServerSettingsRepo(sqlDB),
 		MaxBodyBytes: defaultMaxSyncBodyBytes,
+		syncSlots:    make(chan struct{}, defaultMaxConcurrentSyncs),
 	}
 }
 
@@ -312,6 +326,19 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		writeJSONErrorCode(w, http.StatusTooManyRequests,
 			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
 		return
+	}
+
+	// Il semaforo copre lettura, decodifica, transazione e scrittura della
+	// risposta: è il punto in cui il body resta in memoria. Acquisirlo PRIMA
+	// di decodeSyncRequest è essenziale, perché è lì che avvengono le
+	// allocazioni; process() è già serializzato da stampMu.
+	if h.syncSlots != nil {
+		select {
+		case h.syncSlots <- struct{}{}:
+			defer func() { <-h.syncSlots }()
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	maxBody := h.MaxBodyBytes

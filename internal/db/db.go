@@ -728,7 +728,8 @@ func addFolderCycleTriggers(conn *sql.DB) error {
 		 WHEN NEW.parent_id IS NOT NULL
 		  AND EXISTS (
 		    SELECT 1 FROM folders
-		     WHERE id = NEW.id AND parent_id IS NOT NEW.parent_id
+		     WHERE user_id = NEW.user_id AND id = NEW.id
+		       AND parent_id IS NOT NEW.parent_id
 		  )
 		 BEGIN
 		   SELECT CASE WHEN EXISTS (
@@ -779,64 +780,71 @@ func addFolderCycleTriggers(conn *sql.DB) error {
 // invariato: non è una modifica dell'utente e non deve vincere un LWW contro
 // una modifica legittima concorrente.
 func repairFolderCycles(conn *sql.DB) error {
-	rows, err := conn.Query(`SELECT id, user_id, parent_id FROM folders WHERE parent_id IS NOT NULL`)
+	rows, err := conn.Query(`SELECT user_id, id, parent_id FROM folders WHERE parent_id IS NOT NULL`)
 	if err != nil {
 		return fmt.Errorf("lettura cartelle per controllo cicli: %w", err)
 	}
 	type folderRef struct {
-		id, userID, parentID string
+		userID, id string
 	}
-	refs := make(map[string]folderRef)
+	// La chiave primaria è composita (user_id, id): lo stesso id può esistere
+	// in due account. Il grafo va quindi partizionato per tenant, altrimenti
+	// un arco di A e uno di B con lo stesso id formano un ciclo che non esiste
+	// in nessuno dei due account e la riparazione può staccare la cartella
+	// sbagliata.
+	parentsByUser := make(map[string]map[string]string)
 	for rows.Next() {
-		var r folderRef
-		if err := rows.Scan(&r.id, &r.userID, &r.parentID); err != nil {
+		var userID, id, parentID string
+		if err := rows.Scan(&userID, &id, &parentID); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan cartella: %w", err)
 		}
-		refs[r.id] = r
+		parents := parentsByUser[userID]
+		if parents == nil {
+			parents = make(map[string]string)
+			parentsByUser[userID] = parents
+		}
+		parents[id] = parentID
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return fmt.Errorf("iterazione cartelle: %w", err)
 	}
 	rows.Close()
-	if len(refs) == 0 {
+	if len(parentsByUser) == 0 {
 		return nil
 	}
 
-	parents := make(map[string]string, len(refs))
-	for id, r := range refs {
-		parents[id] = r.parentID
-	}
-
-	done := make(map[string]bool, len(parents))
-	var detach []string
-	for start := range parents {
-		if done[start] {
-			continue
-		}
-		path := make([]string, 0, 8)
-		index := make(map[string]int, 8)
-		cur := start
-		for {
-			if done[cur] {
-				break
+	var detach []folderRef
+	for userID, parents := range parentsByUser {
+		done := make(map[string]bool, len(parents))
+		for start := range parents {
+			if done[start] {
+				continue
 			}
-			if _, seen := index[cur]; seen {
-				detach = append(detach, cur)
-				delete(parents, cur)
-				break
+			path := make([]string, 0, 8)
+			index := make(map[string]int, 8)
+			cur := start
+			for {
+				if done[cur] {
+					break
+				}
+				if _, seen := index[cur]; seen {
+					detach = append(detach, folderRef{userID: userID, id: cur})
+					delete(parents, cur)
+					break
+				}
+				parent, ok := parents[cur]
+				if !ok {
+					break
+				}
+				index[cur] = len(path)
+				path = append(path, cur)
+				cur = parent
 			}
-			parent, ok := parents[cur]
-			if !ok {
-				break
+			for _, id := range path {
+				done[id] = true
 			}
-			index[cur] = len(path)
-			path = append(path, cur)
-			cur = parent
-		}
-		for _, id := range path {
-			done[id] = true
 		}
 	}
 	if len(detach) == 0 {
@@ -856,14 +864,13 @@ func repairFolderCycles(conn *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("begin riparazione cicli: %w", err)
 	}
-	for _, id := range detach {
-		ref := refs[id]
+	for _, ref := range detach {
 		if _, err := tx.Exec(
 			`UPDATE folders SET parent_id = NULL, synced_at = ? WHERE id = ? AND user_id = ?`,
-			stamp, id, ref.userID,
+			stamp, ref.id, ref.userID,
 		); err != nil {
 			_ = tx.Rollback()
-			return fmt.Errorf("distacco cartella %s: %w", id, err)
+			return fmt.Errorf("distacco cartella %s: %w", ref.id, err)
 		}
 	}
 	// Lo stamp della riparazione deve essere rispettato anche dall'allocatore

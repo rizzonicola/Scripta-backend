@@ -138,6 +138,69 @@ func TestRepairFolderCyclesDetachesOneEdgeAndAdvancesCursor(t *testing.T) {
 	}
 }
 
+func TestRepairFolderCyclesKeepsTenantsSeparate(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx := context.Background()
+	for _, id := range []string{"u1", "u2"} {
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO users(id, username, password_hash, created_at) VALUES(?, ?, 'h', 1)`,
+			id, id,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Il trigger impedisce di creare il ciclo: si droppano solo per costruire
+	// il fixture storico che la riparazione deve saper gestire.
+	for _, trigger := range []string{"trg_folders_cycle_ins", "trg_folders_cycle_upd"} {
+		if _, err := conn.ExecContext(ctx, `DROP TRIGGER IF EXISTS `+trigger); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// u1 ha un ciclo reale tra C e P. u2 riusa gli STESSI id con una gerarchia
+	// perfettamente valida: il vecchio algoritmo, fondendo i grafi per id,
+	// poteva staccare la cartella di u2.
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO folders(id, user_id, name, parent_id, updated_at, synced_at)
+		 VALUES ('C', 'u1', 'C', NULL, 10, 100),
+		        ('P', 'u1', 'P', 'C', 10, 100),
+		        ('C', 'u2', 'C', NULL, 10, 100),
+		        ('P', 'u2', 'P', 'C', 10, 100)`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE folders SET parent_id = 'P' WHERE user_id = 'u1' AND id = 'C'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repairFolderCycles(conn); err != nil {
+		t.Fatal(err)
+	}
+
+	var u1Cycles int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM folders WHERE user_id = 'u1' AND parent_id IS NOT NULL`,
+	).Scan(&u1Cycles); err != nil {
+		t.Fatal(err)
+	}
+	if u1Cycles != 1 {
+		t.Fatalf("u1: %d cartelle ancora con parent, attesa 1 (ciclo spezzato)", u1Cycles)
+	}
+	var u2Parent string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT parent_id FROM folders WHERE user_id = 'u2' AND id = 'P'`,
+	).Scan(&u2Parent); err != nil {
+		t.Fatal(err)
+	}
+	if u2Parent != "C" {
+		t.Fatalf("u2: parent di P = %q, atteso C (account estraneo modificato)", u2Parent)
+	}
+}
+
 func TestRedundantIndexesAreDropped(t *testing.T) {
 	conn, err := Open(filepath.Join(t.TempDir(), "c.db"))
 	if err != nil {
