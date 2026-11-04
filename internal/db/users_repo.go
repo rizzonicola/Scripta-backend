@@ -65,15 +65,20 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 // (GetByUsername), non alla UI, quindi evitare di caricarlo in memoria riduce
 // l'esposizione accidentale.
 func (r *UsersRepo) List(ctx context.Context, search string) ([]models.User, error) {
-	query := `SELECT id, username, created_at, blocked_at, rate_limit_exempt FROM users`
+	query := `SELECT users.id, users.username, users.created_at, users.blocked_at, users.rate_limit_exempt, users.storage_quota_bytes,
+		COALESCE((SELECT SUM(LENGTH(CAST(COALESCE(title, '') AS BLOB)) + LENGTH(CAST(COALESCE(content, '') AS BLOB)))
+			FROM notes WHERE notes.user_id = users.id AND notes.deleted_at IS NULL), 0) +
+		COALESCE((SELECT SUM(LENGTH(CAST(name AS BLOB)))
+			FROM folders WHERE folders.user_id = users.id AND folders.deleted_at IS NULL), 0)
+		FROM users`
 	args := make([]any, 0, 2)
 	search = strings.TrimSpace(search)
 	if search != "" {
 		pattern := "%" + escapeLike(search) + "%"
-		query += ` WHERE username LIKE ? ESCAPE '\' OR id LIKE ? ESCAPE '\'`
+		query += ` WHERE users.username LIKE ? ESCAPE '\' OR users.id LIKE ? ESCAPE '\'`
 		args = append(args, pattern, pattern)
 	}
-	query += ` ORDER BY created_at DESC`
+	query += ` ORDER BY users.created_at DESC`
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -86,7 +91,8 @@ func (r *UsersRepo) List(ctx context.Context, search string) ([]models.User, err
 		var u models.User
 		var blockedAt sql.NullInt64
 		var exempt int
-		if err := rows.Scan(&u.ID, &u.Username, &u.CreatedAt, &blockedAt, &exempt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.CreatedAt, &blockedAt, &exempt,
+			&u.StorageQuotaBytes, &u.StorageUsageBytes); err != nil {
 			return nil, err
 		}
 		if blockedAt.Valid {
@@ -112,7 +118,7 @@ func escapeLike(s string) string {
 // account distinti: il case è parte dell'identità.
 func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models.User, error) {
 	row := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, password_version, created_at, blocked_at, rate_limit_exempt
+		`SELECT id, username, password_hash, password_version, created_at, blocked_at, rate_limit_exempt, storage_quota_bytes
 		 FROM users WHERE username = ? COLLATE BINARY`, username,
 	)
 	u, err := scanUserRow(row)
@@ -125,7 +131,7 @@ func (r *UsersRepo) GetByUsername(ctx context.Context, username string) (*models
 // GetByID recupera un utente per ID.
 func (r *UsersRepo) GetByID(ctx context.Context, id string) (*models.User, error) {
 	row := r.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, password_version, created_at, blocked_at, rate_limit_exempt
+		`SELECT id, username, password_hash, password_version, created_at, blocked_at, rate_limit_exempt, storage_quota_bytes
 		 FROM users WHERE id = ?`, id,
 	)
 	u, err := scanUserRow(row)
@@ -141,6 +147,8 @@ func (r *UsersRepo) GetByID(ctx context.Context, id string) (*models.User, error
 type AccountStatus struct {
 	Blocked         bool
 	RateLimitExempt bool
+	// StorageQuotaBytes è il tetto dello spazio di sync (0 = illimitato).
+	StorageQuotaBytes int64
 	// PasswordVersion è la versione corrente dell'hash password. Il middleware
 	// la confronta con quella nel JWT: un token emesso prima di un reset
 	// password (o da un login concorrente che aveva letto l'hash vecchio) non
@@ -154,9 +162,10 @@ func (r *UsersRepo) GetAccountStatus(ctx context.Context, id string) (status Acc
 	var blockedAt sql.NullInt64
 	var exempt int
 	var passwordVersion int64
+	var quota int64
 	err = r.db.QueryRowContext(ctx,
-		`SELECT blocked_at, rate_limit_exempt, password_version FROM users WHERE id = ?`, id,
-	).Scan(&blockedAt, &exempt, &passwordVersion)
+		`SELECT blocked_at, rate_limit_exempt, password_version, storage_quota_bytes FROM users WHERE id = ?`, id,
+	).Scan(&blockedAt, &exempt, &passwordVersion, &quota)
 	if err == sql.ErrNoRows {
 		return AccountStatus{}, false, nil
 	}
@@ -164,9 +173,10 @@ func (r *UsersRepo) GetAccountStatus(ctx context.Context, id string) (status Acc
 		return AccountStatus{}, false, err
 	}
 	return AccountStatus{
-		Blocked:         blockedAt.Valid,
-		RateLimitExempt: exempt != 0,
-		PasswordVersion: passwordVersion,
+		Blocked:           blockedAt.Valid,
+		RateLimitExempt:   exempt != 0,
+		StorageQuotaBytes: quota,
+		PasswordVersion:   passwordVersion,
 	}, true, nil
 }
 
@@ -217,14 +227,32 @@ func (r *UsersRepo) SetRateLimitExempt(ctx context.Context, userID string, exemp
 	return nil
 }
 
-// scanUserRow legge le colonne comuni a List/GetByUsername/GetByID.
+// SetStorageQuota imposta il tetto di spazio dell'account in byte.
+// 0 = illimitato (restano i limiti fisici del server).
+func (r *UsersRepo) SetStorageQuota(ctx context.Context, userID string, bytes int64) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE users SET storage_quota_bytes = ? WHERE id = ?`, bytes, userID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// scanUserRow legge le colonne comuni a GetByUsername/GetByID.
 func scanUserRow(row interface {
 	Scan(dest ...any) error
 }) (*models.User, error) {
 	var u models.User
 	var blockedAt sql.NullInt64
 	var exempt int
-	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.PasswordVersion, &u.CreatedAt, &blockedAt, &exempt); err != nil {
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.PasswordVersion, &u.CreatedAt, &blockedAt, &exempt, &u.StorageQuotaBytes); err != nil {
 		return nil, err
 	}
 	if blockedAt.Valid {

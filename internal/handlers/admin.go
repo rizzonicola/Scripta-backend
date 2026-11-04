@@ -9,8 +9,10 @@ import (
 	"errors"
 	"html/template"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -132,6 +134,8 @@ var flashMessages = map[string]flashDef{
 	"user_blocked":          {"Account bloccato: le sessioni attive verranno rifiutate", false},
 	"user_unblocked":        {"Account sbloccato", false},
 	"block_revoke_warning":  {"Account bloccato, ma la revoca delle sessioni non è riuscita", true},
+	"user_quota_invalid":    {"Quota non valida: inserisci un numero di MB maggiore o uguale a 0", true},
+	"user_quota_updated":    {"Quota di sincronizzazione aggiornata", false},
 }
 
 // flashFromRequest legge il codice ?f= e lo traduce nel testo whitelisted.
@@ -271,6 +275,10 @@ type userView struct {
 	CreatedAt       string
 	Blocked         bool
 	RateLimitExempt bool
+	UsageText       string
+	QuotaText       string
+	QuotaMB         string
+	QuotaUnlimited  bool
 }
 
 type usersPageData struct {
@@ -325,6 +333,10 @@ func (h *AdminHandler) UsersPage(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:       time.UnixMilli(u.CreatedAt).Format("2006-01-02 15:04"),
 			Blocked:         isBlocked,
 			RateLimitExempt: u.RateLimitExempt,
+			UsageText:       formatStorage(u.StorageUsageBytes),
+			QuotaText:       formatStorage(u.StorageQuotaBytes),
+			QuotaMB:         quotaMBString(u.StorageQuotaBytes),
+			QuotaUnlimited:  u.StorageQuotaBytes <= 0,
 		})
 	}
 
@@ -406,6 +418,96 @@ func (h *AdminHandler) UpdateUserRateLimit(w http.ResponseWriter, r *http.Reques
 	} else {
 		redirectAdminFlash(w, r, "user_limit_restored")
 	}
+}
+
+// UpdateUserStorageQuota imposta il tetto di spazio di sincronizzazione di un
+// account. Il form esprime la quota in MB (0 = illimitato); è accettato un
+// numero decimale per quote precise, es. 0.5 = 512 KiB.
+func (h *AdminHandler) UpdateUserStorageQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		redirectAdminFlash(w, r, "bad_request")
+		return
+	}
+	userID := strings.TrimSpace(r.FormValue("user_id"))
+	if userID == "" {
+		redirectAdminFlash(w, r, "user_id_required")
+		return
+	}
+	raw := strings.TrimSpace(strings.ReplaceAll(r.FormValue("quota_mb"), ",", "."))
+	quotaMB, err := strconv.ParseFloat(raw, 64)
+	if err != nil || quotaMB < 0 || math.IsNaN(quotaMB) || math.IsInf(quotaMB, 0) {
+		redirectAdminFlash(w, r, "user_quota_invalid")
+		return
+	}
+	// Tetto difensivo: oltre int64 non c'è spazio reale che possa essere
+	// allocato, e la conversione non deve andare in overflow.
+	const maxQuotaMB = float64(math.MaxInt64) / (1024 * 1024)
+	if quotaMB > maxQuotaMB {
+		quotaMB = maxQuotaMB
+	}
+	quotaBytes := int64(math.Round(quotaMB * 1024 * 1024))
+	if quotaMB > 0 && quotaBytes <= 0 {
+		// Una quota positiva non deve diventare "illimitato" (0) né negativa
+		// per un overflow della conversione sul valore massimo.
+		if quotaMB >= maxQuotaMB {
+			quotaBytes = math.MaxInt64
+		} else {
+			quotaBytes = 1
+		}
+	}
+	if err := h.Users.SetStorageQuota(r.Context(), userID, quotaBytes); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			redirectAdminFlash(w, r, "user_not_found")
+			return
+		}
+		log.Printf("admin: aggiornamento quota utente %s: %v", userID, err)
+		redirectAdminFlash(w, r, "user_update_failed")
+		return
+	}
+	redirectAdminFlash(w, r, "user_quota_updated")
+}
+
+// formatStorage rende una dimensione in byte leggibile, con unità binarie
+// (1 KB = 1024 B) coerenti con il calcolo dello spazio sul server.
+func formatStorage(bytes int64) string {
+	if bytes <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(bytes)
+	i := 0
+	for value >= 1024 && i < len(units)-1 {
+		value /= 1024
+		i++
+	}
+	if i == 0 {
+		return strconv.FormatInt(bytes, 10) + " B"
+	}
+	return strconv.FormatFloat(value, 'f', 1, 64) + " " + units[i]
+}
+
+// quotaMBString converte i byte in MB per il campo del form, senza zeri
+// superflui (0 = illimitato).
+func quotaMBString(bytes int64) string {
+	if bytes <= 0 {
+		return "0"
+	}
+	// Tre decimali bastano a rappresentare una quota al KB e mantengono il
+	// campo leggibile (niente 0.10000038146972656 dopo un salvataggio).
+	value := strconv.FormatFloat(float64(bytes)/(1024*1024), 'f', 3, 64)
+	value = strings.TrimRight(value, "0")
+	value = strings.TrimSuffix(value, ".")
+	if value == "0" {
+		// Quota positiva sotto il KB: il campo è in MB, mostra il minimo
+		// rappresentabile invece di farla sembrare illimitata.
+		return "0.001"
+	}
+	return value
 }
 
 // SetUserBlocked blocca/sblocca un account.

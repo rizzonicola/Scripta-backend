@@ -288,6 +288,7 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, providedAdmin
 	mux.Handle("/admin/settings/rate-limit", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.UpdateRateLimitSetting))))
 	mux.Handle("/admin/users/rate-limit", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.UpdateUserRateLimit))))
 	mux.Handle("/admin/users/block", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.SetUserBlocked))))
+	mux.Handle("/admin/users/storage-quota", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.UpdateUserStorageQuota))))
 
 	// --- API pubbliche ---
 	mux.Handle("/api/v1/auth/login", apiLoginRateLimit(http.HandlerFunc(authHandler.Login)))
@@ -304,6 +305,7 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, providedAdmin
 	requireJWT := middleware.RequireJWT(tm, usersRepo)
 	mux.Handle("/api/v1/auth/logout-all", requireJWT(http.HandlerFunc(authHandler.LogoutAll)))
 	mux.Handle("/api/v1/sync", requireJWT(http.HandlerFunc(syncHandler.Sync)))
+	mux.Handle("/api/v1/ordering/reset", requireJWT(http.HandlerFunc(syncHandler.ResetOrdering)))
 	mux.Handle("/api/v1/notes/download", requireJWT(http.HandlerFunc(notesHandler.DownloadMarkdown)))
 	mux.Handle("/api/v1/user/settings", requireJWT(http.HandlerFunc(settingsDispatch(settingsHandler))))
 

@@ -1,5 +1,7 @@
 package models
 
+import "encoding/json"
+
 // User rappresenta un utente registrato dell'applicazione.
 type User struct {
 	ID           string
@@ -14,6 +16,12 @@ type User struct {
 	// RateLimitExempt disattiva il rate limit per-utente della sync. Ha
 	// effetto solo quando il limite globale è attivo.
 	RateLimitExempt bool
+	// StorageQuotaBytes è il tetto dello spazio di sincronizzazione
+	// dell'account. 0 = illimitato (restano i limiti fisici del server).
+	StorageQuotaBytes int64
+	// StorageUsageBytes è lo spazio attualmente occupato da note e cartelle
+	// attive. Valorizzato solo da UsersRepo.List (dashboard admin).
+	StorageUsageBytes int64
 }
 
 // Folder rappresenta una cartella nell'albero gerarchico dell'utente.
@@ -104,6 +112,33 @@ type SyncRequest struct {
 	LastSyncedAt int64       `json:"last_synced_at"`
 	Folders      []FolderDTO `json:"folders"`
 	Notes        []NoteDTO   `json:"notes"`
+	// Ordering è presente SOLO quando il client ha modifiche locali di
+	// posizionamento da inviare. Assente = non toccare lo stato del server.
+	Ordering *OrderingPush `json:"ordering,omitempty"`
+}
+
+// OrderingPush contiene l'intero blob di posizionamento (ordine cartelle,
+// ordinamento per vista e ordini manuali delle note) e la versione su cui il
+// client ha costruito la modifica. Se la versione non coincide con quella
+// corrente, il server ignora il push e restituisce lo stato autoritativo:
+// così un client rimasto offline a lungo non sovrascrive un reset o modifiche
+// più recenti fatte altrove.
+type OrderingPush struct {
+	BaseVersion int64           `json:"base_version"`
+	Data        json.RawMessage `json:"data"`
+}
+
+// OrderingState è lo stato di posizionamento restituito al client.
+type OrderingState struct {
+	Version int64           `json:"version"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// StorageInfo comunica al client l'occupazione e il tetto dell'account.
+// QuotaBytes = 0 significa illimitato.
+type StorageInfo struct {
+	UsageBytes int64 `json:"usage_bytes"`
+	QuotaBytes int64 `json:"quota_bytes"`
 }
 
 // SyncResponse è la risposta di POST /api/v1/sync.
@@ -142,6 +177,10 @@ type SyncResponse struct {
 	Folders    []FolderDTO `json:"folders"`
 	Notes      []NoteDTO   `json:"notes"`
 	Caps       Caps        `json:"caps"`
+	// Ordering è sempre presente nei server che supportano la funzione:
+	// assente = server precedente, quindi il client non deve applicare nulla.
+	Ordering *OrderingState `json:"ordering,omitempty"`
+	Storage  StorageInfo    `json:"storage"`
 }
 
 // ProtoHeader è l'header di risposta con la versione del contratto

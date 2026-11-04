@@ -12,5 +12,7 @@
       "created_at": 1700000000000, "updated_at": 1700000000002, "deleted_at": null
     }
   ],
-  "caps": { "proto": 2 }
+  "caps": { "proto": 2 },
+  "ordering": { "version": 0, "data": {} },
+  "storage": { "usage_bytes": 86, "quota_bytes": 0 }
 }

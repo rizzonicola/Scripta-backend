@@ -436,6 +436,7 @@
                 <th data-i18n="colUsername">Username</th>
                 <th data-i18n="colId">ID</th>
                 <th data-i18n="colCreated">Creato il</th>
+                <th data-i18n="colStorage">Spazio</th>
                 <th data-i18n="colStatus">Stato</th>
                 <th data-i18n="colActions">Azioni</th>
               </tr>
@@ -448,6 +449,10 @@
                 </td>
                 <td class="mono" data-label="ID" data-label-i18n="colId">{{.ID}}</td>
                 <td data-label="Creato il" data-label-i18n="colCreated">{{.CreatedAt}}</td>
+                <td data-label="Spazio" data-label-i18n="colStorage">
+                  <span class="mono">{{.UsageText}}</span>
+                  <span class="muted"> / {{if .QuotaUnlimited}}<span data-i18n="quotaUnlimited">Illimitato</span>{{else}}{{.QuotaText}}{{end}}</span>
+                </td>
                 <td data-label="Stato" data-label-i18n="colStatus">
                   <div class="badges">
                     {{if .Blocked}}
@@ -488,6 +493,18 @@
                     </form>
 
                     <details>
+                      <summary data-i18n="storageQuota">Quota spazio</summary>
+                      <form class="inline" method="POST" action="/admin/users/storage-quota">
+                        <input type="hidden" name="user_id" value="{{.ID}}" />
+                        <input type="hidden" name="q" value="{{$.SearchQuery}}" />
+                        <input type="number" name="quota_mb" value="{{.QuotaMB}}" min="0" step="0.1"
+                          inputmode="decimal" data-i18n-placeholder="quotaMBPlaceholder"
+                          placeholder="MB (0 = illimitato)" required />
+                        <button type="submit" class="secondary" data-i18n="saveBtn">Salva</button>
+                      </form>
+                    </details>
+
+                    <details>
                       <summary data-i18n="resetPwd">Reset password</summary>
                       <form class="inline" method="POST" action="/admin/users/reset-password">
                         <input type="hidden" name="user_id" value="{{.ID}}" />
@@ -505,7 +522,7 @@
               </tr>
               {{else}}
               <tr>
-                <td colspan="5" class="empty">
+                <td colspan="6" class="empty">
                   {{if .HasSearch}}<span data-i18n="noResults">Nessun utente corrisponde alla ricerca.</span>
                   {{else}}<span data-i18n="noUsers">Nessun utente registrato.</span>{{end}}
                 </td>
@@ -616,6 +633,7 @@
         colUsername: 'Username',
         colId: 'ID',
         colCreated: 'Creato il',
+        colStorage: 'Spazio',
         colStatus: 'Stato',
         colActions: 'Azioni',
         badgeActive: 'Attivo',
@@ -628,6 +646,9 @@
         unblockConfirm: 'Sbloccare questo account? Le sessioni precedenti resteranno revocate.',
         limitDisableBtn: 'Disattiva rate limit',
         limitEnableBtn: 'Riattiva rate limit',
+        storageQuota: 'Quota spazio',
+        quotaUnlimited: 'Illimitato',
+        quotaMBPlaceholder: 'MB (0 = illimitato)',
         resetPwd: 'Reset password',
         newPwdPlaceholder: 'Nuova password',
         resetBtn: 'Reset',
@@ -689,6 +710,7 @@
         colUsername: 'Username',
         colId: 'ID',
         colCreated: 'Created on',
+        colStorage: 'Storage',
         colStatus: 'Status',
         colActions: 'Actions',
         badgeActive: 'Active',
@@ -701,6 +723,9 @@
         unblockConfirm: 'Unblock this account? Previous sessions will stay revoked.',
         limitDisableBtn: 'Disable rate limit',
         limitEnableBtn: 'Restore rate limit',
+        storageQuota: 'Storage quota',
+        quotaUnlimited: 'Unlimited',
+        quotaMBPlaceholder: 'MB (0 = unlimited)',
         resetPwd: 'Reset password',
         newPwdPlaceholder: 'New password',
         resetBtn: 'Reset',
@@ -762,6 +787,7 @@
         colUsername: "Nom d'utilisateur",
         colId: 'ID',
         colCreated: 'Créé le',
+        colStorage: 'Espace',
         colStatus: 'Statut',
         colActions: 'Actions',
         badgeActive: 'Actif',
@@ -774,6 +800,9 @@
         unblockConfirm: 'Débloquer ce compte ? Les sessions précédentes resteront révoquées.',
         limitDisableBtn: 'Désactiver le rate limit',
         limitEnableBtn: 'Rétablir le rate limit',
+        storageQuota: 'Quota de stockage',
+        quotaUnlimited: 'Illimité',
+        quotaMBPlaceholder: 'Mo (0 = illimité)',
         resetPwd: 'Réinitialiser le mot de passe',
         newPwdPlaceholder: 'Nouveau mot de passe',
         resetBtn: 'Réinitialiser',

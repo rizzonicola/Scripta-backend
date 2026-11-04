@@ -28,6 +28,11 @@ import (
 // processo. Sovrascrivibile per-istanza tramite SYNC_MAX_BODY_BYTES.
 const defaultMaxSyncBodyBytes = 64 << 20 // 64 MiB
 
+// maxOrderingBytes è il tetto del blob di posizionamento (ordine cartelle,
+// ordinamenti per vista, ordini manuali): pochi KB in pratica, ma un tetto
+// esplicito impedisce che un client bacato usi la sync come archivio.
+const maxOrderingBytes = 1 << 20 // 1 MiB
+
 // defaultMaxConcurrentSyncs limita quante richieste di sync possono essere
 // lette/decodificate contemporaneamente. Il limite per-utente (burst 60) e
 // quello per-body (64 MiB) non limitano la SOMMA dei body in volo: senza
@@ -373,11 +378,56 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		if res.retryAfter {
 			w.Header().Set("Retry-After", "1")
 		}
-		writeJSONError(w, res.status, res.message)
+		if res.code != "" {
+			writeJSONErrorCode(w, res.status, res.message, res.code)
+		} else {
+			writeJSONError(w, res.status, res.message)
+		}
 	default:
 		setProtoHeader(w)
 		writeJSON(w, http.StatusOK, res.resp)
 	}
+}
+
+// ResetOrdering gestisce POST /api/v1/ordering/reset: azzera il blob di
+// posizionamento dell'account e ne incrementa la versione. Tutti i client
+// riceveranno lo stato vuoto alla prossima sync e localmente lo applicheranno.
+func (h *SyncHandler) ResetOrdering(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		return
+	}
+	ctx := r.Context()
+	userID, ok := middleware.UserIDFromContext(ctx)
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		return
+	}
+
+	tx, err := h.beginTxWithRetry(ctx)
+	if err != nil {
+		if isTransientBusyErr(err) {
+			writeJSONErrorCode(w, http.StatusServiceUnavailable,
+				"database temporaneamente occupato, riprovare", "service_unavailable")
+			return
+		}
+		log.Printf("reset posizionamento: errore avvio transazione: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
+		return
+	}
+	version, err := db.NewOrderingRepo(tx).Reset(ctx, userID)
+	if err != nil {
+		_ = tx.Rollback()
+		log.Printf("reset posizionamento: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("reset posizionamento: errore commit: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"version": version})
 }
 
 // decodeSyncRequest legge il body di sync in due fasi: prima conserva gli
@@ -393,6 +443,7 @@ func decodeSyncRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (
 		LastSyncedAt int64           `json:"last_synced_at"`
 		Folders      json.RawMessage `json:"folders"`
 		Notes        json.RawMessage `json:"notes"`
+		Ordering     json.RawMessage `json:"ordering"`
 	}
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(&env); err != nil {
@@ -438,7 +489,34 @@ func decodeSyncRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (
 			return nil, false
 		}
 	}
+	if len(env.Ordering) > 0 && !bytes.Equal(bytes.TrimSpace(env.Ordering), []byte("null")) {
+		var push models.OrderingPush
+		if err := json.Unmarshal(env.Ordering, &push); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			return nil, false
+		}
+		if push.BaseVersion < 0 {
+			writeJSONError(w, http.StatusBadRequest, "base_version non valida")
+			return nil, false
+		}
+		if len(push.Data) > maxOrderingBytes {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "dati di posizionamento troppo grandi")
+			return nil, false
+		}
+		if !isJSONObject(push.Data) {
+			writeJSONError(w, http.StatusBadRequest, "dati di posizionamento non validi")
+			return nil, false
+		}
+		req.Ordering = &push
+	}
 	return req, true
+}
+
+// isJSONObject accetta solo un oggetto JSON non nullo: è la forma del blob di
+// posizionamento e impedisce di conservare valori arbitrari (stringhe, array).
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed)
 }
 
 // countJSONArray conta gli elementi di un array JSON senza costruire i
@@ -526,6 +604,7 @@ type syncResult struct {
 	rejected   []models.RejectedItem
 	status     int
 	message    string
+	code       string
 	retryAfter bool
 	aborted    bool
 }
@@ -572,6 +651,17 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 
 	foldersTx := db.NewFoldersRepo(tx)
 	notesTx := db.NewNotesRepo(tx)
+	storageTx := db.NewStorageRepo(tx)
+
+	// Occupazione PRIMA del batch: serve a distinguere un push che aumenta lo
+	// spazio (da rifiutare quando la quota è raggiunta) da una cancellazione o
+	// modifica che lo riduce (sempre ammessa, così l'utente può liberare spazio
+	// anche quando è già oltre il limite).
+	usageBefore, err := storageTx.Usage(ctx, userID)
+	if err != nil {
+		log.Printf("sync: errore calcolo spazio occupato: %v", err)
+		return failure(http.StatusInternalServerError, "errore calcolo spazio occupato")
+	}
 
 	// Cartelle (Y-01): vedi applyFolders. Il trigger di ownership richiede che
 	// il genitore esista già quando si scrive il figlio, ma l'ordine in cui il
@@ -655,6 +745,40 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		return syncResult{rejected: rejected}
 	}
 
+	usageAfter, err := storageTx.Usage(ctx, userID)
+	if err != nil {
+		log.Printf("sync: errore calcolo spazio occupato dopo il push: %v", err)
+		return failure(http.StatusInternalServerError, "errore calcolo spazio occupato")
+	}
+	var quotaBytes int64
+	if status, ok := middleware.AccountStatusFromContext(ctx); ok {
+		quotaBytes = status.StorageQuotaBytes
+	}
+	if quotaBytes > 0 && usageAfter > quotaBytes && usageAfter > usageBefore {
+		log.Printf("sync: quota superata (usata=%d limite=%d prima=%d), push rifiutato", usageAfter, quotaBytes, usageBefore)
+		return syncResult{
+			status:  http.StatusConflict,
+			message: "spazio di sincronizzazione esaurito: libera spazio o chiedi all'amministratore di aumentare la quota",
+			code:    "quota_exceeded",
+		}
+	}
+
+	// Posizionamento: il blob è opaco per il server. Il push viene applicato
+	// solo se la versione di base è quella corrente; in ogni caso la risposta
+	// contiene lo stato autoritativo, che il client applica localmente.
+	orderingTx := db.NewOrderingRepo(tx)
+	if req.Ordering != nil {
+		if _, _, _, err := orderingTx.Apply(ctx, userID, req.Ordering.BaseVersion, req.Ordering.Data); err != nil {
+			log.Printf("sync: errore salvataggio posizionamento: %v", err)
+			return failure(http.StatusInternalServerError, "errore salvataggio posizionamento")
+		}
+	}
+	orderingVersion, orderingData, err := orderingTx.Get(ctx, userID)
+	if err != nil {
+		log.Printf("sync: errore lettura posizionamento: %v", err)
+		return failure(http.StatusInternalServerError, "errore lettura posizionamento")
+	}
+
 	if err := tx.Commit(); err != nil {
 		if isTransientBusyErr(err) {
 			// NB: qui NON si ritenta tx.Commit() sullo stesso *sql.Tx (una
@@ -702,6 +826,8 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		Folders:    make([]models.FolderDTO, 0, len(folders)),
 		Notes:      make([]models.NoteDTO, 0, len(notes)),
 		Caps:       models.ServerCaps,
+		Ordering:   &models.OrderingState{Version: orderingVersion, Data: orderingData},
+		Storage:    models.StorageInfo{UsageBytes: usageAfter, QuotaBytes: quotaBytes},
 	}
 	for _, f := range folders {
 		resp.Folders = append(resp.Folders, models.FolderDTO{

@@ -392,13 +392,14 @@ func newLocalConnector(dsn string) (driver.Connector, error) {
 // questo lo schema è diviso in statement singoli, eseguiti in sequenza.
 var migrationStatements = []string{
 	`CREATE TABLE IF NOT EXISTS users (
-		id                TEXT PRIMARY KEY,
-		username          TEXT NOT NULL UNIQUE,
-		password_hash     TEXT NOT NULL,
-		created_at        INTEGER NOT NULL,
-		blocked_at        INTEGER,
-		rate_limit_exempt INTEGER NOT NULL DEFAULT 0,
-		password_version  INTEGER NOT NULL DEFAULT 1
+		id                  TEXT PRIMARY KEY,
+		username            TEXT NOT NULL UNIQUE,
+		password_hash       TEXT NOT NULL,
+		created_at          INTEGER NOT NULL,
+		blocked_at          INTEGER,
+		rate_limit_exempt   INTEGER NOT NULL DEFAULT 0,
+		password_version    INTEGER NOT NULL DEFAULT 1,
+		storage_quota_bytes INTEGER NOT NULL DEFAULT 0
 	)`,
 	// Chiave primaria COMPOSITA (user_id, id): l'ID è unico solo all'interno
 	// dell'account, non globalmente. Un client non può quindi «occupare» l'ID
@@ -446,6 +447,16 @@ var migrationStatements = []string{
 		user_id       TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
 		settings_json TEXT NOT NULL,
 		updated_at    INTEGER NOT NULL
+	)`,
+	// Blob unico di posizionamento per account (ordine cartelle, ordinamento
+	// per vista, ordini manuali delle note). Il server non interpreta il JSON:
+	// lo conserva e lo restituisce. Version serve al controllo ottimistico:
+	// un client che ha costruito la modifica su una versione superata non deve
+	// sovrascrivere un reset o una modifica più recente.
+	`CREATE TABLE IF NOT EXISTS user_ordering (
+		user_id       TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+		ordering_json TEXT NOT NULL DEFAULT '{}',
+		version       INTEGER NOT NULL DEFAULT 0
 	)`,
 	// Revoca persistente dei token (sopravvive al riavvio del server).
 	// Volutamente SENZA foreign key verso users: la revoca di un utente
@@ -928,6 +939,7 @@ func addUserSecurityColumns(conn *sql.DB) error {
 		{"blocked_at", `ALTER TABLE users ADD COLUMN blocked_at INTEGER`},
 		{"rate_limit_exempt", `ALTER TABLE users ADD COLUMN rate_limit_exempt INTEGER NOT NULL DEFAULT 0`},
 		{"password_version", `ALTER TABLE users ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1`},
+		{"storage_quota_bytes", `ALTER TABLE users ADD COLUMN storage_quota_bytes INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, w := range wanted {
 		if cols[w.column] {
