@@ -404,6 +404,20 @@ func (h *SyncHandler) ResetOrdering(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Il reset è una scrittura come la sync: consuma lo stesso budget per
+	// utente, così non può essere usato per saturare il writer SQLite.
+	if h.UserLimiter != nil && h.rateLimitApplies(ctx) && !h.UserLimiter.Allow(userID) {
+		w.Header().Set("Retry-After", "1")
+		writeJSONErrorCode(w, http.StatusTooManyRequests,
+			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
+		return
+	}
+
+	// Serializza il reset con le sync dello stesso processo: evita che una
+	// raffica di reset faccia fallire per BUSY transazioni di altri account.
+	h.stampMu.Lock()
+	defer h.stampMu.Unlock()
+
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
 		if isTransientBusyErr(err) {
@@ -514,9 +528,16 @@ func decodeSyncRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (
 
 // isJSONObject accetta solo un oggetto JSON non nullo: è la forma del blob di
 // posizionamento e impedisce di conservare valori arbitrari (stringhe, array).
+// Il secondo unmarshal rifiuta i numeri non rappresentabili come float64
+// (es. 1e400): json.Valid li accetta, ma alcuni client li decodificano come
+// Infinity e non riescono più a riserializzare il blob, bloccando la sync.
 func isJSONObject(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed)
+	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return false
+	}
+	var probe any
+	return json.Unmarshal(trimmed, &probe) == nil
 }
 
 // countJSONArray conta gli elementi di un array JSON senza costruire i
@@ -653,14 +674,23 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 	notesTx := db.NewNotesRepo(tx)
 	storageTx := db.NewStorageRepo(tx)
 
+	var quotaBytes int64
+	if status, ok := middleware.AccountStatusFromContext(ctx); ok {
+		quotaBytes = status.StorageQuotaBytes
+	}
+
 	// Occupazione PRIMA del batch: serve a distinguere un push che aumenta lo
 	// spazio (da rifiutare quando la quota è raggiunta) da una cancellazione o
 	// modifica che lo riduce (sempre ammessa, così l'utente può liberare spazio
-	// anche quando è già oltre il limite).
-	usageBefore, err := storageTx.Usage(ctx, userID)
-	if err != nil {
-		log.Printf("sync: errore calcolo spazio occupato: %v", err)
-		return failure(http.StatusInternalServerError, "errore calcolo spazio occupato")
+	// anche quando è già oltre il limite). Con quota illimitata il confronto
+	// non serve: si evita una scansione completa per ogni sync.
+	var usageBefore int64
+	if quotaBytes > 0 {
+		usageBefore, err = storageTx.Usage(ctx, userID)
+		if err != nil {
+			log.Printf("sync: errore calcolo spazio occupato: %v", err)
+			return failure(http.StatusInternalServerError, "errore calcolo spazio occupato")
+		}
 	}
 
 	// Cartelle (Y-01): vedi applyFolders. Il trigger di ownership richiede che
@@ -702,12 +732,19 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		if nc.DeletedAt != nil {
 			d, _ := clampClientTime(*nc.DeletedAt, now)
 			deletedAt = &d
+			// Il testo di un tombstone non serve più a nessun client: non
+			// deve occupare spazio né restare fuori dal conteggio della quota.
+			title = ""
+		}
+		content := nc.Content
+		if deletedAt != nil {
+			content = ""
 		}
 		note := &models.Note{
 			ID:         nc.ID,
 			UserID:     userID,
 			Title:      title,
-			Content:    nc.Content,
+			Content:    content,
 			FolderID:   nc.FolderID,
 			IsFavorite: nc.IsFavorite,
 			IsPinned:   nc.IsPinned,
@@ -745,27 +782,11 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 		return syncResult{rejected: rejected}
 	}
 
-	usageAfter, err := storageTx.Usage(ctx, userID)
-	if err != nil {
-		log.Printf("sync: errore calcolo spazio occupato dopo il push: %v", err)
-		return failure(http.StatusInternalServerError, "errore calcolo spazio occupato")
-	}
-	var quotaBytes int64
-	if status, ok := middleware.AccountStatusFromContext(ctx); ok {
-		quotaBytes = status.StorageQuotaBytes
-	}
-	if quotaBytes > 0 && usageAfter > quotaBytes && usageAfter > usageBefore {
-		log.Printf("sync: quota superata (usata=%d limite=%d prima=%d), push rifiutato", usageAfter, quotaBytes, usageBefore)
-		return syncResult{
-			status:  http.StatusConflict,
-			message: "spazio di sincronizzazione esaurito: libera spazio o chiedi all'amministratore di aumentare la quota",
-			code:    "quota_exceeded",
-		}
-	}
-
 	// Posizionamento: il blob è opaco per il server. Il push viene applicato
 	// solo se la versione di base è quella corrente; in ogni caso la risposta
 	// contiene lo stato autoritativo, che il client applica localmente.
+	// Va applicato PRIMA del conteggio finale: anche il blob occupa spazio e
+	// deve essere contato dalla quota.
 	orderingTx := db.NewOrderingRepo(tx)
 	if req.Ordering != nil {
 		if _, _, _, err := orderingTx.Apply(ctx, userID, req.Ordering.BaseVersion, req.Ordering.Data); err != nil {
@@ -777,6 +798,20 @@ func (h *SyncHandler) process(ctx context.Context, userID string, req *models.Sy
 	if err != nil {
 		log.Printf("sync: errore lettura posizionamento: %v", err)
 		return failure(http.StatusInternalServerError, "errore lettura posizionamento")
+	}
+
+	usageAfter, err := storageTx.Usage(ctx, userID)
+	if err != nil {
+		log.Printf("sync: errore calcolo spazio occupato dopo il push: %v", err)
+		return failure(http.StatusInternalServerError, "errore calcolo spazio occupato")
+	}
+	if quotaBytes > 0 && usageAfter > quotaBytes && usageAfter > usageBefore {
+		log.Printf("sync: quota superata (usata=%d limite=%d prima=%d), push rifiutato", usageAfter, quotaBytes, usageBefore)
+		return syncResult{
+			status:  http.StatusConflict,
+			message: "spazio di sincronizzazione esaurito: libera spazio o chiedi all'amministratore di aumentare la quota",
+			code:    "quota_exceeded",
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

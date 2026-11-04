@@ -14,5 +14,5 @@
   ],
   "caps": { "proto": 2 },
   "ordering": { "version": 0, "data": {} },
-  "storage": { "usage_bytes": 86, "quota_bytes": 0 }
+  "storage": { "usage_bytes": 1110, "quota_bytes": 0 }
 }

@@ -65,13 +65,17 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 // (GetByUsername), non alla UI, quindi evitare di caricarlo in memoria riduce
 // l'esposizione accidentale.
 func (r *UsersRepo) List(ctx context.Context, search string) ([]models.User, error) {
+	// Deve rispecchiare StorageRepo.Usage: tutte le righe (tombstone inclusi),
+	// testo più overhead fisso per riga, più il blob di posizionamento.
 	query := `SELECT users.id, users.username, users.created_at, users.blocked_at, users.rate_limit_exempt, users.storage_quota_bytes,
-		COALESCE((SELECT SUM(LENGTH(CAST(COALESCE(title, '') AS BLOB)) + LENGTH(CAST(COALESCE(content, '') AS BLOB)))
-			FROM notes WHERE notes.user_id = users.id AND notes.deleted_at IS NULL), 0) +
-		COALESCE((SELECT SUM(LENGTH(CAST(name AS BLOB)))
-			FROM folders WHERE folders.user_id = users.id AND folders.deleted_at IS NULL), 0)
+		COALESCE((SELECT SUM(? + LENGTH(CAST(COALESCE(title, '') AS BLOB)) + LENGTH(CAST(COALESCE(content, '') AS BLOB)))
+			FROM notes WHERE notes.user_id = users.id), 0) +
+		COALESCE((SELECT SUM(? + LENGTH(CAST(COALESCE(name, '') AS BLOB)))
+			FROM folders WHERE folders.user_id = users.id), 0) +
+		COALESCE((SELECT LENGTH(CAST(ordering_json AS BLOB))
+			FROM user_ordering WHERE user_ordering.user_id = users.id), 0)
 		FROM users`
-	args := make([]any, 0, 2)
+	args := []any{storageRowOverheadBytes, storageRowOverheadBytes}
 	search = strings.TrimSpace(search)
 	if search != "" {
 		pattern := "%" + escapeLike(search) + "%"

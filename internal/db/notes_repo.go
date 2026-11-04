@@ -108,6 +108,16 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) (bool, error)
 // precedente, perché la cancellazione della cartella padre è per definizione
 // l'evento più recente che le riguarda).
 func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt int64, deletedAt *int64) error {
+	if deletedAt != nil {
+		// Un tombstone non ha bisogno del testo: azzerarlo libera subito la
+		// quota (il contenuto non è più servito a nessun client) e impedisce
+		// di conservare dati fuori dal conteggio dello spazio.
+		_, err := r.db.ExecContext(ctx,
+			`UPDATE notes SET title = '', content = '', updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
+			updatedAt, syncedAt, deletedAt, id, userID,
+		)
+		return err
+	}
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE notes SET updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
 		updatedAt, syncedAt, deletedAt, id, userID,

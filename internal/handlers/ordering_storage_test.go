@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -79,7 +81,8 @@ func TestQuotaRejectsIncreasesButAllowsCleanup(t *testing.T) {
 	clock := time.UnixMilli(1_800_000_000_000)
 	h := handlerWithClock(sqlDB, &clock)
 
-	const quota = 20
+	// 256 B di overhead per riga + testo: la nota "small" occupa 258 B.
+	const quota = 290
 	if err := db.NewUsersRepo(sqlDB).SetStorageQuota(context.Background(), userID, quota); err != nil {
 		t.Fatalf("set quota: %v", err)
 	}
@@ -115,7 +118,7 @@ func TestQuotaRejectsIncreasesButAllowsCleanup(t *testing.T) {
 	if small.resp == nil {
 		t.Fatalf("push entro quota fallito: status=%d msg=%q", small.status, small.message)
 	}
-	if small.resp.Storage.UsageBytes != 2 || small.resp.Storage.QuotaBytes != quota {
+	if small.resp.Storage.UsageBytes != 258 || small.resp.Storage.QuotaBytes != quota {
 		t.Fatalf("storage in risposta = %+v", small.resp.Storage)
 	}
 
@@ -142,7 +145,69 @@ func TestQuotaRejectsIncreasesButAllowsCleanup(t *testing.T) {
 	if del.resp == nil {
 		t.Fatalf("cancellazione rifiutata: status=%d msg=%q", del.status, del.message)
 	}
-	if del.resp.Storage.UsageBytes != 0 {
-		t.Fatalf("spazio dopo la cancellazione = %d", del.resp.Storage.UsageBytes)
+	if del.resp.Storage.UsageBytes != 256 {
+		t.Fatalf("spazio dopo la cancellazione = %d, atteso il solo overhead (256)", del.resp.Storage.UsageBytes)
+	}
+	// Il tombstone conserva solo id/timestamp: il testo è azzerato, quindi
+	// non può essere usato per occupare spazio fuori dalla quota.
+	deleted, err := db.NewNotesRepo(sqlDB).Get(context.Background(), userID, "small")
+	if err != nil || deleted == nil || deleted.DeletedAt == nil {
+		t.Fatalf("tombstone non trovato: %+v %v", deleted, err)
+	}
+	if deleted.Title != "" || deleted.Content != "" {
+		t.Fatalf("il tombstone conserva testo: title=%q content=%q", deleted.Title, deleted.Content)
+	}
+
+	// Anche il blob di posizionamento è spazio dell'account: se fa superare
+	// la quota, il push viene rifiutato e non viene applicato.
+	clock = clock.Add(time.Second)
+	over := h.process(ctx, userID, &models.SyncRequest{
+		Folders: []models.FolderDTO{},
+		Notes:   []models.NoteDTO{},
+		Ordering: &models.OrderingPush{
+			BaseVersion: 0,
+			Data:        json.RawMessage(`{"folders":{"x":1},"pad":"0123456789012345678901234"}`),
+		},
+	})
+	if over.status != 409 || over.code != "quota_exceeded" {
+		t.Fatalf("posizionamento oltre quota: status=%d code=%q", over.status, over.code)
+	}
+	version, data, err := db.NewOrderingRepo(sqlDB).Get(context.Background(), userID)
+	if err != nil || version != 0 || string(data) != `{}` {
+		t.Fatalf("posizionamento applicato nonostante il 409: v=%d data=%s err=%v", version, data, err)
+	}
+}
+
+func TestOrderingRejectsNumbersNotRepresentableAsDouble(t *testing.T) {
+	// JSON valido per json.Valid, ma non per un client che decodifica in
+	// double: diventerebbe Infinity e bloccherebbe la serializzazione.
+	if isJSONObject(json.RawMessage(`{"folders":{"a":1e400}}`)) {
+		t.Fatal("numero non finito accettato nel blob di posizionamento")
+	}
+	if !isJSONObject(json.RawMessage(`{"folders":{"a":1}}`)) {
+		t.Fatal("blob di posizionamento valido rifiutato")
+	}
+}
+
+func TestResetOrderingConsumesTheSyncBudget(t *testing.T) {
+	sqlDB, userID := newStampTestDB(t)
+	h := NewSyncHandler(sqlDB)
+	limiter := &fakeUserLimiter{allow: false}
+	h.UserLimiter = limiter
+
+	call := func() int {
+		ctx := context.WithValue(context.Background(), middleware.CtxUserID, userID)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/ordering/reset", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		h.ResetOrdering(rec, req)
+		return rec.Code
+	}
+
+	if code := call(); code != http.StatusTooManyRequests {
+		t.Fatalf("reset senza budget: status=%d, atteso 429", code)
+	}
+	limiter.allow = true
+	if code := call(); code != http.StatusOK {
+		t.Fatalf("reset con budget: status=%d, atteso 200", code)
 	}
 }
