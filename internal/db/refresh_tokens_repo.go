@@ -15,14 +15,19 @@ var ErrRefreshTokenInactive = errors.New("refresh token non attivo")
 // RefreshToken è una riga di refresh_tokens. TokenHash è l'hash SHA-256 del
 // valore consegnato al client; il valore in chiaro non viene mai persistito.
 type RefreshToken struct {
-	ID         string
-	UserID     string
-	FamilyID   string
-	TokenHash  string
-	IssuedAt   int64
-	ExpiresAt  int64
-	RevokedAt  *int64
-	ReplacedBy *string
+	ID        string
+	UserID    string
+	FamilyID  string
+	TokenHash string
+	// PasswordVersion è l'epoch della password al momento dell'emissione.
+	// Refresh la confronta con users.password_version: un login che aveva
+	// letto l'hash precedente a un reset non può sopravvivere alla revoca
+	// solo perché la sua riga è stata creata dopo il cutoff.
+	PasswordVersion int64
+	IssuedAt        int64
+	ExpiresAt       int64
+	RevokedAt       *int64
+	ReplacedBy      *string
 }
 
 type RefreshTokensRepo struct {
@@ -37,9 +42,9 @@ func NewRefreshTokensRepo(d *sql.DB) *RefreshTokensRepo {
 func (r *RefreshTokensRepo) Create(ctx context.Context, rt RefreshToken) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO refresh_tokens
-			(id, user_id, family_id, token_hash, issued_at, expires_at, revoked_at, replaced_by)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		rt.ID, rt.UserID, rt.FamilyID, rt.TokenHash, rt.IssuedAt, rt.ExpiresAt, rt.RevokedAt, rt.ReplacedBy,
+			(id, user_id, family_id, token_hash, password_version, issued_at, expires_at, revoked_at, replaced_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rt.ID, rt.UserID, rt.FamilyID, rt.TokenHash, rt.PasswordVersion, rt.IssuedAt, rt.ExpiresAt, rt.RevokedAt, rt.ReplacedBy,
 	)
 	return err
 }
@@ -47,13 +52,13 @@ func (r *RefreshTokensRepo) Create(ctx context.Context, rt RefreshToken) error {
 // GetByHash cerca un refresh token per hash. Restituisce nil se non esiste.
 func (r *RefreshTokensRepo) GetByHash(ctx context.Context, hash string) (*RefreshToken, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, user_id, family_id, token_hash, issued_at, expires_at, revoked_at, replaced_by
+		SELECT id, user_id, family_id, token_hash, password_version, issued_at, expires_at, revoked_at, replaced_by
 		FROM refresh_tokens WHERE token_hash = ?`, hash,
 	)
 	var rt RefreshToken
 	var revokedAt sql.NullInt64
 	var replacedBy sql.NullString
-	err := row.Scan(&rt.ID, &rt.UserID, &rt.FamilyID, &rt.TokenHash, &rt.IssuedAt, &rt.ExpiresAt, &revokedAt, &replacedBy)
+	err := row.Scan(&rt.ID, &rt.UserID, &rt.FamilyID, &rt.TokenHash, &rt.PasswordVersion, &rt.IssuedAt, &rt.ExpiresAt, &revokedAt, &replacedBy)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -98,9 +103,9 @@ func (r *RefreshTokensRepo) Rotate(ctx context.Context, oldID string, next Refre
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO refresh_tokens
-			(id, user_id, family_id, token_hash, issued_at, expires_at, revoked_at, replaced_by)
-		VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`,
-		next.ID, next.UserID, next.FamilyID, next.TokenHash, next.IssuedAt, next.ExpiresAt,
+			(id, user_id, family_id, token_hash, password_version, issued_at, expires_at, revoked_at, replaced_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+		next.ID, next.UserID, next.FamilyID, next.TokenHash, next.PasswordVersion, next.IssuedAt, next.ExpiresAt,
 	); err != nil {
 		return err
 	}

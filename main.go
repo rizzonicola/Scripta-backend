@@ -222,16 +222,22 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // buildRouter assembla l'intero handler HTTP (rotte + middleware). È separato
 // da main() per poter essere esercitato dai test di integrazione (main_test.go)
 // con un database temporaneo, esattamente come in produzione.
-func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager) (http.Handler, error) {
+func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, providedAdminSessions ...*auth.AdminSessionManager) (http.Handler, error) {
 	usersRepo := db.NewUsersRepo(sqlDB)
 	notesRepo := db.NewNotesRepo(sqlDB)
 	settingsRepo := db.NewSettingsRepo(sqlDB)
 	serverSettingsRepo := db.NewServerSettingsRepo(sqlDB)
 	refreshTokensRepo := db.NewRefreshTokensRepo(sqlDB)
 
-	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminSessionTTL)
-	if err := adminSessions.AttachStore(context.Background(), db.NewRevocationRepo(sqlDB)); err != nil {
-		return nil, fmt.Errorf("caricamento revoche sessioni admin: %w", err)
+	adminSessions := (*auth.AdminSessionManager)(nil)
+	if len(providedAdminSessions) > 0 {
+		adminSessions = providedAdminSessions[0]
+	}
+	if adminSessions == nil {
+		adminSessions = auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminPass, cfg.AdminSessionTTL)
+		if err := adminSessions.AttachStore(context.Background(), db.NewRevocationRepo(sqlDB)); err != nil {
+			return nil, fmt.Errorf("caricamento revoche sessioni admin: %w", err)
+		}
 	}
 
 	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, refreshTokensRepo, adminSessions, serverSettingsRepo, cfg.AdminUser, cfg.AdminPass, templatesFS)
@@ -336,12 +342,19 @@ func main() {
 	if err := tokenManager.AttachStore(rootCtx, db.NewRevocationRepo(sqlDB)); err != nil {
 		log.Fatalf("caricamento revoche token: %v", err)
 	}
+	// Le sessioni admin hanno una cache di revoca separata: va istanziata qui
+	// (non dentro buildRouter) perché lo stesso oggetto deve essere ricaricato
+	// periodicamente insieme alle revoche dei token utente.
+	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminPass, cfg.AdminSessionTTL)
+	if err := adminSessions.AttachStore(rootCtx, db.NewRevocationRepo(sqlDB)); err != nil {
+		log.Fatalf("caricamento revoche sessioni admin: %v", err)
+	}
 	// Con più istanze sullo stesso primary, una revoca scritta da un'altra
 	// istanza deve diventare visibile anche qui senza riavvio.
-	stopRevocationReload := startRevocationReloadLoop(rootCtx, tokenManager)
+	stopRevocationReload := startRevocationReloadLoop(rootCtx, tokenManager, adminSessions)
 	defer stopRevocationReload()
 
-	handler, err := buildRouter(cfg, sqlDB, tokenManager)
+	handler, err := buildRouter(cfg, sqlDB, tokenManager, adminSessions)
 	if err != nil {
 		log.Fatalf("errore inizializzazione server: %v", err)
 	}
@@ -415,7 +428,7 @@ const revocationReloadInterval = 30 * time.Second
 // startRevocationReloadLoop rilegge periodicamente le revoche JWT dal DB.
 // Restituisce una funzione di stop che attende la fine del ciclo: va chiamata
 // prima di chiudere il pool SQL.
-func startRevocationReloadLoop(ctx context.Context, tm *auth.TokenManager) func() {
+func startRevocationReloadLoop(ctx context.Context, tm *auth.TokenManager, adminSessions *auth.AdminSessionManager) func() {
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -430,6 +443,9 @@ func startRevocationReloadLoop(ctx context.Context, tm *auth.TokenManager) func(
 				reloadCtx, reloadCancel := context.WithTimeout(ctx, 10*time.Second)
 				if err := tm.ReloadRevocations(reloadCtx); err != nil {
 					log.Printf("reload revoche token fallito, riprovo al prossimo giro: %v", err)
+				}
+				if err := adminSessions.ReloadRevocations(reloadCtx); err != nil {
+					log.Printf("reload revoche sessioni admin fallito, riprovo al prossimo giro: %v", err)
 				}
 				reloadCancel()
 			}

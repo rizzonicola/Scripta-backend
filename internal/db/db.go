@@ -472,14 +472,15 @@ var migrationStatements = []string{
 	// ripulisce i token quando l'utente viene eliminato; le revoche JWT
 	// restano invece senza FK per sopravvivere alla DELETE.
 	`CREATE TABLE IF NOT EXISTS refresh_tokens (
-		id          TEXT PRIMARY KEY,
-		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		family_id   TEXT NOT NULL,
-		token_hash  TEXT NOT NULL UNIQUE,
-		issued_at   INTEGER NOT NULL,
-		expires_at  INTEGER NOT NULL,
-		revoked_at  INTEGER,
-		replaced_by TEXT
+		id               TEXT PRIMARY KEY,
+		user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		family_id        TEXT NOT NULL,
+		token_hash       TEXT NOT NULL UNIQUE,
+		password_version INTEGER NOT NULL DEFAULT 0,
+		issued_at        INTEGER NOT NULL,
+		expires_at       INTEGER NOT NULL,
+		revoked_at       INTEGER,
+		replaced_by      TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id)`,
@@ -532,6 +533,14 @@ func migrate(conn *sql.DB) error {
 	// per-utente della sync). Sono additive e idempotenti.
 	if err := addUserSecurityColumns(conn); err != nil {
 		return fmt.Errorf("migrazione colonne sicurezza utente: %w", err)
+	}
+
+	// password_version sui refresh token: lega ogni sessione all'epoch della
+	// password con cui è nata. Senza questa colonna un login che ha letto
+	// l'hash prima di un reset poteva inserire un refresh token dopo la
+	// revoca e restare rinnovabile (il controllo IsUserRevoked usa issued_at).
+	if err := addRefreshTokenPasswordVersion(conn); err != nil {
+		return fmt.Errorf("migrazione password_version refresh token: %w", err)
 	}
 
 	// Le versioni precedenti imponevano l'unicità case-insensitive degli
@@ -923,6 +932,32 @@ func addUserSecurityColumns(conn *sql.DB) error {
 		log.Printf("migrazione: aggiunta colonna users.%s mancante", w.column)
 	}
 	return nil
+}
+
+// addRefreshTokenPasswordVersion aggiunge l'epoch della password alla tabella
+// refresh_tokens. Le righe preesistenti vengono legate alla versione corrente
+// dell'utente: le sessioni valide restano valide, mentre un eventuale token
+// nato dalla race reset/login precedente alla migrazione non può più essere
+// distinto e viene comunque accettato solo fino alla prossima rotazione. Da
+// qui in avanti AuthHandler.Refresh rifiuta ogni token con epoch diverso.
+func addRefreshTokenPasswordVersion(conn *sql.DB) error {
+	cols, err := tableColumns(conn, "refresh_tokens")
+	if err != nil {
+		return err
+	}
+	if !cols["password_version"] {
+		if _, err := conn.Exec(`ALTER TABLE refresh_tokens ADD COLUMN password_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("alter table refresh_tokens.password_version: %w", err)
+		}
+		log.Printf("migrazione: aggiunta colonna refresh_tokens.password_version mancante")
+	}
+	// Backfill idempotente: solo le righe legacy (0) vengono toccate.
+	_, err = conn.Exec(`
+		UPDATE refresh_tokens
+		SET password_version = COALESCE(
+			(SELECT password_version FROM users WHERE users.id = refresh_tokens.user_id), 0)
+		WHERE password_version = 0`)
+	return err
 }
 
 // addNotesPinningColumns aggiunge is_favorite, is_pinned e order_index alla

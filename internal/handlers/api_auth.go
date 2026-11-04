@@ -126,7 +126,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	refreshToken, _, refreshExpiresAt, err := h.createRefreshToken(r, user.ID, auth.NewRefreshFamilyID(), now)
+	refreshToken, _, refreshExpiresAt, err := h.createRefreshToken(
+		r, user.ID, user.PasswordVersion, auth.NewRefreshFamilyID(), now)
 	if err != nil {
 		log.Printf("login: creazione refresh token fallita: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
@@ -146,7 +147,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 // createRefreshToken genera e persiste un nuovo refresh token nella famiglia
 // indicata. Restituisce anche il valore in chiaro (da consegnare al client) e
 // la scadenza.
-func (h *AuthHandler) createRefreshToken(r *http.Request, userID, familyID string, now time.Time) (string, string, time.Time, error) {
+func (h *AuthHandler) createRefreshToken(r *http.Request, userID string, passwordVersion int64, familyID string, now time.Time) (string, string, time.Time, error) {
 	raw, hash, err := auth.NewRefreshToken()
 	if err != nil {
 		return "", "", time.Time{}, err
@@ -154,12 +155,13 @@ func (h *AuthHandler) createRefreshToken(r *http.Request, userID, familyID strin
 	expiresAt := now.Add(h.RefreshTTL)
 	id := uuid.NewString()
 	err = h.RefreshTokens.Create(r.Context(), db.RefreshToken{
-		ID:        id,
-		UserID:    userID,
-		FamilyID:  familyID,
-		TokenHash: hash,
-		IssuedAt:  now.UnixMilli(),
-		ExpiresAt: expiresAt.UnixMilli(),
+		ID:              id,
+		UserID:          userID,
+		FamilyID:        familyID,
+		TokenHash:       hash,
+		PasswordVersion: passwordVersion,
+		IssuedAt:        now.UnixMilli(),
+		ExpiresAt:       expiresAt.UnixMilli(),
 	})
 	if err != nil {
 		return "", "", time.Time{}, err
@@ -231,6 +233,16 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
+	// Epoch della password: chiude la race in cui un login ha verificato
+	// l'hash vecchio, l'admin ha resettato la password e il login ha poi
+	// creato il refresh token DOPO la revoca (issued_at successivo al cutoff).
+	// Il token porta la versione letta al login; se non coincide con quella
+	// corrente, l'intera famiglia non è più affidabile.
+	if current.PasswordVersion == 0 || current.PasswordVersion != user.PasswordVersion {
+		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
+		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		return
+	}
 
 	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username, user.PasswordVersion)
 	if err != nil {
@@ -244,12 +256,13 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := db.RefreshToken{
-		ID:        uuid.NewString(),
-		UserID:    user.ID,
-		FamilyID:  current.FamilyID,
-		TokenHash: nextHash,
-		IssuedAt:  now.UnixMilli(),
-		ExpiresAt: now.Add(h.RefreshTTL).UnixMilli(),
+		ID:              uuid.NewString(),
+		UserID:          user.ID,
+		FamilyID:        current.FamilyID,
+		TokenHash:       nextHash,
+		PasswordVersion: user.PasswordVersion,
+		IssuedAt:        now.UnixMilli(),
+		ExpiresAt:       now.Add(h.RefreshTTL).UnixMilli(),
 	}
 	if err := h.RefreshTokens.Rotate(r.Context(), current.ID, next, now); err != nil {
 		if errors.Is(err, db.ErrRefreshTokenInactive) {

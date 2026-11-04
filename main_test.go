@@ -27,6 +27,7 @@ type testEnv struct {
 	users    *db.UsersRepo
 	tm       *auth.TokenManager
 	repo     *db.RevocationRepo
+	refresh  *db.RefreshTokensRepo
 	path     string
 	settings *db.ServerSettingsRepo
 }
@@ -58,11 +59,15 @@ func newEnv(t *testing.T, trustedProxies ...string) *testEnv {
 
 	users := db.NewUsersRepo(sqlDB)
 	settings := db.NewServerSettingsRepo(sqlDB)
+	refresh := db.NewRefreshTokensRepo(sqlDB)
 	hash, _ := auth.HashPassword("password-di-prova")
 	if _, err := users.Create(context.Background(), "mario", hash); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	return &testEnv{t: t, srv: srv, users: users, tm: tm, repo: repo, path: path, settings: settings}
+	return &testEnv{
+		t: t, srv: srv, users: users, tm: tm, repo: repo, refresh: refresh,
+		path: path, settings: settings,
+	}
 }
 
 func (e *testEnv) do(method, path, token string, body any, hdr map[string]string) (int, []byte, http.Header) {
@@ -508,6 +513,55 @@ func TestAdminResetPasswordRevokesRefreshFamily(t *testing.T) {
 	}
 	if code, _, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": refresh}, nil); code != http.StatusUnauthorized {
 		t.Fatalf("refresh token ancora valido dopo il reset: %d", code)
+	}
+}
+
+func TestRefreshRejectsTokenIssuedWithPreviousPasswordVersion(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	user, err := e.users.GetByUsername(ctx, "mario")
+	if err != nil || user == nil {
+		t.Fatalf("utente non trovato: %v", err)
+	}
+	oldVersion := user.PasswordVersion
+
+	// Simula la race: il reset avanza l'epoch, poi il login che aveva letto
+	// l'hash vecchio inserisce comunque il suo refresh token (issued_at
+	// successivo al cutoff di revoca, quindi IsUserRevoked non lo vede).
+	newHash, err := auth.HashPassword("nuova-password-lunga")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.users.UpdatePassword(ctx, user.ID, newHash); err != nil {
+		t.Fatal(err)
+	}
+	raw, hash, err := auth.NewRefreshToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := e.refresh.Create(ctx, db.RefreshToken{
+		ID:              "raced-refresh",
+		UserID:          user.ID,
+		FamilyID:        "famiglia-race",
+		TokenHash:       hash,
+		PasswordVersion: oldVersion,
+		IssuedAt:        now.UnixMilli(),
+		ExpiresAt:       now.Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body, _ := e.do("POST", "/api/v1/auth/refresh", "", map[string]string{"refresh_token": raw}, nil)
+	if code != http.StatusUnauthorized || !strings.Contains(string(body), `"code":"invalid_grant"`) {
+		t.Fatalf("refresh con epoch precedente accettato: %d %s", code, body)
+	}
+	got, err := e.refresh.GetByHash(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.RevokedAt == nil {
+		t.Fatalf("famiglia della race non revocata: %+v", got)
 	}
 }
 

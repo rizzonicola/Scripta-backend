@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ const adminSessionSubject = "admin-session-v1"
 type AdminSessionManager struct {
 	secret []byte
 	ttl    time.Duration
+	// credential è l'impronta della password admin corrente. Cambiare
+	// ADMIN_PASS invalida immediatamente i cookie emessi con la precedente,
+	// senza attendere la scadenza naturale.
+	credential string
 
 	// revoked è la cache dei jti di sessione admin revocati (logout
 	// server-side), con la scadenza naturale. store, se presente, la rende
@@ -48,12 +53,14 @@ type AdminSessionRevocationStore interface {
 
 const adminRevocationUserID = "admin-session"
 
-func NewAdminSessionManager(jwtSecret string, ttl time.Duration) *AdminSessionManager {
+func NewAdminSessionManager(jwtSecret, adminPass string, ttl time.Duration) *AdminSessionManager {
 	derived := sha256.Sum256([]byte("admin-session|" + jwtSecret))
+	credential := sha256.Sum256([]byte("admin-credential|" + adminPass))
 	return &AdminSessionManager{
-		secret:  derived[:],
-		ttl:     ttl,
-		revoked: make(map[string]time.Time),
+		secret:     derived[:],
+		ttl:        ttl,
+		credential: fmt.Sprintf("%x", credential[:]),
+		revoked:    make(map[string]time.Time),
 	}
 }
 
@@ -73,8 +80,41 @@ func (m *AdminSessionManager) AttachStore(ctx context.Context, store AdminSessio
 	return nil
 }
 
+// ReloadRevocations rilegge le revoche admin dal DB. Con più istanze sullo
+// stesso primary, un logout avvenuto su un'altra istanza deve invalidare il
+// cookie anche qui senza attendere un riavvio. Le revoche solo in RAM (salvataggio
+// su DB fallito) restano valide: la mappa viene fusa, non sostituita.
+func (m *AdminSessionManager) ReloadRevocations(ctx context.Context) error {
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	_, tokens, err := store.LoadActive(ctx, time.Now())
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	merged := make(map[string]time.Time, len(m.revoked)+len(tokens))
+	for jti, exp := range m.revoked {
+		if exp.After(now) {
+			merged[jti] = exp
+		}
+	}
+	for jti, exp := range tokens {
+		merged[jti] = exp
+	}
+	m.revoked = merged
+	return nil
+}
+
 type adminSessionClaims struct {
 	jwt.RegisteredClaims
+	// Credential lega il cookie alla password admin con cui è stato emesso.
+	Credential string `json:"cv"`
 }
 
 // GenerateSession crea un cookie di sessione firmato, valido per ttl.
@@ -87,6 +127,7 @@ func (m *AdminSessionManager) GenerateSession() (token string, expiresAt time.Ti
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
+		Credential: m.credential,
 	}
 	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.secret)
 	if err != nil {
@@ -111,6 +152,9 @@ func (m *AdminSessionManager) Validate(token string) error {
 	}
 	if !parsed.Valid || claims.Subject != adminSessionSubject {
 		return errors.New("sessione admin non valida")
+	}
+	if claims.Credential == "" || claims.Credential != m.credential {
+		return errors.New("sessione admin non più valida")
 	}
 	if claims.ID != "" {
 		m.mu.RLock()
