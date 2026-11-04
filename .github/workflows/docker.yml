@@ -46,6 +46,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # L'immagine è un indice multi-arch: lo stesso tag `latest` (e gli stessi
+      # tag di versione) contiene sia linux/amd64 sia linux/arm64. Docker sceglie
+      # automaticamente la variante giusta in base all'architettura del client:
+      # su ARM64 scarica l'immagine ARM64, su x86-64 quella amd64. Non serve un
+      # repository separato tipo `scripta-backend-arm64`, che sarebbe solo un
+      # doppione e costringerebbe l'utente a ricordarsi quale nome usare.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -67,6 +79,11 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          # Build multi-arch: il runner è amd64, QEMU emula ARM64 durante la
+          # build. La cache GHA evita di ricompilare tutto a ogni push.
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
