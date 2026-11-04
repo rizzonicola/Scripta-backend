@@ -189,3 +189,49 @@ func TestUsersRepoSearchAndSecurityFlags(t *testing.T) {
 		t.Fatalf("blocco utente inesistente = %v, atteso sql.ErrNoRows", err)
 	}
 }
+
+func TestAdminStorageUsageMatchesQuotaAccounting(t *testing.T) {
+	conn, err := Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx := context.Background()
+	user, err := NewUsersRepo(conn).Create(ctx, "mario", "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO folders (id, user_id, name, updated_at, synced_at) VALUES ('f1', ?, 'Lavoro', 1, 1)`,
+		user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO notes (id, user_id, title, content, folder_id, updated_at, synced_at) VALUES ('n1', ?, 'Titolo', 'Contenuto', 'f1', 1, 1)`,
+		user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO user_ordering (user_id, ordering_json, version) VALUES (?, '{"folders":{"f1":1}}', 1)`,
+		user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := NewStorageRepo(conn).Usage(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, err := NewUsersRepo(conn).List(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 {
+		t.Fatalf("utenti = %d, atteso 1", len(users))
+	}
+	if users[0].StorageUsageBytes != want {
+		t.Fatalf("uso admin = %d, conteggio quota = %d: le due query divergono",
+			users[0].StorageUsageBytes, want)
+	}
+}

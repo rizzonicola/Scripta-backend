@@ -280,6 +280,28 @@ func (h *SyncHandler) rateLimitApplies(ctx context.Context) bool {
 	return settings.UserRateLimitEnabled
 }
 
+// authorizeSyncRequest valida metodo, autenticazione e budget di rate limit
+// comuni a tutte le scritture della sync. Restituisce false quando ha già
+// scritto la risposta di errore.
+func (h *SyncHandler) authorizeSyncRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		return "", false
+	}
+	userID, ok := middleware.UserIDFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		return "", false
+	}
+	if h.UserLimiter != nil && h.rateLimitApplies(r.Context()) && !h.UserLimiter.Allow(userID) {
+		w.Header().Set("Retry-After", "1")
+		writeJSONErrorCode(w, http.StatusTooManyRequests,
+			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
+		return "", false
+	}
+	return userID, true
+}
+
 // Sync gestisce POST /api/v1/sync applicando il protocollo Delta Sync
 // Push/Pull con risoluzione dei conflitti Last-Write-Wins:
 //
@@ -313,25 +335,11 @@ func (h *SyncHandler) rateLimitApplies(ctx context.Context) bool {
 // esplicita: un solo fsync a fine batch (con synchronous=NORMAL + WAL) e
 // atomicità sui metadati dell'intera richiesta.
 func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
-		return
-	}
-
-	ctx := r.Context()
-
-	userID, ok := middleware.UserIDFromContext(ctx)
+	userID, ok := h.authorizeSyncRequest(w, r)
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
 		return
 	}
-
-	if h.UserLimiter != nil && h.rateLimitApplies(ctx) && !h.UserLimiter.Allow(userID) {
-		w.Header().Set("Retry-After", "1")
-		writeJSONErrorCode(w, http.StatusTooManyRequests,
-			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
-		return
-	}
+	ctx := r.Context()
 
 	// Il semaforo copre lettura, decodifica, transazione e scrittura della
 	// risposta: è il punto in cui il body resta in memoria. Acquisirlo PRIMA
@@ -393,25 +401,11 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 // posizionamento dell'account e ne incrementa la versione. Tutti i client
 // riceveranno lo stato vuoto alla prossima sync e localmente lo applicheranno.
 func (h *SyncHandler) ResetOrdering(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+	userID, ok := h.authorizeSyncRequest(w, r)
+	if !ok {
 		return
 	}
 	ctx := r.Context()
-	userID, ok := middleware.UserIDFromContext(ctx)
-	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
-		return
-	}
-
-	// Il reset è una scrittura come la sync: consuma lo stesso budget per
-	// utente, così non può essere usato per saturare il writer SQLite.
-	if h.UserLimiter != nil && h.rateLimitApplies(ctx) && !h.UserLimiter.Allow(userID) {
-		w.Header().Set("Retry-After", "1")
-		writeJSONErrorCode(w, http.StatusTooManyRequests,
-			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
-		return
-	}
 
 	// Serializza il reset con le sync dello stesso processo: evita che una
 	// raffica di reset faccia fallire per BUSY transazioni di altri account.
@@ -1147,29 +1141,21 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 			}
 		}
 
-		childIDs, err := foldersTx.ListChildIDs(ctx, userID, current)
+		children, err := foldersTx.ListChildren(ctx, userID, current)
 		if err != nil {
 			return err
 		}
-		activeIDs, err := foldersTx.ListActiveChildIDs(ctx, userID, current)
-		if err != nil {
-			return err
-		}
-		active := make(map[string]struct{}, len(activeIDs))
-		for _, id := range activeIDs {
-			active[id] = struct{}{}
-		}
-		for _, id := range childIDs {
-			if _, seen := visited[id]; seen {
+		for _, child := range children {
+			if _, seen := visited[child.ID]; seen {
 				continue
 			}
-			visited[id] = struct{}{}
-			if _, ok := active[id]; ok {
-				if err := foldersTx.ForceSet(ctx, userID, id, now, now, &deletedAt); err != nil {
+			visited[child.ID] = struct{}{}
+			if child.Active {
+				if err := foldersTx.ForceSet(ctx, userID, child.ID, now, now, &deletedAt); err != nil {
 					return err
 				}
 			}
-			queue = append(queue, id)
+			queue = append(queue, child.ID)
 		}
 	}
 	return nil

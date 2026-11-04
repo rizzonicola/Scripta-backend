@@ -65,7 +65,7 @@ var pragmaStatements = []string{
 // Open apre (creando se necessario) il DB SQLite locale tramite il driver
 // libSQL, con i PRAGMA ottimizzati per un server a bassa/media concorrenza.
 // È la firma "semplice", equivalente a OpenWithConfig(Config{Path: path}):
-// nessuna sincronizzazione remota, solo file locale.
+// nessuna sincronizzazione remota, solo file locale. La usa la suite di test.
 func Open(path string) (*sql.DB, error) {
 	return OpenWithConfig(Config{Path: path})
 }
@@ -390,6 +390,43 @@ func newLocalConnector(dsn string) (driver.Connector, error) {
 // Exec/Query: una singola stringa con più CREATE TABLE separati da ";"
 // esegue silenziosamente solo la prima e ignora le altre, senza errore. Per
 // questo lo schema è diviso in statement singoli, eseguiti in sequenza.
+// Colonne condivise fra la creazione iniziale delle tabelle e la loro
+// ricostruzione durante la migrazione alla chiave primaria composita: un solo
+// punto da aggiornare quando lo schema cambia.
+const (
+	foldersTableColumns = `(
+		id         TEXT NOT NULL,
+		user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		name       TEXT NOT NULL,
+		parent_id  TEXT,
+		updated_at INTEGER NOT NULL,
+		synced_at  INTEGER NOT NULL DEFAULT 0,
+		deleted_at INTEGER,
+		PRIMARY KEY (user_id, id)
+	)`
+
+	notesTableColumns = `(
+		id          TEXT NOT NULL,
+		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		title       TEXT NOT NULL DEFAULT '',
+		content     TEXT NOT NULL DEFAULT '',
+		folder_id   TEXT,
+		is_favorite INTEGER NOT NULL DEFAULT 0,
+		is_pinned   INTEGER NOT NULL DEFAULT 0,
+		order_index INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL DEFAULT 0,
+		updated_at  INTEGER NOT NULL,
+		synced_at   INTEGER NOT NULL DEFAULT 0,
+		deleted_at  INTEGER,
+		PRIMARY KEY (user_id, id)
+	)`
+
+	createFoldersParentIndex    = `CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`
+	createFoldersDeletedAtIndex = `CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`
+	createNotesFolderIndex      = `CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`
+	createNotesDeletedAtIndex   = `CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`
+)
+
 var migrationStatements = []string{
 	`CREATE TABLE IF NOT EXISTS users (
 		id                  TEXT PRIMARY KEY,
@@ -405,17 +442,8 @@ var migrationStatements = []string{
 	// dell'account, non globalmente. Un client non può quindi «occupare» l'ID
 	// di una cartella altrui né usare il conflitto di chiave come oracolo per
 	// scoprire se un certo ID esiste su un altro account.
-	`CREATE TABLE IF NOT EXISTS folders (
-		id         TEXT NOT NULL,
-		user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		name       TEXT NOT NULL,
-		parent_id  TEXT,
-		updated_at INTEGER NOT NULL,
-		synced_at  INTEGER NOT NULL DEFAULT 0,
-		deleted_at INTEGER,
-		PRIMARY KEY (user_id, id)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`,
+	`CREATE TABLE IF NOT EXISTS folders ` + foldersTableColumns,
+	createFoldersParentIndex,
 	// Indice parziale: PurgeExpiredTombstones (folders_repo.go) filtra
 	// "WHERE deleted_at IS NOT NULL AND deleted_at < ?" senza user_id (è un
 	// job di manutenzione globale, non per-utente). Senza questo indice
@@ -423,26 +451,12 @@ var migrationStatements = []string{
 	// ciclo di purge (main.go, ogni 24h); essendo parziale (solo le righe
 	// con deleted_at valorizzato, cioè i soli tombstone) resta piccolo e
 	// economico da mantenere anche sulle scritture normali di righe attive.
-	`CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
+	createFoldersDeletedAtIndex,
 	// Come folders: chiave primaria composita (user_id, id), vedi sopra.
-	`CREATE TABLE IF NOT EXISTS notes (
-		id          TEXT NOT NULL,
-		user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		title       TEXT NOT NULL DEFAULT '',
-		content     TEXT NOT NULL DEFAULT '',
-		folder_id   TEXT,
-		is_favorite INTEGER NOT NULL DEFAULT 0,
-		is_pinned   INTEGER NOT NULL DEFAULT 0,
-		order_index INTEGER NOT NULL DEFAULT 0,
-		created_at  INTEGER NOT NULL DEFAULT 0,
-		updated_at  INTEGER NOT NULL,
-		synced_at   INTEGER NOT NULL DEFAULT 0,
-		deleted_at  INTEGER,
-		PRIMARY KEY (user_id, id)
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
+	`CREATE TABLE IF NOT EXISTS notes ` + notesTableColumns,
+	createNotesFolderIndex,
 	// Stessa motivazione di idx_folders_deleted_at, per NotesRepo.PurgeExpiredTombstones.
-	`CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
+	createNotesDeletedAtIndex,
 	`CREATE TABLE IF NOT EXISTS user_settings (
 		user_id       TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
 		settings_json TEXT NOT NULL,
@@ -733,6 +747,22 @@ func addOwnershipTriggers(conn *sql.DB) error {
 // discendente non può referenziarla), quindi non paga il costo della CTE.
 // Il ramo UPDATE scatta solo se parent_id cambia davvero.
 func addFolderCycleTriggers(conn *sql.DB) error {
+	// Corpo comune ai due trigger: risale gli antenati del nuovo parent e
+	// rifiuta l'operazione se la cartella stessa compare nella catena.
+	const checkBody = `BEGIN
+		   SELECT CASE WHEN EXISTS (
+		     WITH RECURSIVE ancestors(id, parent_id) AS (
+		       SELECT id, parent_id FROM folders
+		        WHERE id = NEW.parent_id AND user_id = NEW.user_id
+		       UNION
+		       SELECT f.id, f.parent_id FROM folders f
+		        JOIN ancestors a ON f.id = a.parent_id
+		        WHERE f.user_id = NEW.user_id
+		     )
+		     SELECT 1 FROM ancestors WHERE id = NEW.id
+		   ) THEN RAISE(ABORT, 'FOLDER_CYCLE: parent_id è un discendente della cartella') END;
+		 END`
+
 	statements := []string{
 		`CREATE TRIGGER IF NOT EXISTS trg_folders_cycle_ins
 		 BEFORE INSERT ON folders
@@ -742,36 +772,12 @@ func addFolderCycleTriggers(conn *sql.DB) error {
 		     WHERE user_id = NEW.user_id AND id = NEW.id
 		       AND parent_id IS NOT NEW.parent_id
 		  )
-		 BEGIN
-		   SELECT CASE WHEN EXISTS (
-		     WITH RECURSIVE ancestors(id, parent_id) AS (
-		       SELECT id, parent_id FROM folders
-		        WHERE id = NEW.parent_id AND user_id = NEW.user_id
-		       UNION
-		       SELECT f.id, f.parent_id FROM folders f
-		        JOIN ancestors a ON f.id = a.parent_id
-		        WHERE f.user_id = NEW.user_id
-		     )
-		     SELECT 1 FROM ancestors WHERE id = NEW.id
-		   ) THEN RAISE(ABORT, 'FOLDER_CYCLE: parent_id è un discendente della cartella') END;
-		 END`,
+		 ` + checkBody,
 		`CREATE TRIGGER IF NOT EXISTS trg_folders_cycle_upd
 		 BEFORE UPDATE OF parent_id ON folders
 		 WHEN NEW.parent_id IS NOT NULL
 		  AND OLD.parent_id IS NOT NEW.parent_id
-		 BEGIN
-		   SELECT CASE WHEN EXISTS (
-		     WITH RECURSIVE ancestors(id, parent_id) AS (
-		       SELECT id, parent_id FROM folders
-		        WHERE id = NEW.parent_id AND user_id = NEW.user_id
-		       UNION
-		       SELECT f.id, f.parent_id FROM folders f
-		        JOIN ancestors a ON f.id = a.parent_id
-		        WHERE f.user_id = NEW.user_id
-		     )
-		     SELECT 1 FROM ancestors WHERE id = NEW.id
-		   ) THEN RAISE(ABORT, 'FOLDER_CYCLE: parent_id è un discendente della cartella') END;
-		 END`,
+		 ` + checkBody,
 	}
 	for _, stmt := range statements {
 		if _, err := conn.Exec(stmt); err != nil {
@@ -1130,42 +1136,19 @@ func migrateCompositePrimaryKeys(conn *sql.DB) error {
 		{
 			table:   "folders",
 			columns: "id, user_id, name, parent_id, updated_at, synced_at, deleted_at",
-			create: `CREATE TABLE folders__composite_pk (
-				id         TEXT NOT NULL,
-				user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-				name       TEXT NOT NULL,
-				parent_id  TEXT,
-				updated_at INTEGER NOT NULL,
-				synced_at  INTEGER NOT NULL DEFAULT 0,
-				deleted_at INTEGER,
-				PRIMARY KEY (user_id, id)
-			)`,
+			create:  `CREATE TABLE folders__composite_pk ` + foldersTableColumns,
 			indexes: []string{
-				`CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`,
-				`CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`,
+				createFoldersParentIndex,
+				createFoldersDeletedAtIndex,
 			},
 		},
 		{
 			table:   "notes",
 			columns: "id, user_id, title, content, folder_id, is_favorite, is_pinned, order_index, created_at, updated_at, synced_at, deleted_at",
-			create: `CREATE TABLE notes__composite_pk (
-				id          TEXT NOT NULL,
-				user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-				title       TEXT NOT NULL DEFAULT '',
-				content     TEXT NOT NULL DEFAULT '',
-				folder_id   TEXT,
-				is_favorite INTEGER NOT NULL DEFAULT 0,
-				is_pinned   INTEGER NOT NULL DEFAULT 0,
-				order_index INTEGER NOT NULL DEFAULT 0,
-				created_at  INTEGER NOT NULL DEFAULT 0,
-				updated_at  INTEGER NOT NULL,
-				synced_at   INTEGER NOT NULL DEFAULT 0,
-				deleted_at  INTEGER,
-				PRIMARY KEY (user_id, id)
-			)`,
+			create:  `CREATE TABLE notes__composite_pk ` + notesTableColumns,
 			indexes: []string{
-				`CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`,
-				`CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`,
+				createNotesFolderIndex,
+				createNotesDeletedAtIndex,
 			},
 		},
 	}

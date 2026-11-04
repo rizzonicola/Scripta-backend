@@ -28,6 +28,14 @@ var templatesFS embed.FS
 // serverVersion è riportata da /healthz (e verificata dai test).
 const serverVersion = "2.1.0"
 
+// methodNotAllowedJSON risponde 405 in JSON per i dispatcher che non hanno un
+// handler per il metodo richiesto.
+func methodNotAllowedJSON(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
+}
+
 // settingsDispatch instrada GET e PUT su /api/v1/user/settings verso i rispettivi
 // handler (mux.Handle non fa dispatch per metodo su un singolo pattern).
 func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
@@ -38,9 +46,7 @@ func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
 		case http.MethodPut:
 			h.UpdateSettings(w, r)
 		default:
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
+			methodNotAllowedJSON(w)
 		}
 	}
 }
@@ -57,9 +63,7 @@ func adminLoginDispatch(h *handlers.AdminHandler, loginGuards func(http.Handler)
 		case http.MethodPost:
 			post.ServeHTTP(w, r)
 		default:
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
+			methodNotAllowedJSON(w)
 		}
 	}
 }

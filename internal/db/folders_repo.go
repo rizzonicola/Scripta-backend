@@ -107,36 +107,20 @@ func (r *FoldersRepo) ListSyncedBetween(ctx context.Context, userID string, sinc
 	return folders, rows.Err()
 }
 
-// ListChildIDs restituisce gli ID di tutte le sottocartelle dirette,
-// tombstone inclusi. La cascade la usa per attraversare anche un ramo già
-// cancellato e raggiungere eventuali discendenti ancora attivi.
-func (r *FoldersRepo) ListChildIDs(ctx context.Context, userID, parentID string) ([]string, error) {
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id FROM folders WHERE user_id = ? AND parent_id = ?`,
-		userID, parentID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
+// FolderChild è una sottocartella diretta con il suo stato di cancellazione.
+// La cascade usa Active per decidere se propagare il tombstone, ma attraversa
+// anche i rami già cancellati per raggiungere eventuali discendenti attivi.
+type FolderChild struct {
+	ID     string
+	Active bool
 }
 
-// ListActiveChildIDs restituisce gli ID delle sottocartelle dirette e ancora
-// attive (non soft-deleted) di una data cartella. Usata dalla cascade
-// soft-delete per attraversare ricorsivamente il sottoalbero.
-func (r *FoldersRepo) ListActiveChildIDs(ctx context.Context, userID, parentID string) ([]string, error) {
+// ListChildren restituisce tutte le sottocartelle dirette, tombstone inclusi,
+// in una sola query. Prima la cascade ne eseguiva due (tutti i figli + soli
+// attivi) per ogni cartella visitata.
+func (r *FoldersRepo) ListChildren(ctx context.Context, userID, parentID string) ([]FolderChild, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id FROM folders WHERE user_id = ? AND parent_id = ? AND deleted_at IS NULL`,
+		`SELECT id, deleted_at IS NULL FROM folders WHERE user_id = ? AND parent_id = ?`,
 		userID, parentID,
 	)
 	if err != nil {
@@ -144,15 +128,17 @@ func (r *FoldersRepo) ListActiveChildIDs(ctx context.Context, userID, parentID s
 	}
 	defer rows.Close()
 
-	var ids []string
+	var children []FolderChild
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var child FolderChild
+		var active int
+		if err := rows.Scan(&child.ID, &active); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		child.Active = active == 1
+		children = append(children, child)
 	}
-	return ids, rows.Err()
+	return children, rows.Err()
 }
 
 // PurgeExpiredTombstones rimuove definitivamente le cartelle soft-deleted il

@@ -61,6 +61,29 @@ func NewAdminHandler(users *db.UsersRepo, tokens *auth.TokenManager, refreshToke
 	}, nil
 }
 
+// beginAdminForm applica il limite di dimensione e decodifica il form di un
+// handler POST della dashboard. In caso di errore ha già reindirizzato con il
+// codice "bad_request": il chiamante deve solo interrompere la richiesta.
+func beginAdminForm(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	if err := r.ParseForm(); err != nil {
+		redirectAdminFlash(w, r, "bad_request")
+		return false
+	}
+	return true
+}
+
+// adminUserID estrae e valida l'ID utente da un form della dashboard. In caso
+// di campo vuoto ha già reindirizzato con "user_id_required".
+func adminUserID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	userID := strings.TrimSpace(r.FormValue("user_id"))
+	if userID == "" {
+		redirectAdminFlash(w, r, "user_id_required")
+		return "", false
+	}
+	return userID, true
+}
+
 // revokeUserSessions invalida sia i JWT sia le famiglie refresh dell'utente.
 // Le due revoche sono indipendenti: se la prima fallisce non si tenta la
 // seconda, così il chiamante può annullare l'operazione pericolosa.
@@ -368,9 +391,7 @@ func (h *AdminHandler) UpdateRateLimitSetting(w http.ResponseWriter, r *http.Req
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
 	enabled := r.FormValue("enabled") == "on"
@@ -393,14 +414,11 @@ func (h *AdminHandler) UpdateUserRateLimit(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
-	userID := strings.TrimSpace(r.FormValue("user_id"))
-	if userID == "" {
-		redirectAdminFlash(w, r, "user_id_required")
+	userID, ok := adminUserID(w, r)
+	if !ok {
 		return
 	}
 	exempt := r.FormValue("exempt") == "1"
@@ -428,14 +446,11 @@ func (h *AdminHandler) UpdateUserStorageQuota(w http.ResponseWriter, r *http.Req
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
-	userID := strings.TrimSpace(r.FormValue("user_id"))
-	if userID == "" {
-		redirectAdminFlash(w, r, "user_id_required")
+	userID, ok := adminUserID(w, r)
+	if !ok {
 		return
 	}
 	raw := strings.TrimSpace(strings.ReplaceAll(r.FormValue("quota_mb"), ",", "."))
@@ -521,14 +536,11 @@ func (h *AdminHandler) SetUserBlocked(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
-	userID := strings.TrimSpace(r.FormValue("user_id"))
-	if userID == "" {
-		redirectAdminFlash(w, r, "user_id_required")
+	userID, ok := adminUserID(w, r)
+	if !ok {
 		return
 	}
 	block := r.FormValue("blocked") == "1"
@@ -587,9 +599,7 @@ func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
 
@@ -636,9 +646,7 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
 
@@ -702,15 +710,12 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "metodo non consentito", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
-	if err := r.ParseForm(); err != nil {
-		redirectAdminFlash(w, r, "bad_request")
+	if !beginAdminForm(w, r) {
 		return
 	}
 
-	userID := r.FormValue("user_id")
-	if userID == "" {
-		redirectAdminFlash(w, r, "user_id_required")
+	userID, ok := adminUserID(w, r)
+	if !ok {
 		return
 	}
 
