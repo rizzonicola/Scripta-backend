@@ -153,7 +153,7 @@ func SessionAuthAdmin(sm *auth.AdminSessionManager) func(http.Handler) http.Hand
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookie, err := r.Cookie(AdminSessionCookieName)
-			if err != nil || sm.Validate(cookie.Value) != nil {
+			if err != nil || sm.Validate(r.Context(), cookie.Value) != nil {
 				// Redirect (non 401 JSON): queste rotte sono navigate da
 				// browser, non chiamate da un client API. Il redirect
 				// riporta l'utente al login mantenendo l'esperienza

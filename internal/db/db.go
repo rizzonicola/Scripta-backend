@@ -960,11 +960,14 @@ func addUserSecurityColumns(conn *sql.DB) error {
 }
 
 // addRefreshTokenPasswordVersion aggiunge l'epoch della password alla tabella
-// refresh_tokens. Le righe preesistenti vengono legate alla versione corrente
-// dell'utente: le sessioni valide restano valide, mentre un eventuale token
-// nato dalla race reset/login precedente alla migrazione non può più essere
-// distinto e viene comunque accettato solo fino alla prossima rotazione. Da
-// qui in avanti AuthHandler.Refresh rifiuta ogni token con epoch diverso.
+// refresh_tokens. Le righe preesistenti NON vengono legate alla versione
+// corrente: non è possibile distinguere una sessione legittima da un token
+// nato dalla race reset/login, e il backfill lo renderebbe accettabile per
+// sempre (la rotazione copierebbe l'epoch corrente nel successore). Le righe
+// legacy (epoch 0) vengono quindi ELIMINATE: l'utente rifà il login, l'unico
+// modo per attestare la password corrente. La DELETE è idempotente e copre
+// anche un vecchio binario che, durante un rolling deploy, inserisca nuove
+// righe con epoch 0. AuthHandler.Refresh rifiuta comunque ogni epoch 0.
 func addRefreshTokenPasswordVersion(conn *sql.DB) error {
 	cols, err := tableColumns(conn, "refresh_tokens")
 	if err != nil {
@@ -976,13 +979,14 @@ func addRefreshTokenPasswordVersion(conn *sql.DB) error {
 		}
 		log.Printf("migrazione: aggiunta colonna refresh_tokens.password_version mancante")
 	}
-	// Backfill idempotente: solo le righe legacy (0) vengono toccate.
-	_, err = conn.Exec(`
-		UPDATE refresh_tokens
-		SET password_version = COALESCE(
-			(SELECT password_version FROM users WHERE users.id = refresh_tokens.user_id), 0)
-		WHERE password_version = 0`)
-	return err
+	res, err := conn.Exec(`DELETE FROM refresh_tokens WHERE password_version = 0`)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		log.Printf("migrazione: revocati %d refresh token legacy privi di epoch password", n)
+	}
+	return nil
 }
 
 // addNotesPinningColumns aggiunge is_favorite, is_pinned e order_index alla

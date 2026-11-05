@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -51,15 +52,32 @@ type AdminSessionRevocationStore interface {
 	LoadActive(ctx context.Context, now time.Time) (users map[string]time.Time, tokens map[string]time.Time, err error)
 }
 
+// adminSessionRevocationLookup è l'estensione opzionale usata per verificare
+// la revoca a ogni richiesta, senza attendere il reload periodico della cache:
+// un logout su un'altra istanza invalida subito il cookie anche qui. I fake
+// dei test che implementano solo AdminSessionRevocationStore continuano a
+// funzionare con la cache.
+type adminSessionRevocationLookup interface {
+	IsTokenRevoked(ctx context.Context, jti string, now time.Time) (bool, error)
+}
+
 const adminRevocationUserID = "admin-session"
 
 func NewAdminSessionManager(jwtSecret, adminPass string, ttl time.Duration) *AdminSessionManager {
 	derived := sha256.Sum256([]byte("admin-session|" + jwtSecret))
-	credential := sha256.Sum256([]byte("admin-credential|" + adminPass))
+	// cv è un MAC con chiave derivata da JWT_SECRET, non un hash nudo della
+	// password: chi intercetta il cookie non può più usarlo come verifier
+	// offline di ADMIN_PASS. La chiave del MAC è separata da quella di firma
+	// del JWT. Serve solo al server per invalidare i cookie quando la password
+	// cambia, quindi il confronto resta a tempo costante.
+	cvKey := sha256.Sum256([]byte("admin-credential-key|" + jwtSecret))
+	mac := hmac.New(sha256.New, cvKey[:])
+	mac.Write([]byte("admin-credential|" + adminPass))
+	credential := mac.Sum(nil)
 	return &AdminSessionManager{
 		secret:     derived[:],
 		ttl:        ttl,
-		credential: fmt.Sprintf("%x", credential[:]),
+		credential: fmt.Sprintf("%x", credential),
 		revoked:    make(map[string]time.Time),
 	}
 }
@@ -136,8 +154,11 @@ func (m *AdminSessionManager) GenerateSession() (token string, expiresAt time.Ti
 	return signed, expiresAt, nil
 }
 
-// Validate verifica firma, scadenza e subject del cookie di sessione.
-func (m *AdminSessionManager) Validate(token string) error {
+// Validate verifica firma, scadenza, subject e revoca del cookie di sessione.
+// Oltre alla cache in RAM consulta il DB per singolo jti quando lo store lo
+// supporta: un logout gestito da un'altra istanza invalida il cookie subito,
+// non al prossimo reload periodico.
+func (m *AdminSessionManager) Validate(ctx context.Context, token string) error {
 	claims := &adminSessionClaims{}
 	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
 		// Solo HS256, lo stesso usato da GenerateSession: accettare qualunque
@@ -153,15 +174,28 @@ func (m *AdminSessionManager) Validate(token string) error {
 	if !parsed.Valid || claims.Subject != adminSessionSubject {
 		return errors.New("sessione admin non valida")
 	}
-	if claims.Credential == "" || claims.Credential != m.credential {
+	if claims.Credential == "" || !hmac.Equal([]byte(claims.Credential), []byte(m.credential)) {
 		return errors.New("sessione admin non più valida")
 	}
 	if claims.ID != "" {
+		now := time.Now()
 		m.mu.RLock()
 		exp, revoked := m.revoked[claims.ID]
+		store := m.store
 		m.mu.RUnlock()
-		if revoked && exp.After(time.Now()) {
+		if revoked && exp.After(now) {
 			return errors.New("sessione admin revocata")
+		}
+		if lookup, ok := store.(adminSessionRevocationLookup); ok {
+			revoked, err := lookup.IsTokenRevoked(ctx, claims.ID, now)
+			if err != nil {
+				// Fail closed: se non possiamo verificare la revoca, non
+				// accettiamo una sessione admin.
+				return fmt.Errorf("verifica revoca sessione admin: %w", err)
+			}
+			if revoked {
+				return errors.New("sessione admin revocata")
+			}
 		}
 	}
 	return nil

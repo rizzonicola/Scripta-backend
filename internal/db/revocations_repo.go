@@ -40,6 +40,27 @@ func (r *RevocationRepo) SaveTokenRevocation(ctx context.Context, jti, userID st
 	return err
 }
 
+// IsTokenRevoked verifica un singolo jti sul database. Usata dalle sessioni
+// admin a ogni richiesta: rende immediata la revoca tra istanze diverse,
+// senza caricare l'intera tabella come LoadActive.
+func (r *RevocationRepo) IsTokenRevoked(ctx context.Context, jti string, now time.Time) (bool, error) {
+	if jti == "" {
+		return false, nil
+	}
+	var one int
+	err := r.db.QueryRowContext(ctx,
+		`SELECT 1 FROM revoked_tokens WHERE jti = ? AND expires_at > ? LIMIT 1`,
+		jti, now.UnixMilli()).Scan(&one)
+	switch {
+	case err == sql.ErrNoRows:
+		return false, nil
+	case err != nil:
+		return false, err
+	default:
+		return true, nil
+	}
+}
+
 // LoadActive carica tutte le revoche ancora rilevanti: quelle per utente e
 // quelle per token non ancora scaduti. Chiamata una volta all'avvio per
 // popolare la cache in RAM usata dal middleware (lookup O(1) per richiesta).

@@ -212,7 +212,7 @@ type loginPageData struct {
 // LoginPage gestisce GET /admin/login: mostra il form di accesso. Se una
 // sessione valida è già presente, salta direttamente alla dashboard.
 func (h *AdminHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(middleware.AdminSessionCookieName); err == nil && h.Sessions.Validate(c.Value) == nil {
+	if c, err := r.Cookie(middleware.AdminSessionCookieName); err == nil && h.Sessions.Validate(r.Context(), c.Value) == nil {
 		http.Redirect(w, r, "/admin", http.StatusSeeOther)
 		return
 	}
