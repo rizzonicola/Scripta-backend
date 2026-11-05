@@ -37,8 +37,9 @@ const maxOrderingBytes = 1 << 20 // 1 MiB
 // lette/decodificate contemporaneamente. Il limite per-utente (burst 60) e
 // quello per-body (64 MiB) non limitano la SOMMA dei body in volo: senza
 // questo semaforo N richieste concorrenti trattengono N copie JSON grezze più
-// i DTO. Le scritture sono già serializzate da stampMu, quindi 2 slot bastano
-// a sovrapporre una decodifica a una transazione senza amplificare la RAM.
+// i DTO. Le scritture sono serializzate dal lock di scrittura SQLite (lo stamp
+// è allocato dentro la transazione), quindi 2 slot bastano a sovrapporre una
+// decodifica a una transazione senza amplificare la RAM.
 const defaultMaxConcurrentSyncs = 2
 
 // maxBeginTxRetries e beginTxBackoff regolano il retry di BeginTx quando il
@@ -111,11 +112,13 @@ type SyncHandler struct {
 		Allow(userID string) bool
 	}
 
-	// stampMu serializza le sync di questo processo. Gli stamp sono allocati
-	// dentro la transazione (vedi reserveStampTx) e il lock di scrittura
-	// SQLite serializza i processi; il mutex evita comunque che più sync
-	// locali si accodino sul lock del database.
-	stampMu sync.Mutex
+	// userLocks serializza le richieste dello STESSO utente (sync e reset
+	// dell'ordinamento) senza bloccare gli altri tenant. Il vecchio mutex
+	// globale stampMu metteva in coda tutti gli utenti dietro il batch più
+	// lento. L'ordinamento degli stamp tra utenti/processi resta garantito
+	// dal lock di scrittura SQLite: reserveStampTx è la prima scrittura della
+	// transazione.
+	userLocks userLockSet
 
 	// syncSlots limita le richieste che possono trattenere in RAM un body
 	// decodificato (vedi defaultMaxConcurrentSyncs). Nil = nessun limite
@@ -124,6 +127,101 @@ type SyncHandler struct {
 
 	// clock è un gancio per i test (orologio finto). Nil = time.Now.
 	clock func() time.Time
+}
+
+// userLockSet è una mutex keyed con refcount: la mappa contiene solo gli
+// utenti con richieste in volo e viene ripulita quando l'ultima richiesta di
+// un utente termina, quindi non cresce con il numero di account.
+type userLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*userLockEntry
+}
+
+type userLockEntry struct {
+	ch   chan struct{} // capacità 1: funge da mutex acquisibile con ctx
+	refs int
+}
+
+// acquire attende il lock dell'utente e restituisce la funzione di rilascio.
+// Se ctx termina prima dell'acquisizione restituisce false: la richiesta è
+// stata annullata e non deve consumare memoria né scritture.
+func (s *userLockSet) acquire(ctx context.Context, key string) (func(), bool) {
+	s.mu.Lock()
+	if s.locks == nil {
+		s.locks = make(map[string]*userLockEntry)
+	}
+	e := s.locks[key]
+	if e == nil {
+		e = &userLockEntry{ch: make(chan struct{}, 1)}
+		s.locks[key] = e
+	}
+	e.refs++
+	s.mu.Unlock()
+
+	select {
+	case e.ch <- struct{}{}:
+		return func() { s.release(key, e) }, true
+	case <-ctx.Done():
+		s.dropRef(key, e)
+		return nil, false
+	}
+}
+
+func (s *userLockSet) release(key string, e *userLockEntry) {
+	<-e.ch
+	s.dropRef(key, e)
+}
+
+func (s *userLockSet) dropRef(key string, e *userLockEntry) {
+	s.mu.Lock()
+	e.refs--
+	// refs == 0 implica che non ci sono né holder né waiter: l'entry può
+	// essere rimossa. Una nuova acquire creerà un canale nuovo.
+	if e.refs == 0 {
+		delete(s.locks, key)
+	}
+	s.mu.Unlock()
+}
+
+// syncAdmission è il permesso di trattare un body di sync: gate per-utente
+// (cap 1) più uno slot del semaforo globale di memoria. Release è idempotente
+// e va chiamata PRIMA di scrivere la risposta, così un client lento non
+// trattiene risorse.
+type syncAdmission struct {
+	h       *SyncHandler
+	release func()
+	memHeld bool
+	once    sync.Once
+}
+
+func (a *syncAdmission) Release() {
+	a.once.Do(func() {
+		if a.memHeld {
+			<-a.h.syncSlots
+		}
+		a.release()
+	})
+}
+
+func (h *SyncHandler) admitSync(ctx context.Context, userID string) (*syncAdmission, bool) {
+	release, ok := h.userLocks.acquire(ctx, userID)
+	if !ok {
+		return nil, false
+	}
+	a := &syncAdmission{h: h, release: release}
+	if h.syncSlots == nil {
+		return a, true
+	}
+	// Il gate per-utente è acquisito PRIMA dello slot globale: una seconda
+	// richiesta dello stesso utente aspetta senza occupare memoria.
+	select {
+	case h.syncSlots <- struct{}{}:
+		a.memHeld = true
+		return a, true
+	case <-ctx.Done():
+		a.Release()
+		return nil, false
+	}
 }
 
 func NewSyncHandler(sqlDB *sql.DB) *SyncHandler {
@@ -158,8 +256,8 @@ func (h *SyncHandler) nowMillis() int64 {
 }
 
 // reserveStampTx assegna lo stamp della sync corrente (Y-04) come PRIMA
-// scrittura della transazione. DEVE essere chiamata con stampMu acquisito e
-// con tx già aperta.
+// scrittura della transazione. DEVE essere chiamata con il lock per-utente
+// acquisito e con tx già aperta.
 //
 // Perché dentro la transazione: l'allocazione solo in RAM non era sicura con
 // più processi sullo stesso database. Due sync potevano ottenere stamp
@@ -341,18 +439,15 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	// Il semaforo copre lettura, decodifica, transazione e scrittura della
-	// risposta: è il punto in cui il body resta in memoria. Acquisirlo PRIMA
-	// di decodeSyncRequest è essenziale, perché è lì che avvengono le
-	// allocazioni; process() è già serializzato da stampMu.
-	if h.syncSlots != nil {
-		select {
-		case h.syncSlots <- struct{}{}:
-			defer func() { <-h.syncSlots }()
-		case <-ctx.Done():
-			return
-		}
+	// Ammissione: una sola richiesta per utente (gate) e al massimo due body
+	// decodificati in RAM nell'intero processo (semaforo globale). Il gate
+	// per-utente impedisce a un singolo tenant di occupare entrambi gli slot
+	// con richieste concorrenti; il semaforo globale limita la memoria totale.
+	admission, ok := h.admitSync(ctx, userID)
+	if !ok {
+		return
 	}
+	defer admission.Release()
 
 	maxBody := h.MaxBodyBytes
 	if maxBody <= 0 {
@@ -367,10 +462,15 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// La sezione critica (lock + stamp + transazione + commit + pull) è
-	// in process(); la scrittura della risposta HTTP avviene FUORI dal lock,
-	// così un client lento a leggere non blocca le altre sync.
-	res := h.process(ctx, userID, req)
+	// La sezione critica (stamp + transazione + commit + pull) è in
+	// processLocked(); il lock per-utente è già acquisito da admitSync.
+	res := h.processLocked(ctx, userID, req)
+
+	// Rilascio PRIMA della scrittura: res contiene già tutta la risposta, ma
+	// un client lento a leggerla non deve trattenere il gate dell'utente né
+	// lo slot globale di memoria.
+	admission.Release()
+
 	switch {
 	case res.aborted:
 		return // client disconnesso
@@ -407,10 +507,14 @@ func (h *SyncHandler) ResetOrdering(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
-	// Serializza il reset con le sync dello stesso processo: evita che una
-	// raffica di reset faccia fallire per BUSY transazioni di altri account.
-	h.stampMu.Lock()
-	defer h.stampMu.Unlock()
+	// Serializza il reset con le sync dello stesso utente: due reset
+	// concorrenti dello stesso account si accodano, ma un tenant non può
+	// bloccare le sync degli altri (il vecchio stampMu era globale).
+	release, ok := h.userLocks.acquire(ctx, userID)
+	if !ok {
+		return
+	}
+	defer release()
 
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
@@ -627,13 +731,22 @@ type syncResult struct {
 func failure(status int, msg string) syncResult { return syncResult{status: status, message: msg} }
 
 func (h *SyncHandler) process(ctx context.Context, userID string, req *models.SyncRequest) syncResult {
-	// Lock + stamp: lo stamp è assegnato DOPO aver ottenuto il lock, quindi
-	// gli stamp risultano crescenti nell'ordine di commit. È ciò che rende
-	// sicuro usare "server_time" come cursore: ogni riga committata da una
-	// sync successiva ha uno stamp maggiore di quello restituito qui.
-	h.stampMu.Lock()
-	defer h.stampMu.Unlock()
+	release, ok := h.userLocks.acquire(ctx, userID)
+	if !ok {
+		return syncResult{aborted: true}
+	}
+	defer release()
+	return h.processLocked(ctx, userID, req)
+}
 
+// processLocked è il corpo della sync. DEVE essere chiamata con il lock
+// per-utente già acquisito (Sync lo acquisisce in admitSync, process per i
+// chiamanti diretti): serializza le richieste dello stesso utente senza
+// bloccare gli altri tenant.
+func (h *SyncHandler) processLocked(ctx context.Context, userID string, req *models.SyncRequest) syncResult {
+	// Lo stamp è assegnato dentro la transazione (prima scrittura), quindi
+	// l'ordine di commit tra utenti/processi è garantito dal lock di
+	// scrittura SQLite; non serve più un mutex globale.
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
 		if isTransientBusyErr(err) {
