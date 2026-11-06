@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"notes-server/internal/httpx"
 )
 
 // RateLimit è pensata come SECONDA linea di difesa su login/admin: la difesa
@@ -25,7 +27,7 @@ func RateLimit(ratePerSec, burst float64, ips *ClientIPResolver) func(http.Handl
 			// creduti se la richiesta non arriva da un proxy configurato).
 			if !limiter.allow(ips.ClientIP(r)) {
 				w.Header().Set("Retry-After", "5")
-				writeJSONErrorCode(w, http.StatusTooManyRequests,
+				httpx.WriteErrorCode(w, http.StatusTooManyRequests,
 					"troppi tentativi, riprova più tardi", "rate_limited")
 				return
 			}

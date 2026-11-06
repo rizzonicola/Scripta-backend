@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"notes-server/internal/auth"
-	"notes-server/internal/handlers"
+	"notes-server/internal/db"
 )
 
 func TestConfigRejectsJWTTTLBeyondRevocationRetention(t *testing.T) {
@@ -42,7 +42,7 @@ func TestTombstonePurgeCutoffUsesStampAndIncludesSafetyMargin(t *testing.T) {
 	// La retention è nella linea temporale degli stamp, non dell'orologio:
 	// anche un salto in avanti dell'orologio non deve far scadere i tombstone.
 	latestStamp := int64(1_700_000_000_000)
-	want := latestStamp - (handlers.TombstoneRetention + handlers.TombstonePurgeSafetyMargin).Milliseconds()
+	want := latestStamp - (db.TombstoneRetention + db.TombstonePurgeSafetyMargin).Milliseconds()
 	if got := tombstonePurgeCutoff(latestStamp); got != want {
 		t.Fatalf("cutoff = %d, atteso %d", got, want)
 	}

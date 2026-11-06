@@ -1,4 +1,7 @@
-package handlers
+// Package httpx contiene le primitive HTTP condivise da handler e middleware:
+// un solo posto in cui vivono lo schema JSON di errore, il content type e la
+// decodifica dei body con limite di dimensione.
+package httpx
 
 import (
 	"encoding/json"
@@ -7,34 +10,37 @@ import (
 	"net/http"
 )
 
-// jsonContentType dichiara esplicitamente UTF-8. RFC 8259 impone già UTF-8 per
+// JSONContentType dichiara esplicitamente UTF-8. RFC 8259 impone già UTF-8 per
 // il JSON, ma alcuni client HTTP (es. package:http di Dart) decodificano un
 // «application/json» senza charset con la codifica di default dello stack:
 // l'header esplicito toglie ogni ambiguità ai testi con accenti ed emoji.
-const jsonContentType = "application/json; charset=utf-8"
+const JSONContentType = "application/json; charset=utf-8"
 
-func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
-	w.Header().Set("Content-Type", jsonContentType)
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-type errorBody struct {
+// ErrorBody è lo schema comune delle risposte di errore. Code è opzionale e
+// serve ai client che devono distinguere casi diversi con lo stesso status.
+type ErrorBody struct {
 	Error string `json:"error"`
 	Code  string `json:"code,omitempty"`
 }
 
-func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorBody{Error: msg})
+// WriteJSON scrive payload come JSON con lo status indicato.
+func WriteJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", JSONContentType)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// writeJSONErrorCode accompagna l'errore con un codice stabile, pensato per
-// i client che devono distinguere casi diversi con lo stesso status HTTP.
-func writeJSONErrorCode(w http.ResponseWriter, status int, msg, code string) {
-	writeJSON(w, status, errorBody{Error: msg, Code: code})
+// WriteError scrive una risposta di errore JSON senza codice.
+func WriteError(w http.ResponseWriter, status int, msg string) {
+	WriteJSON(w, status, ErrorBody{Error: msg})
 }
 
-// decodeJSONBody decodifica il body JSON di una richiesta in dst, applicando
+// WriteErrorCode accompagna l'errore con un codice stabile.
+func WriteErrorCode(w http.ResponseWriter, status int, msg, code string) {
+	WriteJSON(w, status, ErrorBody{Error: msg, Code: code})
+}
+
+// DecodeJSONBody decodifica il body JSON di una richiesta in dst, applicando
 // un limite massimo di byte leggibili tramite http.MaxBytesReader.
 //
 // Perché serve: json.Decoder fa streaming dei *token* JSON, ma questo non
@@ -50,16 +56,11 @@ func writeJSONErrorCode(w http.ResponseWriter, status int, msg, code string) {
 // Nota: modifica r.Body in place (come previsto dalla documentazione di
 // http.MaxBytesReader), quindi va chiamata prima di qualunque altra lettura
 // del body.
-func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
+func DecodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
-		} else {
-			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
-		}
+		writeDecodeError(w, err)
 		return false
 	}
 	// Un solo valore JSON per richiesta: senza questo controllo un body come
@@ -67,34 +68,38 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, max
 	// primo oggetto, lasciando al client l'illusione di aver inviato altro.
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		WriteError(w, http.StatusBadRequest, "body JSON non valido")
 		return false
 	}
 	return true
 }
 
-// decodeOptionalJSONBody è come decodeJSONBody ma accetta anche un body
+// DecodeOptionalJSONBody è come DecodeJSONBody ma accetta anche un body
 // vuoto. Il logout può essere inviato senza body; se il client conosce il
 // refresh token lo include per revocare anche la famiglia.
-func decodeOptionalJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
+func DecodeOptionalJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}, maxBytes int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
 		if errors.Is(err, io.EOF) {
 			return true
 		}
-		var mbe *http.MaxBytesError
-		if errors.As(err, &mbe) {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
-		} else {
-			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
-		}
+		writeDecodeError(w, err)
 		return false
 	}
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		WriteError(w, http.StatusBadRequest, "body JSON non valido")
 		return false
 	}
 	return true
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		WriteError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
+		return
+	}
+	WriteError(w, http.StatusBadRequest, "body JSON non valido")
 }

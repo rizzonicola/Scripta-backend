@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"notes-server/internal/db"
+	"notes-server/internal/httpx"
 	"notes-server/internal/middleware"
 	"notes-server/internal/models"
 )
@@ -21,23 +22,23 @@ func NewSettingsHandler(settings *db.SettingsRepo) *SettingsHandler {
 // di default se non ne ha mai salvate.
 func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		httpx.WriteError(w, http.StatusUnauthorized, "utente non autenticato")
 		return
 	}
 
 	settings, err := h.Settings.Get(r.Context(), userID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore lettura impostazioni")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore lettura impostazioni")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, settings)
+	httpx.WriteJSON(w, http.StatusOK, settings)
 }
 
 // maxSettingsBodyBytes limita il body di PUT /api/v1/user/settings: è un
@@ -50,33 +51,33 @@ const maxSettingsBodyBytes = 16 << 10 // 16 KiB
 // non merge parziale) — l'app client invia sempre lo stato corrente completo.
 func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		httpx.WriteError(w, http.StatusUnauthorized, "utente non autenticato")
 		return
 	}
 
 	var incoming models.UserSettings
-	if !decodeJSONBody(w, r, &incoming, maxSettingsBodyBytes) {
+	if !httpx.DecodeJSONBody(w, r, &incoming, maxSettingsBodyBytes) {
 		return
 	}
 
 	if err := validateSettings(&incoming); err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	saved, err := h.Settings.Upsert(r.Context(), userID, incoming)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore salvataggio impostazioni")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore salvataggio impostazioni")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, saved)
+	httpx.WriteJSON(w, http.StatusOK, saved)
 }
 
 var (

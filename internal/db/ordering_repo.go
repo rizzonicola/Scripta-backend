@@ -38,16 +38,16 @@ func (r *OrderingRepo) Get(ctx context.Context, userID string) (int64, json.RawM
 	return version, json.RawMessage(raw), nil
 }
 
-// Apply scrive data solo se baseVersion è ancora quella corrente. Restituisce
-// accepted=false quando il client è rimasto indietro; in quel caso current è
-// lo stato autoritativo da applicare localmente.
-func (r *OrderingRepo) Apply(ctx context.Context, userID string, baseVersion int64, data json.RawMessage) (accepted bool, version int64, current json.RawMessage, err error) {
-	version, current, err = r.Get(ctx, userID)
+// Apply scrive data solo se baseVersion è ancora quella corrente. Il chiamante
+// legge comunque lo stato autoritativo con Get: qui basta sapere se il push è
+// stato accettato.
+func (r *OrderingRepo) Apply(ctx context.Context, userID string, baseVersion int64, data json.RawMessage) (bool, error) {
+	version, _, err := r.Get(ctx, userID)
 	if err != nil {
-		return false, 0, nil, err
+		return false, err
 	}
 	if baseVersion != version {
-		return false, version, current, nil
+		return false, nil
 	}
 	next := version + 1
 	_, err = r.db.ExecContext(ctx, `
@@ -58,9 +58,9 @@ func (r *OrderingRepo) Apply(ctx context.Context, userID string, baseVersion int
 		userID, string(data), next,
 	)
 	if err != nil {
-		return false, 0, nil, err
+		return false, err
 	}
-	return true, next, data, nil
+	return true, nil
 }
 
 // Reset azzera il posizionamento dell'account e incrementa la versione, così

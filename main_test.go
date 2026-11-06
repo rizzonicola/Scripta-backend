@@ -50,7 +50,11 @@ func newEnv(t *testing.T, trustedProxies ...string) *testEnv {
 	if err := tm.AttachStore(context.Background(), repo); err != nil {
 		t.Fatalf("attach store: %v", err)
 	}
-	h, err := buildRouter(cfg, sqlDB, tm)
+	adminSessions := auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminPass, cfg.AdminSessionTTL)
+	if err := adminSessions.AttachStore(context.Background(), repo); err != nil {
+		t.Fatalf("attach admin sessions: %v", err)
+	}
+	h, err := buildRouter(cfg, sqlDB, tm, adminSessions)
 	if err != nil {
 		t.Fatalf("router: %v", err)
 	}

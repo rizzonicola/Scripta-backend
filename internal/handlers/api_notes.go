@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"notes-server/internal/db"
+	"notes-server/internal/httpx"
 	"notes-server/internal/middleware"
 )
 
@@ -41,30 +42,30 @@ func NewNotesHandler(notes *db.NotesRepo) *NotesHandler {
 // tutti e tre i casi non c'è nulla di legittimo da scaricare.
 func (h *NotesHandler) DownloadMarkdown(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 
 	ctx := r.Context()
 	userID, ok := middleware.UserIDFromContext(ctx)
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		httpx.WriteError(w, http.StatusUnauthorized, "utente non autenticato")
 		return
 	}
 
 	noteID := r.URL.Query().Get("id")
 	if noteID == "" {
-		writeJSONError(w, http.StatusBadRequest, "parametro 'id' mancante")
+		httpx.WriteError(w, http.StatusBadRequest, "parametro 'id' mancante")
 		return
 	}
 
 	note, err := h.Notes.Get(ctx, userID, noteID)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore lettura nota")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore lettura nota")
 		return
 	}
 	if note == nil || note.DeletedAt != nil {
-		writeJSONError(w, http.StatusNotFound, "nota non trovata")
+		httpx.WriteError(w, http.StatusNotFound, "nota non trovata")
 		return
 	}
 

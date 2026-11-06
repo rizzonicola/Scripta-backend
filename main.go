@@ -18,6 +18,7 @@ import (
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
 	"notes-server/internal/handlers"
+	"notes-server/internal/httpx"
 	"notes-server/internal/middleware"
 	"notes-server/internal/models"
 )
@@ -28,44 +29,10 @@ var templatesFS embed.FS
 // serverVersion è riportata da /healthz (e verificata dai test).
 const serverVersion = "2.1.0"
 
-// methodNotAllowedJSON risponde 405 in JSON per i dispatcher che non hanno un
-// handler per il metodo richiesto.
-func methodNotAllowedJSON(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusMethodNotAllowed)
-	_, _ = w.Write([]byte(`{"error":"metodo non consentito"}`))
-}
-
-// settingsDispatch instrada GET e PUT su /api/v1/user/settings verso i rispettivi
-// handler (mux.Handle non fa dispatch per metodo su un singolo pattern).
-func settingsDispatch(h *handlers.SettingsHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			h.GetSettings(w, r)
-		case http.MethodPut:
-			h.UpdateSettings(w, r)
-		default:
-			methodNotAllowedJSON(w)
-		}
-	}
-}
-
-// adminLoginDispatch instrada GET (mostra il form) e POST (verifica le
-// credenziali) su /admin/login, applicando al solo POST il rate limiting e il
-// controllo same-origin.
-func adminLoginDispatch(h *handlers.AdminHandler, loginGuards func(http.Handler) http.Handler) http.HandlerFunc {
-	post := loginGuards(http.HandlerFunc(h.Login))
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			h.LoginPage(w, r)
-		case http.MethodPost:
-			post.ServeHTTP(w, r)
-		default:
-			methodNotAllowedJSON(w)
-		}
-	}
+// methodNotAllowedJSON risponde 405 in JSON per i pattern senza handler per
+// il metodo richiesto.
+func methodNotAllowedJSON(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 }
 
 // chain compone più middleware in ordine di applicazione (il primo elencato
@@ -226,23 +193,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // buildRouter assembla l'intero handler HTTP (rotte + middleware). È separato
 // da main() per poter essere esercitato dai test di integrazione (main_test.go)
 // con un database temporaneo, esattamente come in produzione.
-func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, providedAdminSessions ...*auth.AdminSessionManager) (http.Handler, error) {
+func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, adminSessions *auth.AdminSessionManager) (http.Handler, error) {
 	usersRepo := db.NewUsersRepo(sqlDB)
 	notesRepo := db.NewNotesRepo(sqlDB)
 	settingsRepo := db.NewSettingsRepo(sqlDB)
 	serverSettingsRepo := db.NewServerSettingsRepo(sqlDB)
 	refreshTokensRepo := db.NewRefreshTokensRepo(sqlDB)
-
-	adminSessions := (*auth.AdminSessionManager)(nil)
-	if len(providedAdminSessions) > 0 {
-		adminSessions = providedAdminSessions[0]
-	}
-	if adminSessions == nil {
-		adminSessions = auth.NewAdminSessionManager(cfg.JWTSecret, cfg.AdminPass, cfg.AdminSessionTTL)
-		if err := adminSessions.AttachStore(context.Background(), db.NewRevocationRepo(sqlDB)); err != nil {
-			return nil, fmt.Errorf("caricamento revoche sessioni admin: %w", err)
-		}
-	}
 
 	adminHandler, err := handlers.NewAdminHandler(usersRepo, tm, refreshTokensRepo, adminSessions, serverSettingsRepo, cfg.AdminUser, cfg.AdminPass, templatesFS)
 	if err != nil {
@@ -283,7 +239,9 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, providedAdmin
 
 	// --- Dashboard Admin (login form-based + cookie di sessione) ---
 	adminAuth := middleware.SessionAuthAdmin(adminSessions)
-	mux.HandleFunc("/admin/login", adminLoginDispatch(adminHandler, chain(adminLoginRateLimit, sameOrigin)))
+	mux.Handle("GET /admin/login", http.HandlerFunc(adminHandler.LoginPage))
+	mux.Handle("POST /admin/login", chain(adminLoginRateLimit, sameOrigin)(http.HandlerFunc(adminHandler.Login)))
+	mux.HandleFunc("/admin/login", methodNotAllowedJSON)
 	mux.Handle("/admin/logout", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.Logout))))
 	mux.Handle("/admin", adminAuth(http.HandlerFunc(adminHandler.UsersPage)))
 	mux.Handle("/admin/users/create", adminAuth(sameOrigin(http.HandlerFunc(adminHandler.CreateUser))))
@@ -311,7 +269,9 @@ func buildRouter(cfg config, sqlDB *sql.DB, tm *auth.TokenManager, providedAdmin
 	mux.Handle("/api/v1/sync", requireJWT(http.HandlerFunc(syncHandler.Sync)))
 	mux.Handle("/api/v1/ordering/reset", requireJWT(http.HandlerFunc(syncHandler.ResetOrdering)))
 	mux.Handle("/api/v1/notes/download", requireJWT(http.HandlerFunc(notesHandler.DownloadMarkdown)))
-	mux.Handle("/api/v1/user/settings", requireJWT(http.HandlerFunc(settingsDispatch(settingsHandler))))
+	mux.Handle("GET /api/v1/user/settings", requireJWT(http.HandlerFunc(settingsHandler.GetSettings)))
+	mux.Handle("PUT /api/v1/user/settings", requireJWT(http.HandlerFunc(settingsHandler.UpdateSettings)))
+	mux.Handle("/api/v1/user/settings", requireJWT(http.HandlerFunc(methodNotAllowedJSON)))
 
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/health", healthHandler)
@@ -472,7 +432,7 @@ func startRevocationReloadLoop(ctx context.Context, tm *auth.TokenManager, admin
 // un margine oltre la retention per non cancellare tombstone che una sync già
 // in volo deve ancora consegnare.
 func tombstonePurgeCutoff(latestStamp int64) int64 {
-	return latestStamp - (handlers.TombstoneRetention + handlers.TombstonePurgeSafetyMargin).Milliseconds()
+	return latestStamp - (db.TombstoneRetention + db.TombstonePurgeSafetyMargin).Milliseconds()
 }
 
 // startTombstonePurgeLoop avvia una goroutine in background con due cicli
@@ -481,7 +441,7 @@ func tombstonePurgeCutoff(latestStamp int64) int64 {
 //   - ogni tombstonePurgeInterval (e una volta subito all'avvio, per ripulire
 //     eventuale arretrato): rimuove definitivamente dal database le cartelle
 //     e le note il cui tombstone è stato accettato dal server (synced_at) da
-//     più di handlers.TombstoneRetention, pota le revoche JWT scadute, poi
+//     più di db.TombstoneRetention, pota le revoche JWT scadute, poi
 //     – solo in modalità locale pura (isLocalDB) e solo se qualcosa è stato
 //     effettivamente cancellato – recupera lo spazio liberato sul file .db
 //     con un incremental_vacuum, e in ogni caso tenta un wal_checkpoint
@@ -515,14 +475,14 @@ func startTombstonePurgeLoop(ctx context.Context, tm *auth.TokenManager, notesRe
 			if err != nil {
 				log.Printf("purge tombstone note fallito: %v", err)
 			} else if nDeleted > 0 {
-				log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s (+ margine)", nDeleted, handlers.TombstoneRetention)
+				log.Printf("purge tombstone: rimosse %d note cancellate da oltre %s (+ margine)", nDeleted, db.TombstoneRetention)
 			}
 
 			fDeleted, err = foldersRepo.PurgeExpiredTombstones(purgeCtx, cutoff)
 			if err != nil {
 				log.Printf("purge tombstone cartelle fallito: %v", err)
 			} else if fDeleted > 0 {
-				log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s (+ margine)", fDeleted, handlers.TombstoneRetention)
+				log.Printf("purge tombstone: rimosse %d cartelle cancellate da oltre %s (+ margine)", fDeleted, db.TombstoneRetention)
 			}
 		}
 

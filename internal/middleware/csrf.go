@@ -1,6 +1,10 @@
 package middleware
 
-import "net/http"
+import (
+	"net/http"
+
+	"notes-server/internal/httpx"
+)
 
 // RequireSameOrigin blocca le richieste POST che non provengono dalla stessa
 // origin del sito, come difesa CSRF per le rotte /admin/* protette da
@@ -33,18 +37,18 @@ func RequireSameOrigin(next http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if site != "" {
 				if site != "same-origin" {
-					writeJSONError(w, http.StatusForbidden, "richiesta cross-site non consentita")
+					httpx.WriteError(w, http.StatusForbidden, "richiesta cross-site non consentita")
 					return
 				}
 			} else if origin != "" {
 				expectedHTTPS := "https://" + r.Host
 				expectedHTTP := "http://" + r.Host
 				if origin != expectedHTTPS && origin != expectedHTTP {
-					writeJSONError(w, http.StatusForbidden, "origin non consentita")
+					httpx.WriteError(w, http.StatusForbidden, "origin non consentita")
 					return
 				}
 			} else {
-				writeJSONError(w, http.StatusForbidden, "origine della richiesta non verificabile")
+				httpx.WriteError(w, http.StatusForbidden, "origine della richiesta non verificabile")
 				return
 			}
 		}

@@ -2,12 +2,12 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
+	"notes-server/internal/httpx"
 )
 
 type ctxKey string
@@ -19,26 +19,17 @@ const (
 	CtxAccountStatus ctxKey = "account_status"
 )
 
-// writeJSONError scrive una risposta di errore JSON coerente con quella usata
-// dal package handlers (stesso schema {"error": "..."}). Duplicata qui invece
-// di importare "notes-server/internal/handlers" per evitare un import ciclico
-// (handlers già importa middleware per UserIDFromContext).
-func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	writeJSONErrorCode(w, status, msg, "")
-}
-
-// writeJSONErrorCode aggiunge un codice stabile che i client possono usare
-// per distinguere casi diversi con lo stesso status HTTP (es. account
-// bloccato vs token scaduto, oppure rate limit vs errore transitorio).
-func writeJSONErrorCode(w http.ResponseWriter, status int, msg, code string) {
-	// charset esplicito: stessa motivazione di handlers.jsonContentType.
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	body := struct {
-		Error string `json:"error"`
-		Code  string `json:"code,omitempty"`
-	}{Error: msg, Code: code}
-	_ = json.NewEncoder(w).Encode(body)
+// BearerToken estrae il token dall'header Authorization. La sintassi
+// "Bearer <token>" è una convenzione del protocollo: vive qui, non nei singoli
+// handler che devono accettarla (middleware e logout).
+func BearerToken(r *http.Request) (string, bool) {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, prefix) {
+		return "", false
+	}
+	token := strings.TrimPrefix(header, prefix)
+	return token, token != ""
 }
 
 // RequireJWT protegge gli endpoint API verificando l'header Authorization: Bearer <token>.
@@ -48,16 +39,15 @@ func writeJSONErrorCode(w http.ResponseWriter, status int, msg, code string) {
 func RequireJWT(tm *auth.TokenManager, users *db.UsersRepo) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			header := r.Header.Get("Authorization")
-			if header == "" || !strings.HasPrefix(header, "Bearer ") {
-				writeJSONErrorCode(w, http.StatusUnauthorized, "token mancante", "missing_token")
+			tokenStr, ok := BearerToken(r)
+			if !ok {
+				httpx.WriteErrorCode(w, http.StatusUnauthorized, "token mancante", "missing_token")
 				return
 			}
-			tokenStr := strings.TrimPrefix(header, "Bearer ")
 
 			claims, err := tm.ParseToken(tokenStr)
 			if err != nil {
-				writeJSONErrorCode(w, http.StatusUnauthorized, "token non valido o scaduto", "invalid_token")
+				httpx.WriteErrorCode(w, http.StatusUnauthorized, "token non valido o scaduto", "invalid_token")
 				return
 			}
 
@@ -70,15 +60,15 @@ func RequireJWT(tm *auth.TokenManager, users *db.UsersRepo) func(http.Handler) h
 			// token restano revocati e il client ottiene 401.
 			status, found, err := users.GetAccountStatus(r.Context(), claims.UserID)
 			if err != nil {
-				writeJSONErrorCode(w, http.StatusInternalServerError, "errore interno", "internal_error")
+				httpx.WriteErrorCode(w, http.StatusInternalServerError, "errore interno", "internal_error")
 				return
 			}
 			if !found {
-				writeJSONErrorCode(w, http.StatusUnauthorized, "account non valido", "invalid_account")
+				httpx.WriteErrorCode(w, http.StatusUnauthorized, "account non valido", "invalid_account")
 				return
 			}
 			if status.Blocked {
-				writeJSONErrorCode(w, http.StatusForbidden,
+				httpx.WriteErrorCode(w, http.StatusForbidden,
 					"account bloccato dall'amministratore", "account_blocked")
 				return
 			}
@@ -92,7 +82,7 @@ func RequireJWT(tm *auth.TokenManager, users *db.UsersRepo) func(http.Handler) h
 				effectiveVersion = 1
 			}
 			if effectiveVersion != status.PasswordVersion {
-				writeJSONErrorCode(w, http.StatusUnauthorized, "token non più valido", "revoked_token")
+				httpx.WriteErrorCode(w, http.StatusUnauthorized, "token non più valido", "revoked_token")
 				return
 			}
 
@@ -102,7 +92,7 @@ func RequireJWT(tm *auth.TokenManager, users *db.UsersRepo) func(http.Handler) h
 			// TokenManager.AttachStore), quindi la revoca resta valida anche
 			// dopo un riavvio del server.
 			if tm.IsRevoked(claims) {
-				writeJSONErrorCode(w, http.StatusUnauthorized, "token revocato", "revoked_token")
+				httpx.WriteErrorCode(w, http.StatusUnauthorized, "token revocato", "revoked_token")
 				return
 			}
 

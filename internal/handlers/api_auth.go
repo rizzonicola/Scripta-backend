@@ -12,6 +12,7 @@ import (
 
 	"notes-server/internal/auth"
 	"notes-server/internal/db"
+	"notes-server/internal/httpx"
 	"notes-server/internal/middleware"
 	"notes-server/internal/models"
 )
@@ -62,12 +63,12 @@ const maxLoginBodyBytes = 4 << 10 // 4 KiB
 // Login gestisce POST /api/v1/auth/login
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 
 	var req models.LoginRequest
-	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
+	if !httpx.DecodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
 
@@ -81,7 +82,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// "credenziali errate", senza toccare il DB.
 	username := auth.LoginUsername(req.Username)
 	if username == "" || req.Password == "" {
-		writeJSONError(w, http.StatusBadRequest, "username e password sono obbligatori")
+		httpx.WriteError(w, http.StatusBadRequest, "username e password sono obbligatori")
 		return
 	}
 	// Il driver libSQL converte le stringhe in C string: un NUL verrebbe
@@ -89,24 +90,24 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// lo impedisce, ma il login non passa da NormalizeUsername.
 	if strings.IndexByte(username, 0) >= 0 {
 		sleepUntilMinResponseTime(start)
-		writeJSONErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
 		return
 	}
 	if utf8.RuneCountInString(username) > auth.MaxUsernameLen || len(req.Password) > auth.MaxPasswordBytes {
 		sleepUntilMinResponseTime(start)
-		writeJSONErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
 		return
 	}
 
 	user, err := h.Users.GetByUsername(r.Context(), username)
 	if err != nil {
 		log.Printf("login: errore lettura utente: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore interno")
 		return
 	}
 	if user == nil || !auth.CheckPassword(user.PasswordHash, req.Password) {
 		sleepUntilMinResponseTime(start)
-		writeJSONErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "credenziali non valide", "invalid_credentials")
 		return
 	}
 
@@ -114,14 +115,14 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// password sbagliata resta indistinguibile da un account inesistente e
 	// non permette di scoprire quali username sono bloccati.
 	if user.BlockedAt != nil {
-		writeJSONErrorCode(w, http.StatusForbidden,
+		httpx.WriteErrorCode(w, http.StatusForbidden,
 			"account bloccato dall'amministratore", "account_blocked")
 		return
 	}
 
 	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username, user.PasswordVersion)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione del token")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore nella generazione del token")
 		return
 	}
 
@@ -130,11 +131,11 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		r, user.ID, user.PasswordVersion, auth.NewRefreshFamilyID(), now)
 	if err != nil {
 		log.Printf("login: creazione refresh token fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, models.LoginResponse{
+	httpx.WriteJSON(w, http.StatusOK, models.LoginResponse{
 		Token:            token,
 		ExpiresAt:        expiresAt,
 		RefreshToken:     refreshToken,
@@ -174,28 +175,28 @@ func (h *AuthHandler) createRefreshToken(r *http.Request, userID string, passwor
 // famiglia, perché significa che una copia è finita nelle mani sbagliate.
 func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 
 	var req models.RefreshRequest
-	if !decodeJSONBody(w, r, &req, maxLoginBodyBytes) {
+	if !httpx.DecodeJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
 	raw := strings.TrimSpace(req.RefreshToken)
 	if raw == "" {
-		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
 
 	current, err := h.RefreshTokens.GetByHash(r.Context(), auth.HashRefreshToken(raw))
 	if err != nil {
 		log.Printf("refresh: lettura token fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore interno")
 		return
 	}
 	if current == nil {
-		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
 
@@ -204,33 +205,33 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		// Riuso (o token scaduto): la famiglia non è più affidabile.
 		if err := h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now); err != nil {
 			log.Printf("refresh: revoca famiglia dopo riuso fallita: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "errore interno")
+			httpx.WriteError(w, http.StatusInternalServerError, "errore interno")
 			return
 		}
-		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
 
 	user, err := h.Users.GetByID(r.Context(), current.UserID)
 	if err != nil {
 		log.Printf("refresh: lettura utente fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore interno")
 		return
 	}
 	if user == nil {
 		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
-		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
 	if user.BlockedAt != nil {
 		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
-		writeJSONErrorCode(w, http.StatusForbidden,
+		httpx.WriteErrorCode(w, http.StatusForbidden,
 			"account bloccato dall'amministratore", "account_blocked")
 		return
 	}
 	if h.Tokens.IsUserRevoked(current.UserID, time.UnixMilli(current.IssuedAt)) {
 		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
-		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
 	// Epoch della password: chiude la race in cui un login ha verificato
@@ -240,19 +241,19 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	// corrente, l'intera famiglia non è più affidabile.
 	if current.PasswordVersion == 0 || current.PasswordVersion != user.PasswordVersion {
 		_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
-		writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 		return
 	}
 
 	token, expiresAt, err := h.Tokens.GenerateToken(user.ID, user.Username, user.PasswordVersion)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione del token")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore nella generazione del token")
 		return
 	}
 
 	nextRaw, nextHash, err := auth.NewRefreshToken()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore nella generazione della sessione")
 		return
 	}
 	next := db.RefreshToken{
@@ -267,15 +268,15 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	if err := h.RefreshTokens.Rotate(r.Context(), current.ID, next, now); err != nil {
 		if errors.Is(err, db.ErrRefreshTokenInactive) {
 			_ = h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, now)
-			writeJSONErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
+			httpx.WriteErrorCode(w, http.StatusUnauthorized, "refresh token non valido", "invalid_grant")
 			return
 		}
 		log.Printf("refresh: rotazione fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore interno")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore interno")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, models.LoginResponse{
+	httpx.WriteJSON(w, http.StatusOK, models.LoginResponse{
 		Token:            token,
 		ExpiresAt:        expiresAt,
 		RefreshToken:     nextRaw,
@@ -303,19 +304,19 @@ func sleepUntilMinResponseTime(start time.Time) {
 // valido fino alla scadenza anche dopo il "logout" dell'app.
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 	// Il logout non passa da RequireJWT: deve funzionare anche quando
 	// l'access token è scaduto, purché il client presenti il refresh token
 	// della famiglia. La presenza di uno dei due è la credenziale.
 	var claims *auth.Claims
-	if header := r.Header.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
-		claims, _ = h.Tokens.ParseToken(strings.TrimPrefix(header, "Bearer "))
+	if token, ok := middleware.BearerToken(r); ok {
+		claims, _ = h.Tokens.ParseToken(token)
 	}
 
 	var req models.LogoutRequest
-	if !decodeOptionalJSONBody(w, r, &req, maxLoginBodyBytes) {
+	if !httpx.DecodeOptionalJSONBody(w, r, &req, maxLoginBodyBytes) {
 		return
 	}
 
@@ -324,14 +325,14 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		rt, err := h.RefreshTokens.GetByHash(r.Context(), auth.HashRefreshToken(raw))
 		if err != nil {
 			log.Printf("logout: lettura refresh token fallita: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "impossibile revocare la sessione")
+			httpx.WriteError(w, http.StatusInternalServerError, "impossibile revocare la sessione")
 			return
 		}
 		current = rt
 	}
 
 	if claims == nil && current == nil {
-		writeJSONErrorCode(w, http.StatusUnauthorized, "utente non autenticato", "invalid_token")
+		httpx.WriteErrorCode(w, http.StatusUnauthorized, "utente non autenticato", "invalid_token")
 		return
 	}
 
@@ -341,42 +342,42 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	if current != nil && (claims == nil || current.UserID == claims.UserID) {
 		if err := h.RefreshTokens.RevokeFamily(r.Context(), current.FamilyID, time.Now()); err != nil {
 			log.Printf("logout: revoca famiglia fallita: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "impossibile revocare la sessione")
+			httpx.WriteError(w, http.StatusInternalServerError, "impossibile revocare la sessione")
 			return
 		}
 	}
 	if claims != nil {
 		if err := h.Tokens.RevokeToken(r.Context(), claims); err != nil {
 			log.Printf("logout: revoca token fallita: %v", err)
-			writeJSONError(w, http.StatusInternalServerError, "impossibile revocare il token")
+			httpx.WriteError(w, http.StatusInternalServerError, "impossibile revocare il token")
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // LogoutAll gestisce POST /api/v1/auth/logout-all: chiude tutte le sessioni
 // dell'utente, su ogni dispositivo, incluso quello corrente.
 func (h *AuthHandler) LogoutAll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return
 	}
 	claims, ok := middleware.ClaimsFromContext(r.Context())
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		httpx.WriteError(w, http.StatusUnauthorized, "utente non autenticato")
 		return
 	}
 	now := time.Now()
 	if err := h.RefreshTokens.RevokeAllForUser(r.Context(), claims.UserID, now); err != nil {
 		log.Printf("logout-all: revoca refresh token fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "impossibile revocare le sessioni")
+		httpx.WriteError(w, http.StatusInternalServerError, "impossibile revocare le sessioni")
 		return
 	}
 	if err := h.Tokens.RevokeUser(r.Context(), claims.UserID); err != nil {
 		log.Printf("logout-all: revoca JWT fallita: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "impossibile revocare le sessioni")
+		httpx.WriteError(w, http.StatusInternalServerError, "impossibile revocare le sessioni")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

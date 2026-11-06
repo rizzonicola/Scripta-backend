@@ -1,4 +1,4 @@
-package handlers
+package httpx
 
 import (
 	"net/http/httptest"
@@ -12,7 +12,7 @@ func TestDecodeJSONBodyAcceptsSingleValueAndWhitespace(t *testing.T) {
 	var dst struct {
 		Username string `json:"username"`
 	}
-	if !decodeJSONBody(w, r, &dst, 1024) {
+	if !DecodeJSONBody(w, r, &dst, 1024) {
 		t.Fatalf("body valido rifiutato: %d %s", w.Code, w.Body)
 	}
 	if dst.Username != "mario" {
@@ -24,7 +24,7 @@ func TestDecodeJSONBodyRejectsTrailingValue(t *testing.T) {
 	r := httptest.NewRequest("POST", "/", strings.NewReader(`{"username":"a"}{"password":"b"}`))
 	w := httptest.NewRecorder()
 	var dst map[string]string
-	if decodeJSONBody(w, r, &dst, 1024) {
+	if DecodeJSONBody(w, r, &dst, 1024) {
 		t.Fatal("secondo valore JSON accettato")
 	}
 	if w.Code != 400 {

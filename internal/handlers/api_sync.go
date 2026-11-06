@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"notes-server/internal/db"
+	"notes-server/internal/httpx"
 	"notes-server/internal/middleware"
 	"notes-server/internal/models"
 )
@@ -49,22 +50,6 @@ const defaultMaxConcurrentSyncs = 2
 const maxBeginTxRetries = 3
 
 var beginTxBackoff = [maxBeginTxRetries]time.Duration{20 * time.Millisecond, 60 * time.Millisecond, 150 * time.Millisecond}
-
-// tombstoneRetention è per quanto tempo un tombstone (deleted_at valorizzato)
-// resta visibile tramite la pull della sync prima di poter essere rimosso
-// definitivamente (vedi PurgeExpiredTombstones, invocata periodicamente da
-// main.go). Deve essere più larga del più lungo intervallo plausibile tra
-// due sync consecutive di un dispositivo che l'utente comunque continua ad
-// usare, così ogni device ha il tempo di ricevere ogni cancellazione prima
-// che il server la dimentichi.
-const TombstoneRetention = 30 * 24 * time.Hour
-
-// TombstonePurgeSafetyMargin è il margine aggiuntivo prima dell'hard-delete:
-// una sync già in volo con un cursore appena dentro la retention deve poter
-// ancora vedere il tombstone. Senza margine, la purge può cancellarlo mentre
-// la richiesta è in coda, e il client non riceverebbe mai la cancellazione
-// (il suo cursore non è abbastanza vecchio per un full_resync).
-const TombstonePurgeSafetyMargin = 5 * time.Minute
 
 // MaxClockSkew è la tolleranza massima accettata tra l'orologio del client e
 // quello del server: un created_at/updated_at/deleted_at che supera "adesso +
@@ -332,31 +317,6 @@ func validID(id string) bool {
 	return true
 }
 
-// isOwnershipViolation riconosce il rifiuto, da parte dei trigger SQLite
-// definiti in internal/db/db.go (addOwnershipTriggers), di un INSERT/UPDATE
-// che assegnerebbe a una nota/cartella un parent_id/folder_id inesistente o
-// appartenente a un altro utente.
-//
-// Riconosce il messaggio tramite db.OwnershipViolationMarker (letteralmente
-// "OWNERSHIP_VIOLATION", lo stesso testo che i trigger passano a
-// RAISE(ABORT, ...)): un marcatore scelto da noi, non un pattern-matching
-// sul testo generico di un errore SQLite, quindi non fragile rispetto a
-// come il driver libSQL formatta i propri messaggi di errore.
-//
-// A differenza di una busy-error, questa non è transitoria: significa che
-// il singolo elemento del batch inviato dal client è, di per sé, invalido.
-// Un RAISE(ABORT, ...) in un trigger BEFORE annulla solo l'INSERT/UPDATE che
-// lo ha innescato: la transazione in corso resta pienamente utilizzabile per
-// gli statement successivi — per questo il chiamante può semplicemente
-// scartare l'elemento incriminato e proseguire il resto del batch, invece di
-// far fallire l'intera sync.
-func isOwnershipViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), db.OwnershipViolationMarker)
-}
-
 // rateLimitApplies decide se la richiesta deve consumare il budget del limiter
 // per-utente. L'esenzione per-utente ha precedenza sul toggle globale, così
 // un amministratore può disattivare il limite per un singolo client senza
@@ -383,17 +343,17 @@ func (h *SyncHandler) rateLimitApplies(ctx context.Context) bool {
 // scritto la risposta di errore.
 func (h *SyncHandler) authorizeSyncRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "metodo non consentito")
+		httpx.WriteError(w, http.StatusMethodNotAllowed, "metodo non consentito")
 		return "", false
 	}
 	userID, ok := middleware.UserIDFromContext(r.Context())
 	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "utente non autenticato")
+		httpx.WriteError(w, http.StatusUnauthorized, "utente non autenticato")
 		return "", false
 	}
 	if h.UserLimiter != nil && h.rateLimitApplies(r.Context()) && !h.UserLimiter.Allow(userID) {
 		w.Header().Set("Retry-After", "1")
-		writeJSONErrorCode(w, http.StatusTooManyRequests,
+		httpx.WriteErrorCode(w, http.StatusTooManyRequests,
 			"troppe richieste di sincronizzazione, riprova tra poco", "rate_limited")
 		return "", false
 	}
@@ -458,7 +418,7 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.Folders)+len(req.Notes) > maxBatchSize {
-		writeJSONError(w, http.StatusRequestEntityTooLarge, "troppi elementi nel batch")
+		httpx.WriteError(w, http.StatusRequestEntityTooLarge, "troppi elementi nel batch")
 		return
 	}
 
@@ -478,7 +438,7 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		// Una riga di riepilogo per ogni 422, con la versione dell'app (solo
 		// per capire chi sta inviando cosa; nessun titolo né contenuto).
 		log.Printf("sync: 422, %d elementi rifiutati (client=%s)", len(res.rejected), clientTag(r))
-		writeJSON(w, http.StatusUnprocessableEntity, models.SyncRejectedResponse{
+		httpx.WriteJSON(w, http.StatusUnprocessableEntity, models.SyncRejectedResponse{
 			Error:    "alcuni elementi sono stati rifiutati: dati non validi",
 			Rejected: res.rejected,
 		})
@@ -487,13 +447,13 @@ func (h *SyncHandler) Sync(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Retry-After", "1")
 		}
 		if res.code != "" {
-			writeJSONErrorCode(w, res.status, res.message, res.code)
+			httpx.WriteErrorCode(w, res.status, res.message, res.code)
 		} else {
-			writeJSONError(w, res.status, res.message)
+			httpx.WriteError(w, res.status, res.message)
 		}
 	default:
 		setProtoHeader(w)
-		writeJSON(w, http.StatusOK, res.resp)
+		httpx.WriteJSON(w, http.StatusOK, res.resp)
 	}
 }
 
@@ -519,27 +479,27 @@ func (h *SyncHandler) ResetOrdering(w http.ResponseWriter, r *http.Request) {
 	tx, err := h.beginTxWithRetry(ctx)
 	if err != nil {
 		if isTransientBusyErr(err) {
-			writeJSONErrorCode(w, http.StatusServiceUnavailable,
+			httpx.WriteErrorCode(w, http.StatusServiceUnavailable,
 				"database temporaneamente occupato, riprovare", "service_unavailable")
 			return
 		}
 		log.Printf("reset posizionamento: errore avvio transazione: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
 		return
 	}
 	version, err := db.NewOrderingRepo(tx).Reset(ctx, userID)
 	if err != nil {
 		_ = tx.Rollback()
 		log.Printf("reset posizionamento: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("reset posizionamento: errore commit: %v", err)
-		writeJSONError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
+		httpx.WriteError(w, http.StatusInternalServerError, "errore eliminazione posizionamento")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int64{"version": version})
+	httpx.WriteJSON(w, http.StatusOK, map[string]int64{"version": version})
 }
 
 // decodeSyncRequest legge il body di sync in due fasi: prima conserva gli
@@ -561,62 +521,62 @@ func decodeSyncRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (
 	if err := dec.Decode(&env); err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
+			httpx.WriteError(w, http.StatusRequestEntityTooLarge, "payload troppo grande")
 		} else {
-			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 		}
 		return nil, false
 	}
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 		return nil, false
 	}
 
 	nFolders, err := countJSONArray(env.Folders)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 		return nil, false
 	}
 	nNotes, err := countJSONArray(env.Notes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+		httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 		return nil, false
 	}
 	if nFolders+nNotes > maxBatchSize {
-		writeJSONError(w, http.StatusRequestEntityTooLarge, "troppi elementi nel batch")
+		httpx.WriteError(w, http.StatusRequestEntityTooLarge, "troppi elementi nel batch")
 		return nil, false
 	}
 
 	req := &models.SyncRequest{LastSyncedAt: env.LastSyncedAt}
 	if len(env.Folders) > 0 {
 		if err := json.Unmarshal(env.Folders, &req.Folders); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 			return nil, false
 		}
 	}
 	if len(env.Notes) > 0 {
 		if err := json.Unmarshal(env.Notes, &req.Notes); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 			return nil, false
 		}
 	}
 	if len(env.Ordering) > 0 && !bytes.Equal(bytes.TrimSpace(env.Ordering), []byte("null")) {
 		var push models.OrderingPush
 		if err := json.Unmarshal(env.Ordering, &push); err != nil {
-			writeJSONError(w, http.StatusBadRequest, "body JSON non valido")
+			httpx.WriteError(w, http.StatusBadRequest, "body JSON non valido")
 			return nil, false
 		}
 		if push.BaseVersion < 0 {
-			writeJSONError(w, http.StatusBadRequest, "base_version non valida")
+			httpx.WriteError(w, http.StatusBadRequest, "base_version non valida")
 			return nil, false
 		}
 		if len(push.Data) > maxOrderingBytes {
-			writeJSONError(w, http.StatusRequestEntityTooLarge, "dati di posizionamento troppo grandi")
+			httpx.WriteError(w, http.StatusRequestEntityTooLarge, "dati di posizionamento troppo grandi")
 			return nil, false
 		}
 		if !isJSONObject(push.Data) {
-			writeJSONError(w, http.StatusBadRequest, "dati di posizionamento non validi")
+			httpx.WriteError(w, http.StatusBadRequest, "dati di posizionamento non validi")
 			return nil, false
 		}
 		req.Ordering = &push
@@ -863,7 +823,7 @@ func (h *SyncHandler) processLocked(ctx context.Context, userID string, req *mod
 		}
 		won, err := notesTx.UpsertLWW(ctx, note)
 		if err != nil {
-			if isOwnershipViolation(err) {
+			if db.IsOwnershipViolation(err) {
 				log.Printf("sync: nota %s rifiutata, folder_id non valido o non dell'utente", nc.ID)
 				rejected = append(rejected, models.RejectedItem{Kind: "note", ID: nc.ID, Reason: "invalid_folder_id"})
 				continue
@@ -896,7 +856,7 @@ func (h *SyncHandler) processLocked(ctx context.Context, userID string, req *mod
 	// deve essere contato dalla quota.
 	orderingTx := db.NewOrderingRepo(tx)
 	if req.Ordering != nil {
-		if _, _, _, err := orderingTx.Apply(ctx, userID, req.Ordering.BaseVersion, req.Ordering.Data); err != nil {
+		if _, err := orderingTx.Apply(ctx, userID, req.Ordering.BaseVersion, req.Ordering.Data); err != nil {
 			log.Printf("sync: errore salvataggio posizionamento: %v", err)
 			return failure(http.StatusInternalServerError, "errore salvataggio posizionamento")
 		}
@@ -944,7 +904,7 @@ func (h *SyncHandler) processLocked(ctx context.Context, userID string, req *mod
 	fullResync := false
 	if since < 0 || since > now {
 		since, fullResync = 0, true
-	} else if since > 0 && since < now-TombstoneRetention.Milliseconds() {
+	} else if since > 0 && since < now-db.TombstoneRetention.Milliseconds() {
 		since, fullResync = 0, true
 	}
 	// Tombstone utili solo per una pull incrementale: a una prima sync o a
@@ -1126,7 +1086,7 @@ func applyFolder(ctx context.Context, foldersTx *db.FoldersRepo, notesTx *db.Not
 	}
 	won, err := foldersTx.UpsertLWW(ctx, folder)
 	if err != nil {
-		if isOwnershipViolation(err) || db.IsFolderCycleViolation(err) {
+		if db.IsOwnershipViolation(err) || db.IsFolderCycleViolation(err) {
 			return folderParentMissing, models.RejectedItem{Kind: "folder", ID: fc.ID, Reason: "invalid_parent_id"}, nil
 		}
 		log.Printf("sync: errore upsert cartella %s: %v", fc.ID, err)
@@ -1249,7 +1209,7 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 			return err
 		}
 		for _, id := range noteIDs {
-			if err := notesTx.ForceSet(ctx, userID, id, now, now, &deletedAt); err != nil {
+			if err := notesTx.ForceSet(ctx, userID, id, now, now, deletedAt); err != nil {
 				return err
 			}
 		}
@@ -1264,7 +1224,7 @@ func cascadeSoftDeleteFolder(ctx context.Context, foldersTx *db.FoldersRepo, not
 			}
 			visited[child.ID] = struct{}{}
 			if child.Active {
-				if err := foldersTx.ForceSet(ctx, userID, child.ID, now, now, &deletedAt); err != nil {
+				if err := foldersTx.ForceSet(ctx, userID, child.ID, now, now, deletedAt); err != nil {
 					return err
 				}
 			}
