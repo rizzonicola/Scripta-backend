@@ -112,7 +112,7 @@ func TestMigrateCompositePrimaryKeysPreservesData(t *testing.T) {
 	}
 
 	// Indici e trigger ricreati dopo il rebuild.
-	for _, idx := range []string{"idx_folders_parent", "idx_folders_deleted_at", "idx_notes_folder", "idx_notes_deleted_at"} {
+	for _, idx := range []string{"idx_folders_parent", "idx_folders_deleted_at", "idx_folders_synced", "idx_notes_folder", "idx_notes_deleted_at", "idx_notes_synced"} {
 		var count int
 		if err := conn.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, idx).Scan(&count); err != nil {
 			t.Fatalf("indice %s: %v", idx, err)

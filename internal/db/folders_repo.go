@@ -72,7 +72,7 @@ func (r *FoldersRepo) UpsertLWW(ctx context.Context, f *models.Folder) (bool, er
 // cartella, usata dalla cascade quando un antenato viene cancellato (vedi
 // CascadeSoftDelete nel gestore di sync): la cancellazione del padre deve
 // propagarsi ai figli indipendentemente dal loro updated_at precedente.
-func (r *FoldersRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt int64, deletedAt *int64) error {
+func (r *FoldersRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt, deletedAt int64) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE folders SET updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
 		updatedAt, syncedAt, deletedAt, id, userID,
@@ -145,14 +145,7 @@ func (r *FoldersRepo) ListChildren(ctx context.Context, userID, parentID string)
 // cui synced_at (istante server) è più vecchio della finestra di retention.
 // Vedi NotesRepo.PurgeExpiredTombstones per la strategia completa.
 func (r *FoldersRepo) PurgeExpiredTombstones(ctx context.Context, olderThan int64) (int64, error) {
-	res, err := r.db.ExecContext(ctx,
-		`DELETE FROM folders WHERE deleted_at IS NOT NULL AND synced_at < ?`,
-		olderThan,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return purgeExpiredTombstones(ctx, r.db, "folders", olderThan)
 }
 
 // TouchSynced aggiorna SOLO synced_at di una riga esistente dell'utente. Serve
@@ -162,9 +155,5 @@ func (r *FoldersRepo) PurgeExpiredTombstones(ctx context.Context, olderThan int6
 // resterebbe con una copia divergente (il suo cursore è già oltre il vecchio
 // synced_at della riga vincente).
 func (r *FoldersRepo) TouchSynced(ctx context.Context, userID, id string, syncedAt int64) error {
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE folders SET synced_at = ? WHERE id = ? AND user_id = ?`,
-		syncedAt, id, userID,
-	)
-	return err
+	return touchSynced(ctx, r.db, "folders", userID, id, syncedAt)
 }

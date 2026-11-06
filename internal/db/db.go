@@ -423,8 +423,10 @@ const (
 
 	createFoldersParentIndex    = `CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(user_id, parent_id)`
 	createFoldersDeletedAtIndex = `CREATE INDEX IF NOT EXISTS idx_folders_deleted_at ON folders(deleted_at) WHERE deleted_at IS NOT NULL`
+	createFoldersSyncedIndex    = `CREATE INDEX IF NOT EXISTS idx_folders_synced ON folders(user_id, synced_at)`
 	createNotesFolderIndex      = `CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(user_id, folder_id)`
 	createNotesDeletedAtIndex   = `CREATE INDEX IF NOT EXISTS idx_notes_deleted_at ON notes(deleted_at) WHERE deleted_at IS NOT NULL`
+	createNotesSyncedIndex      = `CREATE INDEX IF NOT EXISTS idx_notes_synced ON notes(user_id, synced_at)`
 )
 
 var migrationStatements = []string{
@@ -647,6 +649,11 @@ const OwnershipViolationMarker = "OWNERSHIP_VIOLATION"
 // cartelle coinvolte dalla UI (nessuna radice le raggiunge).
 const FolderCycleViolationMarker = "FOLDER_CYCLE"
 
+// IsOwnershipViolation riconosce il rifiuto dei trigger di ownership.
+func IsOwnershipViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), OwnershipViolationMarker)
+}
+
 // IsFolderCycleViolation riconosce il rifiuto del trigger sui cicli.
 func IsFolderCycleViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), FolderCycleViolationMarker)
@@ -701,7 +708,7 @@ func addOwnershipTriggers(conn *sql.DB) error {
 		 BEGIN
 		   SELECT CASE WHEN NOT EXISTS (
 		     SELECT 1 FROM folders WHERE id = NEW.parent_id AND user_id = NEW.user_id
-		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: parent_id non valido o non appartenente allo stesso utente') END;
+		   ) THEN RAISE(ABORT, '` + OwnershipViolationMarker + `: parent_id non valido o non appartenente allo stesso utente') END;
 		 END`,
 		`CREATE TRIGGER IF NOT EXISTS trg_folders_parent_ownership_upd
 		 BEFORE UPDATE OF parent_id ON folders
@@ -709,7 +716,7 @@ func addOwnershipTriggers(conn *sql.DB) error {
 		 BEGIN
 		   SELECT CASE WHEN NOT EXISTS (
 		     SELECT 1 FROM folders WHERE id = NEW.parent_id AND user_id = NEW.user_id
-		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: parent_id non valido o non appartenente allo stesso utente') END;
+		   ) THEN RAISE(ABORT, '` + OwnershipViolationMarker + `: parent_id non valido o non appartenente allo stesso utente') END;
 		 END`,
 		`CREATE TRIGGER IF NOT EXISTS trg_notes_folder_ownership_ins
 		 BEFORE INSERT ON notes
@@ -717,7 +724,7 @@ func addOwnershipTriggers(conn *sql.DB) error {
 		 BEGIN
 		   SELECT CASE WHEN NOT EXISTS (
 		     SELECT 1 FROM folders WHERE id = NEW.folder_id AND user_id = NEW.user_id
-		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: folder_id non valido o non appartenente allo stesso utente') END;
+		   ) THEN RAISE(ABORT, '` + OwnershipViolationMarker + `: folder_id non valido o non appartenente allo stesso utente') END;
 		 END`,
 		`CREATE TRIGGER IF NOT EXISTS trg_notes_folder_ownership_upd
 		 BEFORE UPDATE OF folder_id ON notes
@@ -725,8 +732,18 @@ func addOwnershipTriggers(conn *sql.DB) error {
 		 BEGIN
 		   SELECT CASE WHEN NOT EXISTS (
 		     SELECT 1 FROM folders WHERE id = NEW.folder_id AND user_id = NEW.user_id
-		   ) THEN RAISE(ABORT, 'OWNERSHIP_VIOLATION: folder_id non valido o non appartenente allo stesso utente') END;
+		   ) THEN RAISE(ABORT, '` + OwnershipViolationMarker + `: folder_id non valido o non appartenente allo stesso utente') END;
 		 END`,
+	}
+	for _, name := range []string{
+		"trg_folders_parent_ownership_ins",
+		"trg_folders_parent_ownership_upd",
+		"trg_notes_folder_ownership_ins",
+		"trg_notes_folder_ownership_upd",
+	} {
+		if _, err := conn.Exec(`DROP TRIGGER IF EXISTS ` + name); err != nil {
+			return fmt.Errorf("drop trigger %s: %w", name, err)
+		}
 	}
 	for _, stmt := range statements {
 		if _, err := conn.Exec(stmt); err != nil {
@@ -760,7 +777,7 @@ func addFolderCycleTriggers(conn *sql.DB) error {
 		        WHERE f.user_id = NEW.user_id
 		     )
 		     SELECT 1 FROM ancestors WHERE id = NEW.id
-		   ) THEN RAISE(ABORT, 'FOLDER_CYCLE: parent_id è un discendente della cartella') END;
+		   ) THEN RAISE(ABORT, '` + FolderCycleViolationMarker + `: parent_id è un discendente della cartella') END;
 		 END`
 
 	statements := []string{
@@ -778,6 +795,11 @@ func addFolderCycleTriggers(conn *sql.DB) error {
 		 WHEN NEW.parent_id IS NOT NULL
 		  AND OLD.parent_id IS NOT NEW.parent_id
 		 ` + checkBody,
+	}
+	for _, name := range []string{"trg_folders_cycle_ins", "trg_folders_cycle_upd"} {
+		if _, err := conn.Exec(`DROP TRIGGER IF EXISTS ` + name); err != nil {
+			return fmt.Errorf("drop trigger %s: %w", name, err)
+		}
 	}
 	for _, stmt := range statements {
 		if _, err := conn.Exec(stmt); err != nil {
@@ -894,13 +916,9 @@ func repairFolderCycles(conn *sql.DB) error {
 	// delle sync: si aggiornano sia l'high-water mark sia l'ultimo stamp
 	// allocato, così un riavvio con l'orologio indietro non riusa un valore
 	// già consegnato ai client.
+	state := NewSyncStateRepo(tx)
 	for _, key := range []string{StampHWMKey, StampLastKey} {
-		if _, err := tx.Exec(
-			`INSERT INTO sync_state(key, value) VALUES(?, ?)
-			 ON CONFLICT(key) DO UPDATE SET value = excluded.value
-			 WHERE excluded.value > sync_state.value`,
-			key, stamp,
-		); err != nil {
+		if err := state.SetMaxInt(context.Background(), key, stamp); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("aggiornamento %s: %w", key, err)
 		}
@@ -1087,7 +1105,11 @@ func addSyncedAtColumns(conn *sql.DB) error {
 			}
 			log.Printf("migrazione: aggiunta colonna %s.synced_at (backfill = ora corrente del server)", table)
 		}
-		if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_` + table + `_synced ON ` + table + `(user_id, synced_at)`); err != nil {
+		index := createNotesSyncedIndex
+		if table == "folders" {
+			index = createFoldersSyncedIndex
+		}
+		if _, err := conn.Exec(index); err != nil {
 			return fmt.Errorf("index %s.synced_at: %w", table, err)
 		}
 	}
@@ -1144,6 +1166,7 @@ func migrateCompositePrimaryKeys(conn *sql.DB) error {
 			indexes: []string{
 				createFoldersParentIndex,
 				createFoldersDeletedAtIndex,
+				createFoldersSyncedIndex,
 			},
 		},
 		{
@@ -1153,6 +1176,7 @@ func migrateCompositePrimaryKeys(conn *sql.DB) error {
 			indexes: []string{
 				createNotesFolderIndex,
 				createNotesDeletedAtIndex,
+				createNotesSyncedIndex,
 			},
 		},
 	}
@@ -1234,40 +1258,14 @@ func tableColumns(conn *sql.DB, table string) (map[string]bool, error) {
 // Su un'installazione nuova (colonna relative_path assente o tabella
 // inesistente) questa funzione è un no-op.
 func quarantineLegacyNotesTable(conn *sql.DB) error {
-	rows, err := conn.Query(`PRAGMA table_info(notes)`)
+	cols, err := tableColumns(conn, "notes")
 	if err != nil {
-		return fmt.Errorf("pragma table_info(notes): %w", err)
+		return err
 	}
-
-	hasRelativePath := false
-	hasFolderID := false
-	tableExists := false
-	for rows.Next() {
-		tableExists = true
-		var cid int
-		var name, ctype string
-		var notNull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan table_info(notes): %w", err)
-		}
-		if name == "relative_path" {
-			hasRelativePath = true
-		}
-		if name == "folder_id" {
-			hasFolderID = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("iterazione table_info(notes): %w", err)
-	}
-	rows.Close()
-
-	if !tableExists || !hasRelativePath || hasFolderID {
-		// Tabella assente (installazione nuova), oppure già nel nuovo
-		// schema (hasFolderID): nulla da fare.
+	// Tabella assente (installazione nuova), oppure già nel nuovo schema
+	// (folder_id presente): nulla da fare. Con lo schema legacy la tabella
+	// esiste e ha relative_path.
+	if len(cols) == 0 || !cols["relative_path"] || cols["folder_id"] {
 		return nil
 	}
 

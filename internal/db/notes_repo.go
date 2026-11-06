@@ -107,19 +107,12 @@ func (r *NotesRepo) UpsertLWW(ctx context.Context, n *models.Note) (bool, error)
 // devono risultare cancellate indipendentemente dal loro updated_at
 // precedente, perché la cancellazione della cartella padre è per definizione
 // l'evento più recente che le riguarda).
-func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt int64, deletedAt *int64) error {
-	if deletedAt != nil {
-		// Un tombstone non ha bisogno del testo: azzerarlo libera subito la
-		// quota (il contenuto non è più servito a nessun client) e impedisce
-		// di conservare dati fuori dal conteggio dello spazio.
-		_, err := r.db.ExecContext(ctx,
-			`UPDATE notes SET title = '', content = '', updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
-			updatedAt, syncedAt, deletedAt, id, userID,
-		)
-		return err
-	}
+func (r *NotesRepo) ForceSet(ctx context.Context, userID, id string, updatedAt, syncedAt, deletedAt int64) error {
+	// Un tombstone non ha bisogno del testo: azzerarlo libera subito la quota
+	// (il contenuto non è più servito a nessun client) e impedisce di
+	// conservare dati fuori dal conteggio dello spazio.
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE notes SET updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
+		`UPDATE notes SET title = '', content = '', updated_at = ?, synced_at = ?, deleted_at = ? WHERE id = ? AND user_id = ?`,
 		updatedAt, syncedAt, deletedAt, id, userID,
 	)
 	return err
@@ -198,14 +191,7 @@ func (r *NotesRepo) ListActiveIDsByFolder(ctx context.Context, userID, folderID 
 // tombstone prima che sparisca; i dispositivi più lenti vengono riallineati
 // da SyncResponse.FullResync (vedi handlers/api_sync.go).
 func (r *NotesRepo) PurgeExpiredTombstones(ctx context.Context, olderThan int64) (int64, error) {
-	res, err := r.db.ExecContext(ctx,
-		`DELETE FROM notes WHERE deleted_at IS NOT NULL AND synced_at < ?`,
-		olderThan,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return purgeExpiredTombstones(ctx, r.db, "notes", olderThan)
 }
 
 // TouchSynced aggiorna SOLO synced_at di una riga esistente dell'utente. Serve
@@ -215,9 +201,5 @@ func (r *NotesRepo) PurgeExpiredTombstones(ctx context.Context, olderThan int64)
 // resterebbe con una copia divergente (il suo cursore è già oltre il vecchio
 // synced_at della riga vincente).
 func (r *NotesRepo) TouchSynced(ctx context.Context, userID, id string, syncedAt int64) error {
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE notes SET synced_at = ? WHERE id = ? AND user_id = ?`,
-		syncedAt, id, userID,
-	)
-	return err
+	return touchSynced(ctx, r.db, "notes", userID, id, syncedAt)
 }

@@ -5,7 +5,24 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 )
+
+// TombstoneRetention è per quanto tempo un tombstone (deleted_at valorizzato)
+// resta visibile tramite la pull della sync prima di poter essere rimosso
+// definitivamente (vedi PurgeExpiredTombstones, invocata periodicamente da
+// main.go). Deve essere più larga del più lungo intervallo plausibile tra due
+// sync consecutive di un dispositivo che l'utente comunque continua a usare,
+// così ogni device ha il tempo di ricevere ogni cancellazione prima che il
+// server la dimentichi.
+const TombstoneRetention = 30 * 24 * time.Hour
+
+// TombstonePurgeSafetyMargin è il margine aggiuntivo prima dell'hard-delete:
+// una sync già in volo con un cursore appena dentro la retention deve poter
+// ancora vedere il tombstone. Senza margine, la purge può cancellarlo mentre
+// la richiesta è in coda, e il client non riceverebbe mai la cancellazione
+// (il suo cursore non è abbastanza vecchio per un full_resync).
+const TombstonePurgeSafetyMargin = 5 * time.Minute
 
 // ---------------------------------------------------------------------------
 // Recupero spazio su disco.

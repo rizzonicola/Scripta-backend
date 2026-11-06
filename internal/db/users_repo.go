@@ -48,11 +48,11 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 	)
 	if err != nil {
 		// Il pre-check sopra non è atomico: due richieste concorrenti possono
-		// superarlo entrambe e una sola INSERT vince l'indice univoco. In quel
-		// caso restituiamo lo stesso ErrUsernameTaken del percorso normale,
-		// invece dell'errore grezzo del driver (che la dashboard mostrerebbe
-		// come "creazione fallita" senza spiegare il motivo).
-		if existing, getErr := r.GetByUsername(ctx, username); getErr == nil && existing != nil {
+		// superarlo entrambe e una sola INSERT vince l'indice univoco. Solo
+		// quella violazione è un duplicato: un errore diverso (disco pieno,
+		// DB chiuso) deve restare l'errore vero, non mascherarsi da "username
+		// già in uso".
+		if isUniqueUsernameViolation(err) {
 			return nil, ErrUsernameTaken
 		}
 		return nil, err
@@ -60,22 +60,23 @@ func (r *UsersRepo) Create(ctx context.Context, username, passwordHash string) (
 	return u, nil
 }
 
+// isUniqueUsernameViolation riconosce la sola violazione dell'indice univoco
+// su users.username. La stringa è quella stabile di SQLite/libSQL; gli altri
+// errori di INSERT non vanno classificati come duplicati.
+func isUniqueUsernameViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed: users.username")
+}
+
 // List restituisce gli utenti per la dashboard admin, eventualmente filtrati
 // per username o ID. Non legge password_hash: l'hash serve solo al login
 // (GetByUsername), non alla UI, quindi evitare di caricarlo in memoria riduce
 // l'esposizione accidentale.
 func (r *UsersRepo) List(ctx context.Context, search string) ([]models.User, error) {
-	// Deve rispecchiare StorageRepo.Usage: tutte le righe (tombstone inclusi),
-	// testo più overhead fisso per riga, più il blob di posizionamento.
-	query := `SELECT users.id, users.username, users.created_at, users.blocked_at, users.rate_limit_exempt, users.storage_quota_bytes,
-		COALESCE((SELECT SUM(? + LENGTH(CAST(COALESCE(title, '') AS BLOB)) + LENGTH(CAST(COALESCE(content, '') AS BLOB)))
-			FROM notes WHERE notes.user_id = users.id), 0) +
-		COALESCE((SELECT SUM(? + LENGTH(CAST(COALESCE(name, '') AS BLOB)))
-			FROM folders WHERE folders.user_id = users.id), 0) +
-		COALESCE((SELECT LENGTH(CAST(ordering_json AS BLOB))
-			FROM user_ordering WHERE user_ordering.user_id = users.id), 0)
+	// La formula dello spazio è la stessa di StorageRepo.Usage.
+	query := `SELECT users.id, users.username, users.created_at, users.blocked_at, users.rate_limit_exempt, users.storage_quota_bytes,` +
+		storageUsageSQL("users.id") + `
 		FROM users`
-	args := []any{storageRowOverheadBytes, storageRowOverheadBytes}
+	var args []any
 	search = strings.TrimSpace(search)
 	if search != "" {
 		pattern := "%" + escapeLike(search) + "%"
