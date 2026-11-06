@@ -2,9 +2,56 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
+
+// failingUserRevocationStore simula un DB che rifiuta la scrittura della
+// revoca per utente.
+type failingUserRevocationStore struct {
+	saveErr error
+}
+
+func (s failingUserRevocationStore) SaveUserRevocation(context.Context, string, time.Time) error {
+	return s.saveErr
+}
+
+func (failingUserRevocationStore) SaveTokenRevocation(context.Context, string, string, time.Time) error {
+	return nil
+}
+
+func (failingUserRevocationStore) LoadActive(context.Context, time.Time) (map[string]time.Time, map[string]time.Time, error) {
+	return map[string]time.Time{}, map[string]time.Time{}, nil
+}
+
+func (failingUserRevocationStore) PurgeExpired(context.Context, time.Time, time.Duration) error {
+	return nil
+}
+
+func TestRevokeUserRevokesInMemoryEvenIfPersistenceFails(t *testing.T) {
+	tm := NewTokenManager("01234567890123456789012345678901", time.Hour)
+	ctx := context.Background()
+	saveErr := errors.New("db non disponibile")
+	if err := tm.AttachStore(ctx, failingUserRevocationStore{saveErr: saveErr}); err != nil {
+		t.Fatalf("AttachStore: %v", err)
+	}
+	token, _, err := tm.GenerateToken("u1", "mario", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tm.ParseToken(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := tm.RevokeUser(ctx, "u1"); !errors.Is(err, saveErr) {
+		t.Fatalf("RevokeUser: errore %v, atteso %v", err, saveErr)
+	}
+	if !tm.IsRevoked(claims) {
+		t.Fatal("token ancora valido in RAM dopo una persistenza fallita")
+	}
+}
 
 func TestRevocationUsesMillisecondIssueTime(t *testing.T) {
 	tm := NewTokenManager("01234567890123456789012345678901", time.Hour)

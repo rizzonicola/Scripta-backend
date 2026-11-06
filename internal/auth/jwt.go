@@ -135,22 +135,25 @@ func (tm *TokenManager) RevokeUser(ctx context.Context, userID string) error {
 	tm.mu.RLock()
 	store := tm.store
 	tm.mu.RUnlock()
-	// Prima la persistenza, poi la cache in RAM: se il salvataggio fallisce il
-	// processo non deve considerare revocato un token che, dopo un riavvio,
-	// tornerebbe valido. L'aggiornamento RAM mantiene comunque il massimo per
-	// non far regredire la revoca se l'orologio torna indietro o due richieste
-	// arrivano fuori ordine.
+	// Prima la persistenza, poi la cache in RAM: se il processo muore tra le
+	// due, al riavvio la revoca è comunque nel DB. Se però il salvataggio
+	// fallisce, la revoca va applicata lo stesso in RAM (best effort) prima di
+	// restituire l'errore: un token già emesso non deve restare utilizzabile
+	// nel processo corrente solo perché il DB è momentaneamente indisponibile.
+	// È lo stesso contratto di RevokeToken, che aggiorna sempre la RAM.
+	var persistErr error
 	if store != nil {
-		if err := store.SaveUserRevocation(ctx, userID, now); err != nil {
-			return err
-		}
+		persistErr = store.SaveUserRevocation(ctx, userID, now)
 	}
 	tm.mu.Lock()
+	// Non far regredire la revoca se l'orologio torna indietro o due richieste
+	// arrivano fuori ordine: un token emesso tra le due revoche deve restare
+	// invalidato.
 	if prev, ok := tm.userRevoked[userID]; !ok || now.After(prev) {
 		tm.userRevoked[userID] = now
 	}
 	tm.mu.Unlock()
-	return nil
+	return persistErr
 }
 
 // RevokeToken invalida il singolo token (logout esplicito) fino alla sua
